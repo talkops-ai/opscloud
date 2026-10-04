@@ -1,0 +1,479 @@
+/* OpsCloud TUI Theme — Variable-based CSS
+ *
+ * Theme color variables automatically resolved from theme.py
+ * Layer ordering: base → autocomplete → overlay
+ */
+
+/* ── Screen layers (critical for z-ordering) ─────────── */
+
+Screen {
+    layers: base autocomplete overlay;
+    background: $background;
+    color: $foreground;
+}
+
+ModalScreen {
+    align: center middle;
+    background: rgba(0, 0, 0, 0.7);
+}
+
+/* ── Universal Scrollbar Styling ────────────────────────── */
+
+* {
+    scrollbar-size-vertical: 1;
+}
+
+MarkdownFence {
+    scrollbar-size-horizontal: 0;
+    scrollbar-size-vertical: 0;
+}
+
+Scrollbar {
+    background: $surface;
+    color: $primary;
+}
+
+Scrollbar:hover {
+    background: $surface;
+    color: $primary-lighten-1;
+}
+
+/* ── Message list scroll area ────────────────────────────── */
+
+#messages {
+    height: 1fr;
+    background: $background;
+    scrollbar-size-vertical: 1;
+    padding-bottom: 1;
+}
+
+/* ── Bottom container ────────────────────────────────── */
+
+#bottom-container {
+    height: auto;
+    margin: 0;
+    padding: 0;
+}
+
+/* ── Diff lines ──────────────────────────────────────── */
+
+.diff-line-added, .diff-added {
+    background: #1D2D20;
+    color: #9ECE6A;
+}
+
+.diff-line-removed, .diff-removed {
+    background: #2D2030;
+    color: #F7768E;
+}
+
+.diff-line-hunk {
+    color: $primary;
+}
+
+.diff-line-header {
+    text-style: bold;
+}
+
+.diff-line-context {
+    color: $foreground;
+}
+
+.diff-line-truncated {
+    color: $foreground;
+    text-style: italic;
+}
+
+/* ── Status bar ──────────────────────────────────────── */
+
+StatusBar {
+    dock: bottom;
+    height: 1;
+    color: $foreground;
+}
+
+/* ── Chat input ──────────────────────────────────────── */
+
+ChatInput {
+    height: auto;
+}
+
+ChatInput #input-box {
+    height: auto;
+    max-height: 20;
+    min-height: 3;
+    border: solid $primary;
+    background: $background;
+    color: $foreground;
+    padding: 0;
+}
+
+ChatInput .input-row {
+    height: auto;
+    width: 100%;
+    layout: horizontal;
+    padding: 0 1;
+}
+
+ChatInput .input-prompt {
+    width: 2;
+    height: 1;
+    color: $primary;
+    text-style: bold;
+}
+
+ChatInput ChatTextArea {
+    width: 1fr;
+    height: auto;
+    min-height: 1;
+    max-height: 10;
+    border: none;
+    background: transparent;
+    padding: 0;
+}
+
+ChatInput:focus #input-box {
+    border: solid $primary;
+}
+
+
+/* ── Messages ────────────────────────────────────────── */
+
+/* Mode-specific borders for UserMessage — currently all use $primary */
+/* Reserved for future mode-specific border colors if needed */
+
+AssistantMessage {
+    padding: 0 1;
+    margin: 1 0 0 0;
+    color: $foreground;
+    pointer: text;
+}
+
+ToolCallMessage {
+    padding: 0 1;
+    margin: 0 0 0 0;
+    color: $foreground;
+}
+
+ToolCallMessage:hover {
+    background: $surface;
+}
+
+ErrorMessage {
+    height: auto;
+    padding: 1 2;
+    margin: 1 0 0 0;
+    background: $error-muted;
+    color: $foreground;
+    border-left: wide $error;
+    pointer: text;
+}
+
+SystemMessage {
+    padding: 0 1;
+    margin: 1 0 0 0;
+    height: auto;
+    color: $text;
+    pointer: text;
+}
+
+/* ── Queued User Message ─────────────────────────────── */
+
+QueuedUserMessage {
+    padding: 0 1;
+    margin: 1 0 0 4;
+    background: $surface;
+    color: $foreground;
+    border-left: solid $panel;
+}
+
+/* ── Skill Message ──────────────────────────────────── */
+
+SkillMessage {
+    height: auto;
+    padding: 0 1 0 0;
+    margin: 1 0 1 0;
+    background: transparent;
+    border-left: wide $skill;
+}
+
+SkillMessage:hover {
+    border-left: wide $skill-hover;
+}
+
+/* ── Approval overlay ────────────────────────────────── */
+
+/* ApprovalMenu styles are now contained within the component's DEFAULT_CSS */
+
+
+/* ── Overlay panels (model/thread/mcp selectors) ─────── */
+
+ModelSelector, ThreadSelector, MCPViewer {
+    layer: overlay;
+    dock: right;
+    width: 45;
+    height: 100%;
+    background: $surface;
+    border-left: tall $panel;
+    padding: 1;
+}
+
+/* ── Sub-agent panel ─────────────────────────────────── */
+
+SubagentPanel {
+    color: $foreground;
+}
+
+/* ── Autocomplete Popup ──────────────────────────────── */
+
+#autocomplete-popup {
+    height: auto;
+    max-height: 10;
+    width: 100%;
+    background: $surface;
+    border-top: solid $primary;
+    scrollbar-size-vertical: 1;
+    scrollbar-gutter: stable;
+    display: none;
+}
+
+/* ── Muted helper class ──────────────────────────────── */
+
+.muted {
+    color: $foreground;
+    text-style: italic;
+}
+
+/* ── Inline Prompts & Approval Menus ─────────────────── */
+
+.inline-prompt {
+    height: auto;
+    margin: 1 0;
+    padding: 0 1;
+    background: $surface;
+    border: solid $primary;
+}
+
+.inline-prompt .inline-prompt-title {
+    text-style: bold;
+    color: $primary;
+    margin-bottom: 0;
+}
+
+.inline-prompt .inline-prompt-help {
+    color: $text-muted;
+    text-style: italic;
+    margin-top: 0;
+    margin-bottom: 0;
+}
+
+.inline-prompt .inline-prompt-input {
+    & .text-area--cursor-line {
+        background: transparent;
+    }
+
+    & .text-area--cursor-gutter {
+        background: transparent;
+    }
+}
+
+/* ── Ask user widget ─────────────────────────────────── */
+.ask-user-menu .ask-user-questions {
+    height: auto;
+    padding: 0 1;
+}
+
+.ask-user-menu .ask-user-question {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.ask-user-menu .ask-user-question-active {
+    border-left: thick $primary;
+    padding-left: 1;
+}
+
+.ask-user-menu .ask-user-question-inactive {
+    opacity: 0.6;
+    padding-left: 2;
+}
+
+.ask-user-menu .ask-user-question-text {
+    margin: 0 0 0 1;
+    padding: 0;
+    color: $foreground;
+}
+
+.ask-user-menu .ask-user-choice {
+    height: auto;
+    padding: 0 1;
+    color: $foreground;
+}
+
+.ask-user-menu .ask-user-choice-selected {
+    color: $primary;
+    text-style: bold;
+}
+
+.ask-user-menu .ask-user-text-input {
+    margin: 1 0 0 2;
+    height: auto;
+    min-height: 3;
+    max-height: 10;
+    background: $background;
+    border: solid $panel;
+    padding: 0 1;
+    color: $foreground;
+}
+
+.ask-user-menu .ask-user-text-input:focus {
+    border: solid $primary;
+}
+
+.ask-user-menu .ask-user-other-input {
+    margin: 1 0 0 2;
+    height: auto;
+    min-height: 3;
+    max-height: 10;
+    background: $background;
+    border: solid $panel;
+    padding: 0 1;
+    color: $foreground;
+}
+
+.ask-user-menu .ask-user-other-input:focus {
+    border: solid $primary;
+}
+
+.goal-review-menu .goal-review-content {
+    height: auto;
+    max-height: 12;
+    padding: 0 1;
+}
+
+.goal-review-menu .goal-review-body {
+    height: auto;
+}
+
+.goal-review-menu .goal-review-markdown {
+    margin: 0 0 1 0;
+    padding: 0;
+}
+
+.goal-review-menu .goal-review-options-container {
+    height: auto;
+    background: $surface;
+    padding: 0 1;
+    margin-top: 0;
+}
+
+.goal-review-menu .goal-review-option {
+    height: 1;
+    padding: 0 1;
+}
+
+.goal-review-menu .goal-review-option-selected {
+    background: $primary;
+    text-style: bold;
+}
+
+.goal-review-menu .goal-review-edit-input {
+    margin: 1 1 0 1;
+    height: auto;
+    min-height: 4;
+    max-height: 12;
+    background: transparent;
+}
+
+.approval-menu {
+    height: auto;
+    margin: 1 0;
+    padding: 0 1;
+    background: $surface;
+    border: solid $warning;
+}
+
+.approval-menu .approval-title {
+    text-style: bold;
+    color: $warning;
+    margin-bottom: 0;
+}
+
+.approval-menu .approval-command {
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    color: $warning;
+}
+
+.approval-menu .approval-separator {
+    height: 1;
+    color: $warning;
+    margin: 0;
+}
+
+.approval-menu .tool-info-scroll {
+    height: auto;
+    max-height: 10;
+    margin-top: 0;
+}
+
+.approval-menu .tool-info-container {
+    height: auto;
+}
+
+.approval-menu .approval-options-container {
+    height: auto;
+    background: $surface;
+    padding: 0 1;
+    margin-top: 0;
+}
+
+.approval-menu .approval-option {
+    height: 1;
+    padding: 0 1;
+}
+
+.approval-menu .approval-option-selected {
+    background: $primary;
+    text-style: bold;
+}
+
+.approval-menu .approval-reason-input {
+    margin: 1 0 0 0;
+    border: solid $warning;
+    background: $surface;
+}
+
+.approval-menu .approval-help {
+    color: $foreground;
+    text-style: italic;
+    margin-top: 0;
+    margin-bottom: 0;
+}
+
+/* Tool approval widgets & diff styling */
+.tool-approval-widget {
+    height: auto;
+}
+
+.diff-removed {
+    height: auto;
+    color: $text-error;
+    background: $error-muted;
+    padding: 0 1;
+}
+
+.diff-added {
+    height: auto;
+    color: $text-success;
+    background: $success-muted;
+    padding: 0 1;
+}
+
+.diff-context {
+    height: auto;
+    color: $text-muted;
+    padding: 0 1;
+}
+

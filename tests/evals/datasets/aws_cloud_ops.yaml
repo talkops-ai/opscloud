@@ -1,0 +1,22 @@
+version: "1.0"
+tasks:
+  - id: aws-iam-audit
+    task: "Audit IAM roles with AdministratorAccess and list users without MFA"
+    expected_tools:
+      - execute
+    expected_output_patterns:
+      - "(AdministratorAccess|MFA)"
+
+  - id: aws-eks-diagnose
+    task: "Check node status and pod events in the default namespace"
+    expected_tools:
+      - execute
+    expected_output_patterns:
+      - "(Ready|kubectl)"
+
+  - id: aws-finops-idle-ebs
+    task: "Find unattached EBS volumes across us-east-1 and estimate monthly waste"
+    expected_tools:
+      - execute
+    expected_output_patterns:
+      - "(vol-|available|unattached)"

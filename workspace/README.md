@@ -1,1 +1,0 @@
-## This Workspace will contains the genrated terraform modules.
