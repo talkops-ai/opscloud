@@ -211,7 +211,8 @@ def test_thinking_level_max_effort_prioritization(pool_manager):
 
 
 @pytest.mark.asyncio
-async def test_official_model_router_custom_choices():
+async def test_official_model_router_custom_choices(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "mock-test-key-typesafe")
     mock_fast = MagicMock(spec=BaseChatModel)
     mock_powerful = MagicMock(spec=BaseChatModel)
 

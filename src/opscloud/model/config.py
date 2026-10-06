@@ -471,10 +471,17 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
             (resolved.get("aws_access_key_id") and resolved.get("aws_secret_access_key"))
             or (getattr(settings, "aws_access_key_id", None) and getattr(settings, "aws_secret_access_key", None))
         )
-        has_profile = bool(
-            resolved.get("profile_name")
-            or (getattr(settings, "aws_profile", None) and getattr(settings, "aws_profile") != "default")
-        )
+        has_profile = False
+        prof = resolved.get("profile_name") or getattr(settings, "aws_profile", None)
+        if prof and prof != "default":
+            try:
+                import botocore.session
+
+                boto_sess = botocore.session.get_session()
+                if prof in boto_sess.available_profiles:
+                    has_profile = True
+            except Exception:
+                has_profile = False
         if has_keys or has_profile:
             return ProviderAuthStatus(
                 state=ProviderAuthState.CONFIGURED,

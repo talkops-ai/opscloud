@@ -406,11 +406,12 @@ def test_model_selector_smooth_navigation_and_jev_system1():
     assert not opt1.is_selected
 
 
-async def test_model_selector_dismiss_idempotency_and_auth_check():
+async def test_model_selector_dismiss_idempotency_and_auth_check(monkeypatch: pytest.MonkeyPatch):
     """Verify ModelSelectorScreen dismissal is idempotent and prevents ScreenStackError."""
     from opscloud.ui.app import OpsCloudApp
     from opscloud.ui.widgets.model_selector import ModelSelectorScreen
 
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-mock")
     app = OpsCloudApp()
     async with app.run_test(headless=True) as pilot:
         screen = ModelSelectorScreen()
