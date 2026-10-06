@@ -26,11 +26,9 @@ def clean_environment(monkeypatch):
     os.environ.clear()
     os.environ.update(old_env)
     try:
-        from opscloud.config import settings as _settings_mod
+        from opscloud.config.settings import reset_settings_for_testing
 
-        with _settings_mod._settings_lock:
-            _settings_mod._settings = None
-            _settings_mod._bootstrap_state.done = False
+        reset_settings_for_testing()
     except Exception:
         pass
     try:

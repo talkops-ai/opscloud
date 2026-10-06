@@ -58,11 +58,28 @@ def generate_langgraph_json(
     server_graph_file.write_text(server_graph_code, encoding="utf-8")
 
     # Link or create checkpointer.py in output_dir (connects to sessions.db)
+    from opscloud.state.session import get_db_path
+
+    db_path = str(get_db_path())
+    os.environ["OPSCLOUD_SERVER_DB_PATH"] = db_path
+
     checkpointer_file = output_dir / "checkpointer.py"
-    checkpointer_code = (
-        "from opscloud.state.session import get_checkpointer\n"
-        "create_checkpointer = get_checkpointer\n"
-    )
+    checkpointer_code = f'''\
+"""Persistent SQLite checkpointer for the LangGraph dev server."""
+
+import os
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def create_checkpointer():
+    """Yield an AsyncSqliteSaver connected to the sessions DB."""
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    path = os.environ.get("OPSCLOUD_SERVER_DB_PATH") or {repr(db_path)}
+    async with AsyncSqliteSaver.from_conn_string(path) as saver:
+        yield saver
+'''
     checkpointer_file.write_text(checkpointer_code, encoding="utf-8")
     return target
 
@@ -102,9 +119,15 @@ class ServerProcess:
 
         env = os.environ.copy()
         env.update(self.config.to_env())
-        # Ensure python path includes current package and src
-        src_path = str(Path.cwd() / "src")
-        env["PYTHONPATH"] = f"{src_path}:{env.get('PYTHONPATH', '')}" if "PYTHONPATH" in env else src_path
+
+        # If in a dev repository checkout, ensure src/ is on PYTHONPATH.
+        # Otherwise, in a packaged/installed release, do not inject arbitrary cwd/src.
+        repo_src = Path.cwd() / "src" / "opscloud"
+        if repo_src.is_dir() and (Path.cwd() / "pyproject.toml").is_file():
+            src_path = str(Path.cwd() / "src")
+            env["PYTHONPATH"] = f"{src_path}:{env.get('PYTHONPATH', '')}" if "PYTHONPATH" in env else src_path
+        else:
+            env.pop("PYTHONPATH", None)
 
         server_log_level = getattr(self.config, "server_log_level", "WARNING") or "WARNING"
         # Silence noisy startup/profiler heartbeats in LangGraph API by defaulting LOG_LEVEL to WARNING

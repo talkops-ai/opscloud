@@ -4844,7 +4844,7 @@ wheels = [
 
 [[package]]
 name = "talkops-opscloud"
-version = "0.3.0b1"
+version = "0.3.0b2"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },
@@ -4946,7 +4946,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.22.1" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "bashlex", specifier = ">=0.18" },
-    { name = "boto3", specifier = ">=1.35.0" },
+    { name = "boto3", specifier = ">=1.43.51" },
     { name = "colorama", specifier = ">=0.4.6" },
     { name = "daytona", marker = "extra == 'sandboxes'", specifier = ">=0.217.0" },
     { name = "deepagents", extras = ["quickjs"], specifier = ">=0.7.1" },
@@ -4989,29 +4989,29 @@ requires-dist = [
     { name = "markdownify", specifier = ">=1.2.3" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "modal", marker = "extra == 'sandboxes'", specifier = ">=1.5.5" },
-    { name = "packaging", specifier = ">=24.0" },
-    { name = "pillow", specifier = ">=11.0.0" },
+    { name = "packaging", specifier = ">=26.2" },
+    { name = "pillow", specifier = ">=12.3.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
-    { name = "pydantic", specifier = ">=2.10.0" },
-    { name = "pygments", specifier = ">=2.18.0" },
-    { name = "pyperclip", specifier = ">=1.9.0" },
+    { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "pygments", specifier = ">=2.20.0" },
+    { name = "pyperclip", specifier = ">=1.11.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.5" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "requests", specifier = ">=2.32.0" },
-    { name = "rich", specifier = ">=14.0.0" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "requests", specifier = ">=2.34.2" },
+    { name = "rich", specifier = ">=15.0.0" },
     { name = "rich-pixels", specifier = ">=3.0.0" },
-    { name = "tavily-python", specifier = ">=0.5.0" },
-    { name = "textual", specifier = ">=8.0.0" },
+    { name = "tavily-python", specifier = ">=0.7.26" },
+    { name = "textual", specifier = ">=8.2.8" },
     { name = "tomli", specifier = ">=1.1.0" },
-    { name = "tomli-w", specifier = ">=1.1.0" },
-    { name = "typing-extensions", specifier = ">=4.12.0" },
-    { name = "urllib3", specifier = ">=2.2.0" },
-    { name = "uuid-utils", specifier = ">=0.10.0" },
+    { name = "tomli-w", specifier = ">=1.2.0" },
+    { name = "typing-extensions", specifier = ">=4.16.0" },
+    { name = "urllib3", specifier = ">=2.7.0" },
+    { name = "uuid-utils", specifier = ">=0.17.0" },
 ]
 provides-extras = ["dev", "test-integration", "sandboxes"]
 

@@ -410,8 +410,8 @@ def test_get_aws_credentials_dict():
 
 
 def test_langsmith_project_name(monkeypatch):
-    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
-    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+    monkeypatch.setenv("LANGSMITH_API_KEY", "")
+    monkeypatch.setenv("LANGCHAIN_API_KEY", "")
     assert get_langsmith_project_name() is None
 
     monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2_pt_test")

@@ -63,30 +63,16 @@ def _make_graph_sync() -> Any:
 _precompiled_graph: Any = None
 _graph_lock = asyncio.Lock()
 
-# When running in server mode (ServerProcess sets OPSCLOUD_SERVER_ASSISTANT_ID),
-# eagerly compile the graph during module import / container startup.
-# Official LangChain guidance: "Move expensive initialization (API clients, DB connections,
-# model loading) from graph factory if you are seeing API slowness. Export an already-compiled
-# CompiledGraph instance... or keep factory functions lightweight since they run on every invocation."
-if "OPSCLOUD_SERVER_ASSISTANT_ID" in os.environ:
-    try:
-        _precompiled_graph = _make_graph_sync()
-    except Exception as exc:
-        logger.critical("Failed to precompile server graph during startup: %s", exc, exc_info=True)
-        print(f"Failed to precompile server graph during startup: {exc}", file=sys.stderr)
-        raise
-
-
 async def make_graph() -> Any:
     """Return the agent graph for `langgraph dev`.
 
-    Returns the pre-compiled graph in <1ms without incurring per-request compilation latency.
+    Compiles the agent graph lazily on first invocation and caches the CompiledGraph instance
+    to serve subsequent requests in <1ms without per-request compilation latency.
     """
     global _precompiled_graph
     if _precompiled_graph is not None:
         return _precompiled_graph
 
-    # Fallback for environments where OPSCLOUD_SERVER_ASSISTANT_ID wasn't pre-set
     async with _graph_lock:
         if _precompiled_graph is None:
             _precompiled_graph = await asyncio.to_thread(_make_graph_sync)

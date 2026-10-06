@@ -514,13 +514,14 @@ class ConfigManagerScreen(ModalScreen[None]):
                     current_profile=self._settings.aws_profile,
                 )
 
-                def _on_cloud_result(result: str | None) -> None:
+                def _on_cloud_result(result: tuple[str, str | None] | None) -> None:
                     if result:
                         from opscloud.config.cloud_profiles import set_active_aws_profile
 
-                        set_active_aws_profile(result, persist=True)
-                        self._settings.aws_profile = result
-                        self.post_message(self.SettingChanged("aws.profile", result))
+                        profile_name = result[0] if isinstance(result, tuple) else str(result)
+                        set_active_aws_profile(profile_name, persist=True)
+                        self._settings.aws_profile = profile_name
+                        self.post_message(self.SettingChanged("aws.profile", profile_name))
                         self._refresh_options()
 
                 self.app.push_screen(screen, callback=_on_cloud_result)

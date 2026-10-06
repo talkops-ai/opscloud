@@ -102,7 +102,13 @@ def run_interactive(
             trust_project_mcp=trust_project_mcp,
         )
         proc = ServerProcess(config)
-        url = proc.start()
+        try:
+            url = proc.start()
+        except Exception as e:
+            logger.warning("Could not start server immediately: %s", e)
+            proc = None
+            url = None
+            defer_server_start = True
 
     effective_prompt = initial_prompt
     if initial_skill and not effective_prompt:

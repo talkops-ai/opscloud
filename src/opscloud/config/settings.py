@@ -612,6 +612,14 @@ def reload_settings() -> Settings:
     return _settings
 
 
+def reset_settings_for_testing() -> None:
+    """Reset the global Settings singleton and bootstrap state (for tests)."""
+    global _settings
+    with _settings_lock:
+        _settings = None
+        _bootstrap_state.done = False
+
+
 async def reload_from_store(store: Any) -> Settings:
     """Replace the global Settings instance with one hydrated from the store."""
     global _settings
@@ -828,6 +836,7 @@ __all__ = [
     "parse_shell_allow_list",
     "reload_from_store",
     "reload_settings",
+    "reset_settings_for_testing",
     "resolve_env_var",
     "settings",
     "sync_aws_env_aliases",
