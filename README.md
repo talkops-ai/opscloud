@@ -51,9 +51,21 @@ OpsCloud is an extensible, terminal-based multi-agent framework that unifies pla
 
 ### 1. Installation
 
+**Option A: Install via Script (macOS & Linux)**
 ```bash
-# Automated install (macOS & Linux)
-curl -LsSf https://opscloud.talkops.ai/install.sh | bash
+# From GitHub repository
+curl -LsSf https://raw.githubusercontent.com/talkops-ai/opscloud/main/scripts/install.sh | bash
+
+# Or from a local clone
+./scripts/install.sh --local
+```
+
+**Option B: Install from PyPI**
+```bash
+pip install talkops-opscloud
+# or using uv / pipx:
+uv tool install talkops-opscloud
+pipx install talkops-opscloud
 ```
 
 > [!NOTE]

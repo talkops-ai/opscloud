@@ -307,5 +307,5 @@ jobs:
           body_path: /tmp/release_body.md
           files: dist/*
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(needs.meta.outputs.version, 'b') || contains(needs.meta.outputs.version, 'a') || contains(needs.meta.outputs.version, 'rc') }}
           generate_release_notes: false

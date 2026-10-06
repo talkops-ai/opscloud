@@ -1,7 +1,7 @@
 [project]
-name = "opscloud"
-version = "0.1.0"
-description = "Platform for AI agents to securely manage AWS Infrastructure and Applications"
+name = "talkops-opscloud"
+version = "0.3.0b1"
+description = "Extensible Terminal Multi-Agent Framework for Cloud Operations & DevOps Coding"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

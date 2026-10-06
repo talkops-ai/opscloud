@@ -22,7 +22,11 @@ OpsCloud works with 22+ LLM providers, features the ultra-low latency **TypeSafe
 ## Quick Install
 
 ```bash
-curl -LsSf https://opscloud.talkops.ai/install.sh | bash
+# Install via script
+curl -LsSf https://raw.githubusercontent.com/talkops-ai/opscloud/main/scripts/install.sh | bash
+
+# Or install from PyPI
+pip install talkops-opscloud
 
 # Launch the interactive terminal UI
 opscloud

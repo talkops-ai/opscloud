@@ -36,7 +36,7 @@
 #   --uninstall         Uninstall opscloud and clean up binaries
 #
 # Environment variables:
-#   OPSCLOUD_PACKAGE_NAME     — Package name on PyPI (default: "opscloud")
+#   OPSCLOUD_PACKAGE_NAME     — Package name on PyPI (default: "talkops-opscloud")
 #   OPSCLOUD_REPO_URL         — GitHub repo URL (default: "https://github.com/talkops-ai/opscloud")
 #   OPSCLOUD_SOURCE           — "pypi", "git", or "local" (default: auto-detected)
 #   OPSCLOUD_VERSION          — Exact version to install (e.g. "0.1.0")
@@ -56,7 +56,7 @@ set -euo pipefail
 
 # ── Package & Repository Constants ───────────────────────────
 
-PACKAGE_NAME="${OPSCLOUD_PACKAGE_NAME:-opscloud}"
+PACKAGE_NAME="${OPSCLOUD_PACKAGE_NAME:-talkops-opscloud}"
 PRIMARY_BIN="opscloud"
 REPO_URL="${OPSCLOUD_REPO_URL:-https://github.com/talkops-ai/opscloud}"
 DEFAULT_PYTHON="3.12"
