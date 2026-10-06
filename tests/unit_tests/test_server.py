@@ -155,3 +155,49 @@ def test_server_graph_factory_signature():
 
     classification = _classify_factory(make_graph)
     assert classification == {}
+
+
+def test_wait_for_graph_ready_single_request():
+    """Verify wait_for_graph_ready sends a single request with full remaining timeout."""
+    import httpx
+    from unittest.mock import MagicMock, patch
+
+    cfg = ServerConfig()
+    proc = ServerProcess(cfg, port=8123)
+    proc.process = MagicMock()
+    proc.process.poll.return_value = None
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+
+    with patch("httpx.get", return_value=mock_resp) as mock_get:
+        proc.wait_for_graph_ready("agent", timeout=15.0)
+
+        # Must be called exactly once
+        assert mock_get.call_count == 1
+        call_url, call_kwargs = mock_get.call_args[0][0], mock_get.call_args[1]
+        assert call_url == f"{proc.url}/assistants/agent/graph"
+        # Timeout must be approximately 15.0s, not 2.0s
+        assert 14.0 <= call_kwargs["timeout"] <= 15.0
+
+
+def test_wait_for_graph_ready_fallback():
+    """Verify wait_for_graph_ready falls back from agent to opscloud on 404."""
+    import httpx
+    from unittest.mock import MagicMock, patch
+
+    cfg = ServerConfig()
+    proc = ServerProcess(cfg, port=8123)
+    proc.process = MagicMock()
+    proc.process.poll.return_value = None
+
+    resp_404 = MagicMock(status_code=404)
+    resp_200 = MagicMock(status_code=200)
+
+    with patch("httpx.get", side_effect=[resp_404, resp_200]) as mock_get:
+        proc.wait_for_graph_ready("agent", timeout=15.0)
+
+        assert mock_get.call_count == 2
+        assert mock_get.call_args_list[0][0][0] == f"{proc.url}/assistants/agent/graph"
+        assert mock_get.call_args_list[1][0][0] == f"{proc.url}/assistants/opscloud/graph"
+

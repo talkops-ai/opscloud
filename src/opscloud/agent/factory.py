@@ -707,9 +707,9 @@ def create_opscloud_agent(
     from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT, SubAgent
 
     compiled_subagents: list[SubAgent] = []
-    base_subagent_tools = [t for t in all_tools if t not in mcp_tools_list]
     for name, subagent_meta in subagent_by_name.items():
         model_spec = subagent_meta.get("model")
+        has_explicit_model = bool(model_spec)
         sub_prompt = subagent_meta.get("system_prompt") or ""
         subagent_dict: dict[str, Any] = {
             "name": subagent_meta.get("name") or name,
@@ -717,30 +717,14 @@ def create_opscloud_agent(
             "system_prompt": sub_prompt,
         }
         if model_spec:
-            try:
-                sub_model_res = create_model(model_spec)
-                subagent_dict["model"] = sub_model_res.model
-            except Exception as e:
-                logger.warning("Failed to resolve model %s for subagent %s: %s", model_spec, name, e)
+            subagent_dict["model"] = model_spec
 
         subagent_name = subagent_meta.get("name") or name
         subagent_path = subagent_meta.get("path")
         custom_mw = subagent_meta.get("middleware")
 
-        # Build per-subagent MCP config and tools for this subagent
-        from opscloud.plugins.adapters.mcp import prepare_subagent_mcp
-
-        servers, subagent_mcp_tools, sub_mcp_server_infos = prepare_subagent_mcp(
-            subagent_name, subagent_meta, project_scope_root
-        )
-
-        if subagent_mcp_tools:
-            subagent_dict["tools"] = [*base_subagent_tools, *subagent_mcp_tools]
-        else:
-            subagent_dict["tools"] = list(base_subagent_tools)
-
         sub_middleware = _subagent_cli_middleware(
-            has_explicit_model=bool(model_spec),
+            has_explicit_model=has_explicit_model,
             assistant_id=assistant_id,
             subagent_name=subagent_name,
             subagent_meta=subagent_meta,
@@ -754,11 +738,8 @@ def create_opscloud_agent(
             worktree_root=effective_cwd,
             subagent_path=subagent_path if subagent_path else None,
             custom_middleware=custom_mw if isinstance(custom_mw, list) else None,
-            mcp_server_info=sub_mcp_server_infos or None,
-            mcp_config=servers or None,
-            mcp_tools=subagent_mcp_tools or None,
             backend=composite_backend,
-            model=subagent_dict.get("model") or active_model,
+            model=active_model,
         )
         if sub_middleware:
             subagent_dict["middleware"] = sub_middleware
@@ -767,10 +748,9 @@ def create_opscloud_agent(
 
         compiled_subagents.append(cast(SubAgent, subagent_dict))
         logger.info(
-            "Compiled subagent '%s' (tools: %d)",
+            "Registered declarative subagent '%s'",
             subagent_name,
-            len(subagent_dict.get("tools", [])),
-            extra={"subagent": subagent_name, "tools_count": len(subagent_dict.get("tools", []))},
+            extra={"subagent": subagent_name},
         )
 
     if not any(sub.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for sub in compiled_subagents):
@@ -793,7 +773,6 @@ def create_opscloud_agent(
             "name": gp_name,
             "description": gp_description,
             "system_prompt": gp_system_prompt,
-            "tools": list(base_subagent_tools),
             "middleware": gp_middleware,
         }
         if interrupt_on is not None:
@@ -810,7 +789,7 @@ def create_opscloud_agent(
                 },
             )
         logger.info(
-            "Compiled subagent '%s'",
+            "Registered declarative subagent '%s'",
             gp_name,
             extra={"subagent": gp_name},
         )

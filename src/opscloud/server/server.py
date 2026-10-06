@@ -201,23 +201,42 @@ class ServerProcess:
 
     def wait_for_graph_ready(self, graph_name: str = "agent", timeout: float = 30.0) -> None:
         """Resolve the served graph once so lazy startup failures surface immediately."""
+        if self.process is None:
+            raise RuntimeError("Server process is not running")
+
         deadline = time.monotonic() + timeout
         graph_url = f"{self.url}/assistants/{graph_name}/graph"
 
         while time.monotonic() < deadline:
-            if self.process and self.process.poll() is not None:
+            if self.process.poll() is not None:
                 err = self._read_log_tail()
-                raise RuntimeError(f"Server exited prematurely with code {self.process.returncode}:\n{err}")
+                raise RuntimeError(f"Server process exited with code {self.process.returncode}:\n{err}")
+
+            remaining = max(0.1, deadline - time.monotonic())
             try:
-                resp = httpx.get(graph_url, timeout=2.0)
-                if resp.status_code == 200:
-                    logger.info("Server graph %r is ready at %s", graph_name, self.url)
-                    return
-                elif resp.status_code == 404 and graph_name == "agent":
-                    graph_name = "opscloud"
-                    graph_url = f"{self.url}/assistants/{graph_name}/graph"
-            except Exception:
-                time.sleep(0.2)
+                resp = httpx.get(graph_url, timeout=remaining)
+            except (httpx.TransportError, httpx.TimeoutException, OSError) as exc:
+                err = self._read_log_tail()
+                if self.process.poll() is not None:
+                    msg = f"Server process exited with code {self.process.returncode}:\n{err}"
+                else:
+                    msg = f"Server graph '{graph_name}' did not initialize within {timeout}s:\n{err}"
+                raise RuntimeError(msg) from exc
+
+            if resp.status_code == 200:
+                logger.info("Server graph %r is ready at %s", graph_name, self.url)
+                return
+            elif resp.status_code == 404 and graph_name == "agent":
+                graph_name = "opscloud"
+                graph_url = f"{self.url}/assistants/{graph_name}/graph"
+                continue
+
+            err = self._read_log_tail()
+            msg = f"Server graph '{graph_name}' failed readiness check (status: {resp.status_code}):\n{err}"
+            raise RuntimeError(msg)
+
+        err = self._read_log_tail()
+        raise RuntimeError(f"Server graph '{graph_name}' did not initialize within {timeout}s:\n{err}")
 
     def _stop_process(self) -> None:
         """Stop only the server subprocess and its log file handle."""
