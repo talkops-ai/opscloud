@@ -81,5 +81,5 @@ class BtwHandler(BaseCommandHandler):
 
         return CommandResult(
             success=True,
-            message=f"💬 **Aside:** {question}\n\n_(Agent not connected — aside queued for next turn.)_",
+            message=f"**Aside:** {question}\n\n_(Agent not connected — aside queued for next turn.)_",
         )

@@ -102,10 +102,10 @@ class PermissionsHandler(BaseCommandHandler):
         if store is None:
             return CommandResult(success=False, message="Permission store not available.")
 
-        lines = [f"🔐 **Permission Scopes** (mode: {store.mode})\n"]
+        lines = [f"**Permission Scopes** (mode: {store.mode})\n"]
         for scope in sorted(VALID_SCOPES):
             status = store.evaluate(scope)
-            icons = {"allow": "✅", "ask": "🟡", "deny": "🔒"}
+            icons = {"allow": "[allow]", "ask": "[ask]", "deny": "[deny]"}
             labels = {"allow": "granted", "ask": "requires approval", "deny": "denied"}
             lines.append(f"  {icons[status]} `{scope}`: {labels[status]}")
 
@@ -115,7 +115,7 @@ class PermissionsHandler(BaseCommandHandler):
             lines.append("\n**Tool-Pattern Rules:**")
             for rule in tool_rules:
                 cat = "allow" if rule in store.allow else "ask" if rule in store.ask else "deny"
-                icons = {"allow": "✅", "ask": "🟡", "deny": "🔒"}
+                icons = {"allow": "[allow]", "ask": "[ask]", "deny": "[deny]"}
                 lines.append(f"  {icons[cat]} `{rule.pattern}` [{cat}]")
 
         lines.append("\n_Use `/permissions` in TUI for interactive management._")
@@ -132,7 +132,7 @@ class PermissionsHandler(BaseCommandHandler):
         # Accept both scope-based and tool-pattern rules
         store.add_rule("allow", scope, source="session")
         self._persist(store)
-        return CommandResult(success=True, message=f"✅ Granted (Allow): `{scope}`")
+        return CommandResult(success=True, message=f"Granted (Allow): `{scope}`")
 
     def _revoke(self, ctx: CommandContext, scope: str) -> CommandResult:
         """Revoke a scope — move it to 'ask' (require approval)."""
@@ -142,7 +142,7 @@ class PermissionsHandler(BaseCommandHandler):
 
         store.add_rule("ask", scope, source="session")
         self._persist(store)
-        return CommandResult(success=True, message=f"🟡 Revoked: `{scope}` — now requires approval")
+        return CommandResult(success=True, message=f"Revoked: `{scope}` — now requires approval")
 
     def _reset(self, ctx: CommandContext) -> CommandResult:
         """Reset all permissions to defaults."""
@@ -152,7 +152,7 @@ class PermissionsHandler(BaseCommandHandler):
 
         store.reset()
         self._persist(store)
-        return CommandResult(success=True, message="🔄 Permissions reset to defaults.")
+        return CommandResult(success=True, message="Permissions reset to defaults.")
 
     def _set_mode(self, ctx: CommandContext, mode_name: str) -> CommandResult:
         """Set a permission mode preset."""
@@ -169,7 +169,7 @@ class PermissionsHandler(BaseCommandHandler):
         store.apply_mode(mode_name)
         self._persist(store)
         desc = PERMISSION_MODES[mode_name]
-        return CommandResult(success=True, message=f"🔧 Permission mode set to `{mode_name}` — {desc}")
+        return CommandResult(success=True, message=f"Permission mode set to `{mode_name}` — {desc}")
 
     def _show_mode(self, ctx: CommandContext) -> CommandResult:
         """Show current permission mode and available modes."""
@@ -177,7 +177,7 @@ class PermissionsHandler(BaseCommandHandler):
         if store is None:
             return CommandResult(success=False, message="Permission store not available (no app context).")
 
-        lines = [f"🔧 **Current mode:** `{store.mode}`\n", "**Available modes:**"]
+        lines = [f"**Current mode:** `{store.mode}`\n", "**Available modes:**"]
         for mode, desc in PERMISSION_MODES.items():
             marker = " ← current" if mode == store.mode else ""
             lines.append(f"  `{mode}`: {desc}{marker}")

@@ -56,7 +56,7 @@ class OperationCard(Widget):
         self._logs: list[str] = []
 
     def compose(self):
-        title = Text(f"⚡ Operation: {self.op_name} [{self.env}]", style="bold amber")
+        title = Text(f"Operation: {self.op_name} [{self.env}]", style="bold amber")
         yield Static(title, classes="header", id=f"hdr-{self.operation_id}")
 
         with VerticalScroll(id=f"log-{self.operation_id}"):
@@ -73,7 +73,7 @@ class OperationCard(Widget):
             elapsed = int(time.time() - self._start_time)
             mins, secs = divmod(elapsed, 60)
             hdr = self.query_one(f"#hdr-{self.operation_id}", Static)
-            title = Text(f"⚡ Operation: {self.op_name} [{self.env}] ⏱️ {mins:02d}:{secs:02d}", style="bold warning")
+            title = Text(f"Operation: {self.op_name} [{self.env}] ({mins:02d}:{secs:02d})", style="bold warning")
             hdr.update(title)
 
     def append_log(self, line: str) -> None:
@@ -92,7 +92,7 @@ class OperationCard(Widget):
             hdr = self.query_one(f"#hdr-{self.operation_id}", Static)
             icon = "✓" if success else "✗"
             style = "bold green" if success else "bold red"
-            hdr.update(Text(f"{icon} Operation: {self.op_name} ({self._status}) ⏱️ {elapsed}s", style=style))
+            hdr.update(Text(f"{icon} Operation: {self.op_name} ({self._status}) in {elapsed}s", style=style))
             if self.app is not None:
                 msg = f"Operation '{self.op_name}' completed in {elapsed}s"
                 severity = "information" if success else "error"

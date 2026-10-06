@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import json
 import re
 from hashlib import sha256
@@ -12,7 +13,9 @@ from opscloud.plugins.substitution import plugin_environment, substitute_json
 from opscloud.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from opscloud.plugins.models import PluginInstance
+    from opscloud.subagents.types import SubagentMetadata
 
 logger = get_logger(__name__)
 
@@ -186,6 +189,7 @@ def plugin_mcp_configs(
     plugins: tuple[PluginInstance, ...] | list[PluginInstance],
     *,
     project_dir: Path | None = None,
+    include_subagents: bool = False,
 ) -> list[dict[str, Any]]:
     """Build MCP config layers for enabled plugins.
 
@@ -194,6 +198,9 @@ def plugin_mcp_configs(
     """
     configs: list[dict[str, Any]] = []
     for plugin in plugins:
+        if not include_subagents and plugin.is_agent_plugin:
+            continue  # Dynamic subagent plugins isolate their own MCP servers
+
         if plugin.data_dir is not None:
             try:
                 plugin.data_dir.mkdir(parents=True, exist_ok=True)
@@ -222,7 +229,7 @@ def plugin_mcp_configs(
 def subagent_mcp_configs(
     subagent_name: str,
     bundle_dir: Path,
-    mcp_files: list[str | Path] | None = None,
+    mcp_files: Sequence[str | Path] | None = None,
     *,
     project_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -258,11 +265,13 @@ def subagent_mcp_configs(
 def discover_plugin_mcp_configs(
     *,
     project_dir: Path | None = None,
+    include_subagents: bool = False,
 ) -> dict[str, Any]:
     """Discover enabled plugins and return merged MCP server configurations.
 
     Args:
         project_dir: Project directory for variable substitution.
+        include_subagents: Whether to include MCP servers from agent-based plugins.
 
     Returns:
         Dict mapping server names to normalized server configs.
@@ -272,9 +281,83 @@ def discover_plugin_mcp_configs(
 
         result = discover_plugins(project_root=project_dir)
         merged: dict[str, Any] = {}
-        for layer in plugin_mcp_configs(result.plugins, project_dir=project_dir):
+        for layer in plugin_mcp_configs(
+            result.plugins,
+            project_dir=project_dir,
+            include_subagents=include_subagents,
+        ):
             merged.update(layer)
         return merged
     except Exception as exc:
         logger.debug("Could not discover plugin MCP configs: %s", exc)
         return {}
+
+
+def prepare_subagent_mcp(
+    subagent_name: str,
+    subagent_meta: SubagentMetadata | Mapping[str, Any],
+    project_root: Path | None = None,
+) -> tuple[dict[str, Any], list[Any], list[Any]]:
+    """Prepare and preload MCP servers and tools for a subagent.
+
+    Args:
+        subagent_name: Name of the subagent.
+        subagent_meta: Subagent metadata dict.
+        project_root: Optional project scope root directory.
+
+    Returns:
+        Tuple of (servers_dict, subagent_mcp_tools, sub_mcp_server_infos).
+    """
+    import asyncio
+    import concurrent.futures
+    from opscloud.plugins.adapters.agents import get_subagent_bundle_dir
+
+    servers: dict[str, Any] = {}
+    bundle_dir = get_subagent_bundle_dir(subagent_meta)
+    mcp_files_raw = subagent_meta.get("mcp_files")
+    mcp_files = list(mcp_files_raw) if mcp_files_raw is not None else None
+    if bundle_dir and bundle_dir.is_dir():
+        servers.update(subagent_mcp_configs(subagent_name, bundle_dir, mcp_files, project_dir=project_root))
+
+    raw_mcp_cfg = subagent_meta.get("mcp_config")
+    if raw_mcp_cfg and isinstance(raw_mcp_cfg, dict):
+        servers.update(raw_mcp_cfg.get("mcpServers") or raw_mcp_cfg)
+
+    if not servers:
+        return {}, [], []
+
+    subagent_mcp_tools: list[Any] = []
+    sub_mcp_server_infos: list[Any] = []
+    try:
+        from opscloud.mcp.preload import get_cached_mcp_server_infos, preload_mcp_metadata
+        from opscloud.mcp.session_manager import MCPSessionManager, build_mcp_tools_from_server_infos
+
+        sub_mcp_manager = MCPSessionManager.get_instance(servers, purge_missing=False)
+        sub_mcp_manager.register_servers(servers)
+
+        cached_infos = get_cached_mcp_server_infos()
+        cached_by_name = {info.name: info for info in cached_infos}
+        missing_configs = {k: v for k, v in servers.items() if k not in cached_by_name}
+
+        if missing_configs:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    new_infos = pool.submit(asyncio.run, preload_mcp_metadata(missing_configs)).result()
+            else:
+                new_infos = asyncio.run(preload_mcp_metadata(missing_configs))
+            cached_infos.extend(new_infos)
+            cached_by_name.update({info.name: info for info in new_infos})
+
+        sub_mcp_server_infos = [cached_by_name[k] for k in servers if k in cached_by_name]
+        sub_tools = build_mcp_tools_from_server_infos(sub_mcp_server_infos, sub_mcp_manager)
+        if sub_tools:
+            subagent_mcp_tools.extend(sub_tools)
+    except Exception as exc:
+        logger.warning("Could not initialize subagent %s MCP tools: %s", subagent_name, exc)
+
+    return servers, subagent_mcp_tools, sub_mcp_server_infos

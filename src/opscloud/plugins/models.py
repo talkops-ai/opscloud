@@ -170,6 +170,41 @@ class PluginInstance:
         """Alias for root for backward compatibility."""
         return self.root
 
+    @property
+    def is_agent_plugin(self) -> bool:
+        """Return True if this plugin provides autonomous agents (agent-based plugin)."""
+        if self.inventory.agents:
+            return any(
+                (p.is_dir() and any(p.glob("*.md"))) or (p.is_file() and p.suffix == ".md")
+                for p in self.inventory.agents
+                if p.exists()
+            )
+        if self.root and isinstance(self.root, Path):
+            agents_dir = self.root / "agents"
+            return agents_dir.is_dir() and any(agents_dir.glob("*.md"))
+        return False
+
+    @property
+    def has_agents(self) -> bool:
+        """Alias for is_agent_plugin."""
+        return self.is_agent_plugin
+
+    @property
+    def is_partner_plugin(self) -> bool:
+        """Return True if plugin provides MCP tools and skills without autonomous agents."""
+        return not self.is_agent_plugin and bool(self.inventory.mcp_files or (self.manifest and self.manifest.inline_mcp))
+
+    @property
+    def is_vertical_plugin(self) -> bool:
+        """Return True if plugin provides specialized skills without agents or MCP servers."""
+        return not self.is_agent_plugin and not self.is_partner_plugin and bool(self.inventory.skills)
+
+
+def is_agent_plugin_dir(plugin_dir: Path) -> bool:
+    """Return True if a plugin directory contains an agents/ component with markdown definitions."""
+    agents_dir = plugin_dir / "agents"
+    return agents_dir.is_dir() and any(agents_dir.glob("*.md"))
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class LocalPluginSource:

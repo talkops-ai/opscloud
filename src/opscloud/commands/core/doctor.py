@@ -522,7 +522,7 @@ class DoctorHandler(BaseCommandHandler):
 
         # Assemble final output: markdown header + code block + markdown footer
         parts: list[str] = [
-            "🩺 **OpsCode Doctor**\n",
+            "**OpsCode Doctor**\n",
             "```",
             "\n".join(tree_lines),
             "```",

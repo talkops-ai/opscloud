@@ -173,7 +173,7 @@ class PermissionsManagerScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Static("🔐 Permissions", classes="perm-title")
+            yield Static("Permissions", classes="perm-title")
 
             # Tab bar as a single Static with formatted text
             yield Static(self._build_tab_bar_text(), classes="perm-tab-bar", id="perm-tab-bar")
@@ -299,11 +299,11 @@ class PermissionsManagerScreen(ModalScreen[None]):
 
             status = self._store.evaluate(scope)
             if status == "allow":
-                icon, label = "✅", "granted"
+                icon, label = "[allow]", "granted"
             elif status == "ask":
-                icon, label = "🟡", "requires approval"
+                icon, label = "[ask]", "requires approval"
             else:
-                icon, label = "🔒", "denied"
+                icon, label = "[deny]", "denied"
 
             option_list.add_option(Option(f"  {icon} {scope}: {label}", id=f"scope:{scope}"))
 
@@ -319,7 +319,7 @@ class PermissionsManagerScreen(ModalScreen[None]):
                 if self._search_query and self._search_query not in rule.pattern.lower():
                     continue
                 cat = self._find_rule_category(rule)
-                icon = {"allow": "✅", "ask": "🟡", "deny": "🔒"}.get(cat, "❓")
+                icon = {"allow": "[allow]", "ask": "[ask]", "deny": "[deny]"}.get(cat, "[?]")
                 option_list.add_option(Option(f"  {icon} {rule.pattern} [{cat}]", id=f"tool:{rule.pattern}"))
 
     def _render_recently_denied(self, option_list: OptionList) -> None:
@@ -332,7 +332,7 @@ class PermissionsManagerScreen(ModalScreen[None]):
             if self._search_query and self._search_query not in action.display_label.lower():
                 continue
             ts = time.strftime("%H:%M:%S", time.localtime(action.denied_at))
-            label = f"  🚫 [{ts}] {action.display_label}"
+            label = f"  [{ts}] {action.display_label}"
             if action.comment:
                 label += f" — {action.comment[:30]}"
             option_list.add_option(Option(label, id=f"denied:{i}"))
@@ -357,14 +357,14 @@ class PermissionsManagerScreen(ModalScreen[None]):
         else:
             for rule in filtered:
                 source_tag = f" [{rule.source}]" if rule.source != "session" else ""
-                icon = {"allow": "✅", "ask": "🟡", "deny": "🔒"}.get(category, "")
+                icon = {"allow": "[allow]", "ask": "[ask]", "deny": "[deny]"}.get(category, "")
                 option_list.add_option(Option(
                     f"  {icon} {rule.pattern}{source_tag}",
                     id=f"rule:{category}:{rule.pattern}",
                 ))
 
         option_list.add_option(Option("", disabled=True))
-        option_list.add_option(Option("  ＋ Add a new rule…", id=f"add:{category}"))
+        option_list.add_option(Option("  + Add a new rule...", id=f"add:{category}"))
 
     def _render_workspace(self, option_list: OptionList) -> None:
         """Show all rules grouped by source."""
@@ -384,17 +384,17 @@ class PermissionsManagerScreen(ModalScreen[None]):
             sources.setdefault(rule.source, []).append((cat, rule))
 
         source_labels = {
-            "default": "📋 Default Rules",
-            "session": "💬 Session Rules (this session only)",
-            "config": "💾 Config Rules (~/.opscloud/config.toml)",
-            "mode": "🔧 Mode Preset Rules",
+            "default": "Default Rules",
+            "session": "Session Rules (this session only)",
+            "config": "Config Rules (~/.opscloud/config.toml)",
+            "mode": "Mode Preset Rules",
         }
 
         for source, items in sources.items():
-            label = source_labels.get(source, f"📄 {source}")
+            label = source_labels.get(source, str(source))
             option_list.add_option(Option(f"  {label}", disabled=True))
             for cat, rule in items:
-                icon = {"allow": "✅", "ask": "🟡", "deny": "🔒"}.get(cat, "")
+                icon = {"allow": "[allow]", "ask": "[ask]", "deny": "[deny]"}.get(cat, "")
                 option_list.add_option(Option(
                     f"    {icon} {rule.pattern} [{cat}]",
                     id=f"ws:{cat}:{rule.pattern}",
@@ -446,7 +446,7 @@ class PermissionsManagerScreen(ModalScreen[None]):
                 self._store.add_rule("allow", pattern, source="session")
                 self._persist()
                 self._render_tab_content()
-                self.app.notify(f"✅ Added Allow rule: {pattern}", severity="information")
+                self.app.notify(f"Added Allow rule: {pattern}", severity="information")
             return
 
     def action_delete_rule(self) -> None:
@@ -509,9 +509,8 @@ class PermissionsManagerScreen(ModalScreen[None]):
         self._persist()
         self._render_tab_content()
 
-        icons = {"allow": "✅", "ask": "🟡", "deny": "🔒"}
         self.app.notify(
-            f"{icons.get(new_status, '')} {scope}: {new_status}",
+            f"[{new_status}] {scope}: {new_status}",
             severity="information",
         )
 
@@ -627,9 +626,8 @@ class _AddRuleScreen(ModalScreen[tuple[str, str] | None]):
 
     def compose(self) -> ComposeResult:
         cat_display = self._category.title()
-        icon = {"allow": "✅", "ask": "🟡", "deny": "🔒"}.get(self._category, "")
         with Vertical():
-            yield Static(f"{icon} Add {cat_display} Rule", classes="add-rule-title")
+            yield Static(f"Add {cat_display} Rule", classes="add-rule-title")
             yield Static(
                 "Scope: shell:read, file:write, infra:apply\n"
                 "Pattern: Shell(kubectl get *), FileEdit(src/*)",

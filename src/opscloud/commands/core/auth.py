@@ -83,11 +83,11 @@ class LogoutHandler(BaseCommandHandler):
             names = ", ".join(cleared)
             return CommandResult(
                 success=True,
-                message=f"🔒 Logged out. Credentials revoked and removed from disk for: `{names}`",
+                message=f"Logged out. Credentials revoked and removed from disk for: `{names}`",
             )
         return CommandResult(
             success=True,
-            message="🔒 No active credentials found to revoke.",
+            message="No active credentials found to revoke.",
         )
 
 

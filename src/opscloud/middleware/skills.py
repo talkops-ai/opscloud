@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
     from langgraph.runtime import Runtime
     from opscloud.skills.registry import SkillSourceTuple
+    from opscloud.skills.sources import CodeSkillSource
 
 from opscloud.utils.logger import get_logger
 
@@ -164,13 +165,14 @@ class PluginSkillsMiddleware(SkillsMiddleware):
         self,
         *,
         backend: BackendProtocol | None = None,
-        sources: Sequence[SkillSourceTuple] | None = None,
+        sources: Sequence[CodeSkillSource | SkillSourceTuple | tuple[str, ...]] | None = None,
         skill_sources: Sequence[Any] | None = None,
         system_prompt: str | None = None,
         allowed_skills: Sequence[str] | None = None,
         include_subagent_skills: bool = False,
         subagents: Sequence[Any] | None = None,
         planning_mode: bool = False,
+        project_root: Path | str | None = None,
     ) -> None:
         """Initialize PluginSkillsMiddleware with backend, sources, and filtering options.
 
@@ -183,8 +185,10 @@ class PluginSkillsMiddleware(SkillsMiddleware):
             include_subagent_skills: Whether to inherit subagent-specific skills.
             subagents: Sequence of subagents whose skills to discover.
             planning_mode: Whether planning mode is active.
+            project_root: Optional project root path for skill discovery.
         """
         self._planning_mode = planning_mode
+        self._project_root = Path(project_root) if project_root else None
         if system_prompt is None:
             system_prompt = CRITERIA_SKILLS_SYSTEM_PROMPT if planning_mode else sdk_skills.SKILLS_SYSTEM_PROMPT
 
@@ -200,9 +204,10 @@ class PluginSkillsMiddleware(SkillsMiddleware):
             if skill_sources is not None:
                 sources = [(str(getattr(s, "path", s)), getattr(s, "name", str(s))) for s in skill_sources]
             else:
-                from opscloud.skills.registry import SkillRegistry
+                from opscloud.skills.sources import get_skill_sources
 
-                sources = SkillRegistry.get_instance().get_sources_for_middleware(
+                sources = get_skill_sources(
+                    project_root=self._project_root,
                     include_subagent_skills=include_subagent_skills,
                     subagents=subagents,
                 )
@@ -249,13 +254,18 @@ class PluginSkillsMiddleware(SkillsMiddleware):
         for pattern in self._allowed_skills:
             if fnmatch.fnmatch(skill_name, pattern) or fnmatch.fnmatch(skill_name.lower(), pattern.lower()):
                 return True
+            if ":" in pattern:
+                prefix, base_pat = pattern.split(":", 1)
+                if base_pat == "*" or fnmatch.fnmatch(skill_name, base_pat) or fnmatch.fnmatch(skill_name.lower(), base_pat.lower()):
+                    return True
         return False
 
     def _get_live_skills(self) -> tuple[list[sdk_skills.SkillMetadata], list[str]]:
         if self._dynamic_sources:
-            from opscloud.skills.registry import SkillRegistry
+            from opscloud.skills.sources import get_skill_sources
 
-            live_sources = SkillRegistry.get_instance().get_sources_for_middleware(
+            live_sources = get_skill_sources(
+                project_root=self._project_root,
                 include_subagent_skills=self._include_subagent_skills,
                 subagents=self._subagents,
             )

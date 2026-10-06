@@ -164,10 +164,10 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
             yield Static(title, classes="thread-selector-title")
             yield SearchInput(placeholder="Type to search threads...", id="thread-filter")
             yield CustomOptionList(*self._build_options(), id="thread-options")
-            yield Static("↑/↓ navigate  •  Enter select  •  Ctrl+D / Delete / 🗑️ delete  •  Esc cancel", classes="thread-selector-help")
+            yield Static("↑/↓ navigate  •  Enter select  •  Ctrl+D / Delete  •  Esc cancel", classes="thread-selector-help")
 
     def _build_options(self) -> list[Option]:
-        options = [Option("➕ Start New Thread", id="__new__")]
+        options = [Option("+ Start New Thread", id="__new__")]
         for idx, t in enumerate(self._threads, start=1):
             tid = t.get("thread_id", "unknown")
             msg_cnt = t.get("message_count", 0)
@@ -179,7 +179,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
                 if q not in tid.lower() and q not in init_prompt.lower():
                     continue
 
-            is_curr = " 🟢 (active)" if tid == self._current_thread_id else ""
+            is_curr = " (active)" if tid == self._current_thread_id else ""
 
             msg_str = f"{msg_cnt:>3} msgs"
             tid_short = f"{tid[:8]}"
@@ -187,10 +187,10 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
 
             prefix = f"{msg_str} │ `{tid_short}` │ {prompt_trunc}{is_curr}"
 
-            # Display right-padded bold red trash icon 🗑️ ONLY on hovered/highlighted row
+            # Display right-padded [del] text ONLY on hovered/highlighted row
             if self._highlighted_index == len(options):
                 pad_len = max(2, 70 - len(prefix))
-                label = f"{prefix}{' ' * pad_len}[bold red]🗑️[/bold red]"
+                label = f"{prefix}{' ' * pad_len}[bold red][del][/bold red]"
             else:
                 label = prefix
 
@@ -222,7 +222,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         try:
             opt_list = self.query_one("#thread-options", CustomOptionList)
-            # Check if mouse click was on the 🗑️ trash icon on the right (x >= 40)
+            # Check if mouse click was on the delete action on the right (x >= 40)
             if opt_list.last_click_x is not None and opt_list.last_click_x >= 40:
                 opt_list.last_click_x = None
                 self.action_delete_thread()

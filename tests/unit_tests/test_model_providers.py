@@ -2,15 +2,10 @@
 
 import pytest
 from opscloud.model.config import (
-    AVAILABLE_MODELS,
     NO_AUTH_REQUIRED_PROVIDERS,
     PROVIDER_API_KEY_ENV,
-    PROVIDER_BASE_URL_ENV,
-    PROVIDER_DISPLAY_NAMES,
     detect_provider,
     format_token_count,
-    get_credential_env_var,
-    get_provider_auth_status,
     get_provider_display_name,
     resolve_model_spec,
 )
@@ -82,6 +77,7 @@ def test_resolve_model_spec():
 def test_detect_provider():
     assert detect_provider("gpt-4o") == "openai"
     assert detect_provider("claude-3-7-sonnet") == "anthropic"
+    assert detect_provider("gemini-3.8-flash") == "google_genai"
     assert detect_provider("gemini-2.5-flash") == "google_genai"
     assert detect_provider("deepseek-chat") == "deepseek"
     assert detect_provider("mistral-large") == "mistralai"
@@ -207,7 +203,7 @@ def test_bedrock_auth_status_and_kwargs(monkeypatch):
 
 def test_no_default_model_or_provider_without_user_selection(monkeypatch):
     """Ensure that the system never imposes a default model or provider on the user."""
-    from opscloud.config.settings import Settings, get_settings
+    from opscloud.config.settings import get_settings
     from opscloud.exceptions import NoCredentialsConfiguredError
     from opscloud.model.config import ModelConfig
     from opscloud.model.factory import _get_default_model_spec
@@ -263,6 +259,7 @@ def test_unified_model_config_consistency():
     genai_curated = get_curated_models_for_provider("google_genai")
     assert len(genai_curated) >= 12
     model_ids = [m[0] for m in genai_curated]
+    assert "gemini-3.8-flash" in model_ids
     assert "gemini-3.7-flash" in model_ids
     assert "gemini-3.6-flash" in model_ids
     assert "gemini-3.5-flash" in model_ids
@@ -271,8 +268,12 @@ def test_unified_model_config_consistency():
     # 4. get_available_models_list has curated models at the beginning
     avail = get_available_models_list()
     avail_specs = [m[0] for m in avail]
+    assert "google_genai:gemini-3.8-flash" in avail_specs
     assert "google_genai:gemini-3.7-flash" in avail_specs
     assert "google_genai:gemini-3.6-flash" in avail_specs
+    assert "google_vertexai:gemini-3.8-flash" in avail_specs
+    assert "openrouter:google/gemini-3.8-flash" in avail_specs
+    assert "litellm:gemini/gemini-3.8-flash" in avail_specs
 
 
 def test_model_selector_prioritizes_active_and_shows_all_curated_models():
@@ -288,6 +289,7 @@ def test_model_selector_prioritizes_active_and_shows_all_curated_models():
     assert screen._recommended_only is True
     filtered_specs = [m[0] for m in screen._filtered_models]
     assert "auto" in filtered_specs
+    assert "google_genai:gemini-3.8-flash" in filtered_specs
     assert "google_genai:gemini-3.7-flash" in filtered_specs
     assert "google_genai:gemini-3.6-flash" in filtered_specs
     assert "google_genai:gemini-3.5-flash" in filtered_specs
@@ -404,4 +406,110 @@ def test_model_selector_smooth_navigation_and_jev_system1():
     assert not opt1.is_selected
 
 
+async def test_model_selector_dismiss_idempotency_and_auth_check():
+    """Verify ModelSelectorScreen dismissal is idempotent and prevents ScreenStackError."""
+    from opscloud.ui.app import OpsCloudApp
+    from opscloud.ui.widgets.model_selector import ModelSelectorScreen
 
+    app = OpsCloudApp()
+    async with app.run_test(headless=True) as pilot:
+        screen = ModelSelectorScreen()
+        results = []
+        app.push_screen(screen, lambda res: results.append(res))
+        await pilot.pause()
+        assert len(app._screen_stack) == 2
+
+        # 1st call via _select_with_auth_check
+        screen._select_with_auth_check("google_genai:gemini-3.6-flash", "google_genai", None)
+        await pilot.pause()
+        assert screen._dismissed is True
+        assert len(app._screen_stack) == 1
+        assert len(results) == 1
+
+        # 2nd call (simulating double click or rapid re-trigger that previously caused ScreenStackError)
+        screen._select_with_auth_check("google_genai:gemini-3.6-flash", "google_genai", None)
+        await pilot.pause()
+        assert len(app._screen_stack) == 1
+        assert len(results) == 1
+
+
+def test_model_option_multi_click_suppression(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify ModelOption ignores rapid multi-clicks (chain > 1)."""
+    from opscloud.ui.widgets.model_selector import ModelOption
+    from textual.events import Click
+    from textual.message import Message
+
+    opt = ModelOption(
+        label="  Gemini 3.6 Flash",
+        model_spec="google_genai:gemini-3.6-flash",
+        provider="google_genai",
+        index=0,
+    )
+
+    posted: list[Message] = []
+
+    def fake_post_message(message: Message) -> bool:
+        posted.append(message)
+        return True
+
+    monkeypatch.setattr(opt, "post_message", fake_post_message)
+
+    # First click (chain=1) -> posted
+    click1 = Click(opt, x=0, y=0, delta_x=0, delta_y=0, button=1, shift=False, meta=False, ctrl=False, chain=1)
+    opt.on_click(click1)
+    assert len(posted) == 1
+    assert isinstance(posted[0], ModelOption.Clicked)
+    assert posted[0].model_spec == "google_genai:gemini-3.6-flash"
+
+    # Second click of a double-click (chain=2) -> suppressed!
+    click2 = Click(opt, x=0, y=0, delta_x=0, delta_y=0, button=1, shift=False, meta=False, ctrl=False, chain=2)
+    opt.on_click(click2)
+    assert len(posted) == 1
+
+
+async def test_app_pop_screen_guards_against_screen_stack_error():
+    """Verify OpsCloudApp.pop_screen does not raise ScreenStackError when stack size <= 1."""
+    from opscloud.ui.app import OpsCloudApp
+
+    app = OpsCloudApp()
+    async with app.run_test(headless=True):
+        assert len(app._screen_stack) == 1
+        # Should not raise ScreenStackError!
+        res = app.pop_screen()
+        assert res is not None
+
+
+def test_gemini_3_8_flash_spec_and_reasoning_profiles():
+    """Verify Gemini 3.8 Flash registration, capabilities, and reasoning effort across providers."""
+    from opscloud.model.config import get_model_profile
+    from opscloud.model.reasoning import (
+        default_effort_for_model,
+        is_effort_supported_for_model,
+        supported_efforts_for_model,
+    )
+
+    gemini_3_8_specs = [
+        "google_genai:gemini-3.8-flash",
+        "google_vertexai:gemini-3.8-flash",
+        "openrouter:google/gemini-3.8-flash",
+        "litellm:gemini/gemini-3.8-flash",
+    ]
+
+    for spec in gemini_3_8_specs:
+        entry = get_model_profile(spec)
+        assert entry is not None, f"Profile missing for {spec}"
+        profile = entry.get("profile", {})
+        assert profile.get("max_input_tokens") == 1_000_000, f"Max input tokens mismatch for {spec}"
+        assert profile.get("max_output_tokens") == 64_000, f"Max output tokens mismatch for {spec}"
+        assert profile.get("tool_calling") is True, f"Tool calling should be enabled for {spec}"
+        assert profile.get("structured_output") is True, f"Structured output should be enabled for {spec}"
+        assert profile.get("reasoning_output") is True, f"Reasoning output should be enabled for {spec}"
+        assert profile.get("reasoning_effort_levels") == ["low", "medium", "high"], f"Reasoning levels mismatch for {spec}"
+        assert profile.get("reasoning_effort_default") == "medium", f"Default reasoning mismatch for {spec}"
+
+        # Reasoning effort helpers
+        assert is_effort_supported_for_model(spec, "low") is True
+        assert is_effort_supported_for_model(spec, "medium") is True
+        assert is_effort_supported_for_model(spec, "high") is True
+        assert default_effort_for_model(spec) == "medium"
+        assert set(supported_efforts_for_model(spec)) == {"low", "medium", "high"}

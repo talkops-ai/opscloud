@@ -22,7 +22,7 @@ async def require_confirmation(handler: BaseCommandHandler, ctx: CommandContext)
     if handler.safety_level not in (SafetyLevel.HIGH_RISK, SafetyLevel.DESTRUCTIVE):
         return True
 
-    severity = "⚠️ HIGH RISK" if handler.safety_level == SafetyLevel.HIGH_RISK else "🔴 DESTRUCTIVE"
+    severity = "[HIGH RISK]" if handler.safety_level == SafetyLevel.HIGH_RISK else "[DESTRUCTIVE]"
     description = f"{severity}: {handler.name}\n{ctx.raw_command}"
 
     # If app supports screen pushing (Textual app in TUI mode)

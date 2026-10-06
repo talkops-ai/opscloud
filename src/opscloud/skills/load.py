@@ -157,46 +157,73 @@ def list_skills(
     uc_dir = user_claude_skills_dir or paths.get_user_claude_skills_dir()
     pc_dir = project_claude_skills_dir or paths.get_project_claude_skills_dir(effective_root)
 
-    # Resolve plugin skill sources if not explicitly supplied
-    plugin_sources = list(plugin_skill_sources)
-    if not plugin_sources and include_plugins:
-        try:
-            from opscloud.plugins.adapters.skills import discover_plugin_skill_sources_and_roots
+    sources: list[tuple[Path | None, str, bool, str]] = []
+    has_custom_dirs = any(
+        x is not None
+        for x in (
+            built_in_skills_dir,
+            user_skills_dir,
+            project_skills_dir,
+            user_agent_skills_dir,
+            project_agent_skills_dir,
+            user_claude_skills_dir,
+            project_claude_skills_dir,
+        )
+    ) or bool(plugin_skill_sources)
 
-            p_srcs, _ = discover_plugin_skill_sources_and_roots(project_root=effective_root)
-            plugin_sources.extend(p_srcs)
-        except Exception as exc:
-            logger.debug("Could not resolve plugin skill sources in list_skills: %s", exc)
+    if has_custom_dirs:
+        plugin_sources = list(plugin_skill_sources)
+        if not plugin_sources and include_plugins:
+            try:
+                from opscloud.plugins.adapters.skills import discover_plugin_skill_sources_and_roots
 
-    sources: list[tuple[Path | None, str, bool, str]] = [
-        (bi_dir, "built-in", False, ""),
-        *[
-            (path, "plugin", False, namespace)
-            for path, namespace in plugin_sources
-        ],
-        (u_dir, "user", False, ""),
-        (ua_dir, "user", False, ""),
-        (p_dir, "project", False, ""),
-        (pa_dir, "project", False, ""),
-        (uc_dir, "claude (experimental)", True, ""),
-        (pc_dir, "claude (experimental)", True, ""),
-    ]
+                p_srcs, _ = discover_plugin_skill_sources_and_roots(
+                    project_root=effective_root,
+                    include_subagent_skills=include_subagents,
+                )
+                plugin_sources.extend(p_srcs)
+            except Exception as exc:
+                logger.debug("Could not resolve plugin skill sources in list_skills: %s", exc)
 
-    # Optional subagents bundled skills
-    if include_subagents:
-        try:
-            from opscloud.subagents.loader import list_subagents
+        sources = [
+            (bi_dir, "built-in", False, ""),
+            *[(path, "plugin", False, namespace) for path, namespace in plugin_sources],
+            (u_dir, "user", False, ""),
+            (ua_dir, "user", False, ""),
+            (p_dir, "project", False, ""),
+            (pa_dir, "project", False, ""),
+            (uc_dir, "claude (experimental)", True, ""),
+            (pc_dir, "claude (experimental)", True, ""),
+        ]
+    else:
+        from opscloud.skills.sources import get_skill_sources
 
-            for sa in list_subagents(project_root=project_root, include_plugins=True):
-                sa_path = sa.get("path")
-                if sa_path:
-                    p = Path(sa_path)
-                    bundle_dir = p.parent.parent if p.parent.name == "agents" else p.parent
-                    skills_dir = bundle_dir / "skills"
-                    if skills_dir.is_dir():
-                        sources.append((skills_dir, "subagent", False, sa["name"]))
-        except Exception as exc:
-            logger.debug("Could not discover subagent skills: %s", exc)
+        code_sources = get_skill_sources(
+            project_root=effective_root,
+            include_subagent_skills=include_subagents,
+            store=store,
+        )
+        for s in code_sources:
+            path_obj = Path(s[0])
+            lbl = s[1].lower()
+            is_plugin = len(s) == 3
+            is_claude = "claude" in lbl
+            ns = s[2] if len(s) == 3 else ""
+            if "subagent" in lbl:
+                src_type = "subagent"
+            elif is_plugin:
+                src_type = "plugin"
+            elif "user" in lbl:
+                src_type = "user"
+            elif "project" in lbl:
+                src_type = "project"
+            elif "built-in" in lbl:
+                src_type = "built-in"
+            elif is_claude:
+                src_type = "claude (experimental)"
+            else:
+                src_type = "user"
+            sources.append((path_obj, src_type, is_claude, ns))
 
     for skill_dir, source_label, experimental, namespace in sources:
         if not skill_dir or not skill_dir.exists():

@@ -1,10 +1,11 @@
 .cursor
 .vscode
+.opscode
+.opscloud
 .venv
 .taskmaster/
 .claude/
 aws_orchestrator_agent/examples/
-tests/
 # Logs
 logs
 *.log

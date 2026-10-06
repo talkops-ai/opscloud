@@ -39,6 +39,7 @@ from opscloud.mcp.config import (
 from opscloud.mcp.discovery import MCPDiscovery, discover_mcp_configs
 from opscloud.mcp.mcp_info import MCPServerInfo, MCPToolInfo
 from opscloud.mcp.preload import (
+    _mcp_tool_name,
     clear_cached_mcp_server_infos,
     get_cached_mcp_server_infos,
     preload_mcp_metadata,
@@ -159,6 +160,37 @@ def test_clean_mcp_schema() -> None:
     assert "properties" in cleaned
     assert "$schema" not in cleaned["properties"]["instance_id"]
     assert "additionalProperties" not in cleaned["properties"]["instance_id"]
+
+    # Verify dereferencing of nested $defs and $ref (e.g. PricingFilter in AWS pricing tools)
+    schema_with_defs = {
+        "type": "object",
+        "properties": {
+            "service_code": {"type": "string"},
+            "filters": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/PricingFilter"},
+            },
+        },
+        "required": ["service_code"],
+        "$defs": {
+            "PricingFilter": {
+                "type": "object",
+                "properties": {
+                    "Field": {"type": "string"},
+                    "Value": {"type": "string"},
+                },
+                "required": ["Field", "Value"],
+            }
+        },
+    }
+    cleaned_defs = _clean_mcp_schema(schema_with_defs)
+    assert "$defs" not in cleaned_defs
+    assert "$ref" not in str(cleaned_defs)
+    # The referenced definition was inlined directly into properties.filters.items
+    items_schema = cleaned_defs["properties"]["filters"]["items"]
+    assert items_schema["type"] == "object"
+    assert "Field" in items_schema["properties"]
+    assert "Value" in items_schema["properties"]
 
 
 def test_is_transient_session_error() -> None:
@@ -392,7 +424,28 @@ async def test_probe_one_mcp_server_disabled_and_active() -> None:
         info_act = await probe_one_mcp_server("aws-ec2", cfg)
         assert info_act.status == "ok"
         assert info_act.tool_count == 1
-        assert info_act.tools[0].name == "aws-ec2:describe_instances"
+        assert info_act.tools[0].name == "aws-ec2_describe_instances"
+        assert info_act.tools[0].original_name == "describe_instances"
+
+
+def test_mcp_tool_name_provider_safe_length_and_digest() -> None:
+    """Verify tool name composition respects provider length limits and hashing."""
+    # 1. Short name within limit
+    short_name = _mcp_tool_name("aws-ec2", "describe_instances")
+    assert short_name == "aws-ec2_describe_instances"
+    assert len(short_name) <= 64
+
+    # 2. Sanitization of invalid chars (appends digest to avoid collision)
+    dirty_name = _mcp_tool_name("my@server!", "list:buckets?")
+    assert dirty_name == "my_server_list_buckets_d02139680706"
+    assert len(dirty_name) <= 64
+
+    # 3. Long name with plugin prefix exceeding 64 characters (matching reference/dcode SHA256 digest)
+    server_name = "plugin__aws-compute_talkops-devops-plugins_35da5a75__aws-mcp"
+    tool_name = "aws___get_tasks"
+    hashed_name = _mcp_tool_name(server_name, tool_name)
+    assert len(hashed_name) <= 64
+    assert hashed_name == "plugin__aws-compute_talkops-devops-_aws___get_tasks_9badd4f791c6"
 
 
 @pytest.mark.asyncio

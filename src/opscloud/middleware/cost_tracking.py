@@ -10,19 +10,22 @@ lifetime figure.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 import logging
 import math
 import operator
 import threading
-from typing import TYPE_CHECKING, Annotated, Any, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, NotRequired, TypedDict, override
 from uuid import UUID
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     ContextT,
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
     OmitFromInput,
     PrivateStateAttr,
 )
@@ -41,6 +44,11 @@ logger = get_logger(__name__)
 
 SESSION_COST_EVENT_TYPE = "session_cost"
 """Custom-stream event type carrying the thread's absolute cumulative cost."""
+
+ACTIVE_SESSION_THREAD_ID: ContextVar[str | None] = ContextVar(
+    "active_session_thread_id", default=None
+)
+"""ContextVar tracking the active conversation thread ID across async tasks and subagents."""
 
 _PROVIDER_ALIASES: dict[str, str] = {
     "azure_openai": "azure",
@@ -406,6 +414,8 @@ class _SessionCostRecorder(BaseCallbackHandler):
         if not isinstance(thread_id, str) or not thread_id:
             thread_id = configurable.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
+            thread_id = ACTIVE_SESSION_THREAD_ID.get()
+        if not isinstance(thread_id, str) or not thread_id:
             with self._lock:
                 self._run_contexts.pop(run_id, None)
             return
@@ -591,6 +601,8 @@ def _drain_recorded_costs(
     *,
     scope: str | None = None,
 ) -> list[_ModelCallRecord]:
+    if not isinstance(thread_id, str) or not thread_id:
+        thread_id = ACTIVE_SESSION_THREAD_ID.get()
     recorder = _RECORDER_VAR.get()
     if recorder is None or not thread_id:
         return []
@@ -603,6 +615,8 @@ def _restore_recorded_costs(
 ) -> bool:
     if not records:
         return True
+    if not isinstance(thread_id, str) or not thread_id:
+        thread_id = ACTIVE_SESSION_THREAD_ID.get()
     recorder = _RECORDER_VAR.get()
     if recorder is None or not thread_id:
         return False
@@ -614,6 +628,10 @@ class _CostTransfer(TypedDict):
     owner_scope: str
     cost_usd: float
     tokens: NotRequired[int]
+
+
+_PENDING_THREAD_TRANSFERS: dict[str, dict[str, _CostTransfer]] = {}
+_TRANSFERS_LOCK = threading.Lock()
 
 
 class CostState(ResumeState):
@@ -657,12 +675,36 @@ def _pricing_target(
 def _thread_id(runtime: Runtime[ContextT]) -> str | None:
     execution_info = getattr(runtime, "execution_info", None)
     thread_id = getattr(execution_info, "thread_id", None)
-    return thread_id if isinstance(thread_id, str) and thread_id else None
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+    ctx = getattr(runtime, "context", None)
+    if isinstance(ctx, dict):
+        ctx_tid = ctx.get("thread_id")
+        if isinstance(ctx_tid, str) and ctx_tid:
+            return ctx_tid
+    cfg = getattr(runtime, "config", None)
+    if isinstance(cfg, dict):
+        configurable = cfg.get("configurable")
+        if isinstance(configurable, dict):
+            cfg_tid = configurable.get("thread_id")
+            if isinstance(cfg_tid, str) and cfg_tid:
+                return cfg_tid
+    return ACTIVE_SESSION_THREAD_ID.get()
 
 
 def _checkpoint_scope(runtime: Runtime[ContextT]) -> str:
     execution_info = getattr(runtime, "execution_info", None)
-    return _parent_checkpoint_scope(getattr(execution_info, "checkpoint_ns", None))
+    ns = getattr(execution_info, "checkpoint_ns", None)
+    if isinstance(ns, str) and ns:
+        return _parent_checkpoint_scope(ns)
+    cfg = getattr(runtime, "config", None)
+    if isinstance(cfg, dict):
+        configurable = cfg.get("configurable")
+        if isinstance(configurable, dict):
+            c_ns = configurable.get("checkpoint_ns")
+            if isinstance(c_ns, str) and c_ns:
+                return _parent_checkpoint_scope(c_ns)
+    return ""
 
 
 def _latest_ai_message(messages: Sequence[Any]) -> AIMessage | None:
@@ -691,6 +733,9 @@ class CostTrackingMiddleware(AgentMiddleware[CostState, ContextT]):
         state: CostState,
         runtime: Runtime[ContextT],
     ) -> dict[str, Any] | None:
+        tid = _thread_id(runtime)
+        if tid:
+            ACTIVE_SESSION_THREAD_ID.set(tid)
         if not self._nested:
             return None
         return {
@@ -704,6 +749,34 @@ class CostTrackingMiddleware(AgentMiddleware[CostState, ContextT]):
         runtime: Runtime[ContextT],
     ) -> dict[str, Any] | None:
         return self.before_agent(state, runtime)
+
+    @override
+    def wrap_model_call[ResponseT](
+        self,
+        request: ModelRequest[ContextT],
+        handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]],
+    ) -> ModelResponse[ResponseT] | ExtendedModelResponse[ResponseT]:
+        tid = _thread_id(request.runtime)
+        token = ACTIVE_SESSION_THREAD_ID.set(tid) if tid else None
+        try:
+            return handler(request)
+        finally:
+            if token is not None:
+                ACTIVE_SESSION_THREAD_ID.reset(token)
+
+    @override
+    async def awrap_model_call[ResponseT](
+        self,
+        request: ModelRequest[ContextT],
+        handler: Callable[[ModelRequest[ContextT]], Awaitable[ModelResponse[ResponseT]]],
+    ) -> ModelResponse[ResponseT] | ExtendedModelResponse[ResponseT]:
+        tid = _thread_id(request.runtime)
+        token = ACTIVE_SESSION_THREAD_ID.set(tid) if tid else None
+        try:
+            return await handler(request)
+        finally:
+            if token is not None:
+                ACTIVE_SESSION_THREAD_ID.reset(token)
 
     def after_model(
         self,
@@ -749,8 +822,9 @@ class CostTrackingMiddleware(AgentMiddleware[CostState, ContextT]):
             delta_tokens = update.get("_session_total_tokens", 0) if update else 0
             total_tokens = prior_tokens + delta_tokens
 
-            scope = _checkpoint_scope(runtime)
-            if scope and (total_usd > 0 or total_tokens > 0):
+            thread_id = _thread_id(runtime) or "session"
+            scope = _checkpoint_scope(runtime) or f"subagent:{thread_id}:{id(state)}"
+            if total_usd > 0 or total_tokens > 0:
                 transfers: dict[str, _CostTransfer] = dict(
                     state.get("_session_cost_transfers") or {}
                 )
@@ -758,12 +832,16 @@ class CostTrackingMiddleware(AgentMiddleware[CostState, ContextT]):
                     pending = update.get("_session_cost_transfers")
                     if isinstance(pending, Overwrite) and isinstance(pending.value, dict):
                         transfers = dict(pending.value)
+                owner = _owning_checkpoint_scope(scope) if _checkpoint_scope(runtime) else ""
                 transfer_entry: _CostTransfer = {
-                    "owner_scope": _owning_checkpoint_scope(scope),
+                    "owner_scope": owner,
                     "cost_usd": total_usd,
                     "tokens": total_tokens,
                 }
                 transfers[scope] = transfer_entry
+                if thread_id:
+                    with _TRANSFERS_LOCK:
+                        _PENDING_THREAD_TRANSFERS.setdefault(thread_id, {})[scope] = transfer_entry
                 if update is None:
                     update = {}
                 update["_session_cost_transfers"] = Overwrite(transfers)
@@ -786,23 +864,44 @@ class CostTrackingMiddleware(AgentMiddleware[CostState, ContextT]):
         main_message_id = message.id if message is not None else None
         delta_usd = 0.0
         delta_tokens = 0
-        transfers = state.get("_session_cost_transfers") or {}
+        transfers = dict(state.get("_session_cost_transfers") or {})
+        if not self._nested and thread_id:
+            with _TRANSFERS_LOCK:
+                pending_thread_transfers = _PENDING_THREAD_TRANSFERS.pop(thread_id, {})
+            for p_scope, p_transfer in pending_thread_transfers.items():
+                if p_scope not in transfers:
+                    transfers[p_scope] = p_transfer
         remaining_transfers = dict(transfers)
         owner_scope = _checkpoint_scope(runtime)
         claimed_transfer = False
         for source_scope, transfer in transfers.items():
+            target_owner = transfer.get("owner_scope") if isinstance(transfer, Mapping) else None
+            is_matching_owner = (
+                target_owner == owner_scope
+                or (not owner_scope and (target_owner == "" or target_owner is None))
+            )
+            transfer_tokens = transfer.get("tokens") if isinstance(transfer, Mapping) else None
+            transfer_cost = transfer.get("cost_usd") if isinstance(transfer, Mapping) else None
+            has_positive_cost = (
+                isinstance(transfer_cost, int | float)
+                and math.isfinite(transfer_cost)
+                and transfer_cost > 0
+            )
+            has_positive_tokens = (
+                isinstance(transfer_tokens, int)
+                and not isinstance(transfer_tokens, bool)
+                and transfer_tokens > 0
+            )
             if (
                 isinstance(source_scope, str)
                 and isinstance(transfer, Mapping)
-                and transfer.get("owner_scope") == owner_scope
-                and isinstance(transfer.get("cost_usd"), int | float)
-                and math.isfinite(transfer["cost_usd"])
-                and transfer["cost_usd"] > 0
+                and is_matching_owner
+                and (has_positive_cost or has_positive_tokens)
             ):
-                delta_usd += float(transfer["cost_usd"])
-                trans_toks = transfer.get("tokens", 0)
-                if isinstance(trans_toks, int) and trans_toks > 0:
-                    delta_tokens += trans_toks
+                if has_positive_cost and transfer_cost is not None:
+                    delta_usd += float(transfer_cost)
+                if has_positive_tokens and transfer_tokens is not None:
+                    delta_tokens += transfer_tokens
                 remaining_transfers.pop(source_scope, None)
                 claimed_transfer = True
         charged_message_ids: set[str] = set()
@@ -912,6 +1011,7 @@ class CostTrackingMiddleware(AgentMiddleware[CostState, ContextT]):
 
 
 __all__ = [
+    "ACTIVE_SESSION_THREAD_ID",
     "SESSION_COST_EVENT_TYPE",
     "CostState",
     "CostTrackingMiddleware",

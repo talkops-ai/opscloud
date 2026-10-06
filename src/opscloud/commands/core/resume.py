@@ -49,7 +49,7 @@ class ResumeHandler(BaseCommandHandler):
                 )
             return CommandResult(
                 success=True,
-                message="🧵 Opened Thread Selector.",
+                message="Opened Thread Selector.",
                 mount_as_app_message=False,
             )
 
@@ -90,7 +90,7 @@ class ResumeHandler(BaseCommandHandler):
 
         return CommandResult(
             success=True,
-            message=f"🔄 **Resumed Thread:** `{thread_id}`",
+            message=f"**Resumed Thread:** `{thread_id}`",
         )
 
 

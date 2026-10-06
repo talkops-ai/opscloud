@@ -15,6 +15,7 @@ class MCPToolInfo:
     name: str
     description: str = ""
     input_schema: dict[str, Any] | None = None
+    original_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert MCPToolInfo to a JSON-serializable dictionary.
@@ -22,11 +23,14 @@ class MCPToolInfo:
         Returns:
             dict[str, Any]: Dictionary containing tool name, description, and input schema.
         """
-        return {
+        res: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema or {},
         }
+        if self.original_name is not None:
+            res["original_name"] = self.original_name
+        return res
 
 
 @dataclass(frozen=True)

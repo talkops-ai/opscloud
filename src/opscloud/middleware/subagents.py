@@ -164,6 +164,15 @@ class SubagentsMiddleware(AgentMiddleware):
         lines.append("1. **Direct Built-in Call**: For Built-in subagents, invoke `task(...)` directly.")
         lines.append("2. **Plugin Parallelization**: For multiple resources or files, prefer `js_eval` with `Promise.all`.\n")
 
+        lines.append("\n---\n")
+        lines.append("### Subagent Deliverable Presentation Protocol\n")
+        lines.append(
+            "- Subagents return authoritative, production-grade technical deliverables (detailed Markdown tables, "
+            "spend/inventory breakdowns, audit classifications, and exact remediation CLI commands).\n"
+            "- When a subagent completes, the orchestrator MUST relay and present this deliverable in its full technical richness to the user.\n"
+            "- **DO NOT compress or suppress subagent reports into brief synopsis bullets.** Retain all structured tables, regional breakdowns, resource inventories, and copy-pasteable CLI commands (`aws ...`, `kubectl ...`, `terraform ...`) in the final response."
+        )
+
         return "\n".join(lines)
 
     def before_agent(

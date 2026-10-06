@@ -694,7 +694,10 @@ def get_theme_colors(widget_or_app: object = None) -> ThemeColors:
         except (ImportError, LookupError):
             return DARK_COLORS
 
-    app = getattr(widget_or_app, "app", widget_or_app)
+    try:
+        app = getattr(widget_or_app, "app", widget_or_app)
+    except Exception:
+        return DARK_COLORS
     entry = get_registry().get(getattr(app, "theme", None))  # type: ignore[arg-type]
 
     # Custom themes (OpsCloud-branded / user-defined) use pre-built colors —

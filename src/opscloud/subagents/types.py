@@ -18,5 +18,8 @@ class SubagentMetadata(TypedDict):
     middleware: NotRequired[list[Any] | None]
     permission_tier: NotRequired[str | None]
     is_plugin: NotRequired[bool]
+    plugin_id: NotRequired[str | None]
+    bundle_dir: NotRequired[str | None]
+    skills_dir: NotRequired[str | None]
     source: str
     path: str

@@ -39,7 +39,7 @@ class BugHandler(BaseCommandHandler):
             pass
         return CommandResult(
             success=True,
-            message=f"🐛 **Bug Report / Feedback:** Submit an issue at:\n{url}",
+            message=f"**Bug Report / Feedback:** Submit an issue at:\n{url}",
         )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical
@@ -80,6 +80,7 @@ class EffortSelectorScreen(ModalScreen[str | None]):
         self._efforts = efforts or ("low", "medium", "high")
         self._current_effort = current_effort
         self._default_effort = default_effort or "high"
+        self._dismissed: bool = False
 
     def compose(self):
         options = [
@@ -112,12 +113,41 @@ class EffortSelectorScreen(ModalScreen[str | None]):
             return f"{effort} ({suffix})"
         return effort
 
+    def dismiss(self, result: str | None = None) -> Any:
+        """Safely dismiss the modal screen with idempotency protection."""
+        if getattr(self, "_dismissed", False):
+            return None
+        self._dismissed = True
+
+        try:
+            app = self.app
+        except Exception:
+            app = None
+
+        if app is not None:
+            try:
+                screen_stack = app._screen_stack
+            except Exception:
+                screen_stack = None
+            if screen_stack is not None:
+                if len(screen_stack) <= 1 or self not in screen_stack:
+                    return None
+
+        try:
+            return super().dismiss(result)
+        except Exception:
+            return None
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         effort = event.option.id
         if effort is not None:
             self.dismiss(effort)
 
     def action_cancel(self) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         self.dismiss(None)
 
     def action_cursor_down(self) -> None:

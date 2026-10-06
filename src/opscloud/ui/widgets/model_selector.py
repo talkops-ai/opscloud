@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from opscloud.utils.logger import get_logger
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
@@ -14,14 +14,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from opscloud.model.config import (
-    AVAILABLE_MODELS,
     DEFAULT_PROVIDER_PRIORITY,
     RECOMMENDED_SPECS,
     ProviderAuthState,
     ProviderAuthStatus,
     format_token_count,
     get_available_models_list,
-    get_credential_env_var,
     get_model_profile,
     get_provider_auth_status,
     get_provider_display_name,
@@ -100,6 +98,13 @@ class ModelOption(Static):
 
     def on_click(self, event: Click) -> None:
         event.stop()
+        if event.chain > 1:
+            return
+        try:
+            if getattr(self.screen, "_dismissed", False):
+                return
+        except Exception:
+            pass
         self.post_message(self.Clicked(self.model_spec, self.provider, self.index, self.effort))
 
     def render_label_text(self, show_specs: bool = False) -> str:
@@ -270,6 +275,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         self._default_spec = load_default_model()
         self._recent_specs = load_recent_models()
         self.pending_install_extra: str | None = None
+        self._dismissed: bool = False
 
     # ── Compose ──────────────────────────────────────────
 
@@ -691,6 +697,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         self._move_selection(1)
 
     def action_select(self) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         if not self._option_widgets:
             typed = self._filter_text.strip()
             if typed:
@@ -706,6 +714,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
     def _select_with_auth_check(
         self, model_spec: str, provider: str, effort: str | None = None
     ) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         from opscloud.model.config import (
             is_provider_package_installed,
             provider_install_extra,
@@ -761,7 +771,45 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             _on_confirm,
         )
 
+    def dismiss(
+        self,
+        result: tuple[str, str, str | None] | tuple[str, str] | None = None,
+    ) -> Any:
+        """Safely dismiss the modal screen with idempotency protection.
+
+        Prevents ScreenStackError if dismiss is invoked multiple times (e.g. from
+        rapid clicks, enter key repeat, or queued event dispatch during screen pop).
+        """
+        if getattr(self, "_dismissed", False):
+            return None
+        self._dismissed = True
+
+        try:
+            app = self.app
+        except Exception:
+            app = None
+
+        if app is not None:
+            try:
+                screen_stack = app._screen_stack
+            except Exception:
+                screen_stack = None
+            if screen_stack is not None:
+                if len(screen_stack) <= 1 or self not in screen_stack:
+                    logger.debug(
+                        "ModelSelectorScreen.dismiss bypassed: not in stack or stack size <= 1"
+                    )
+                    return None
+
+        try:
+            return super().dismiss(result)
+        except Exception as exc:
+            logger.warning("Error dismissing ModelSelectorScreen: %s", exc)
+            return None
+
     def action_cancel(self) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         self.dismiss(None)
 
     def action_tab_complete(self) -> None:
@@ -807,6 +855,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
 
 
     def on_model_option_clicked(self, event: ModelOption.Clicked) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         self._select_with_auth_check(event.model_spec, event.provider, event.effort)
 
 

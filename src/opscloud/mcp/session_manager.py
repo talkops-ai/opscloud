@@ -17,6 +17,9 @@ from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_DEFAULT_CONNECT_TIMEOUT = 30.0
+_CONNECT_TIMEOUT = float(os.environ.get("OPSCLOUD_MCP_CONNECT_TIMEOUT", str(_DEFAULT_CONNECT_TIMEOUT)))
+
 
 def _is_transient_session_error(exc: BaseException) -> bool:
     """Return True when exc signals the MCP session transport or stream is dead."""
@@ -63,11 +66,24 @@ def _normalize_mcp_arguments(arguments: dict[str, Any], input_schema: Any) -> di
 
 
 def _clean_mcp_schema(schema: Any) -> dict[str, Any]:
-    """Clean JSON Schema for compatibility with LLM provider tool schemas (Gemini, Anthropic, OpenAI)."""
+    """Clean JSON Schema for compatibility with LLM provider tool schemas (Gemini, Anthropic, OpenAI).
+
+    Dereferences all `$ref` pointers (such as `#/$defs/...` or `#/definitions/...`)
+    using LangChain's `dereference_refs` so that referenced models (like PricingFilter)
+    are inlined directly into properties before removing metadata keys.
+    """
     if not isinstance(schema, dict):
         return {}
 
-    cleaned = dict(schema)
+    from langchain_core.utils.json_schema import dereference_refs
+
+    try:
+        resolved = dereference_refs(schema)
+    except Exception as exc:
+        logger.debug("Failed to dereference MCP schema refs: %s", exc)
+        resolved = schema
+
+    cleaned = dict(resolved) if isinstance(resolved, dict) else dict(schema)
     for key in ("$schema", "$id", "$defs", "definitions", "additionalProperties"):
         cleaned.pop(key, None)
 
@@ -255,13 +271,17 @@ def _build_cached_mcp_tool(
         _convert_call_tool_result,
     )
 
-    raw_tool_name = getattr(mcp_tool, "name", str(mcp_tool))
-    if ":" in raw_tool_name and (not server_name or raw_tool_name.startswith(f"{server_name}:")):
-        original_tool_name = raw_tool_name.split(":", 1)[1]
+    orig_name = getattr(mcp_tool, "original_name", None)
+    if isinstance(orig_name, str) and orig_name:
+        original_tool_name = orig_name
+        lc_tool_name = str(getattr(mcp_tool, "name", orig_name))
     else:
-        original_tool_name = raw_tool_name
-
-    lc_tool_name = f"{server_name}{name_prefix_sep}{original_tool_name}" if server_name else original_tool_name
+        raw_tool_name = getattr(mcp_tool, "name", str(mcp_tool))
+        if isinstance(raw_tool_name, str) and ":" in raw_tool_name and (not server_name or raw_tool_name.startswith(f"{server_name}:")):
+            original_tool_name = raw_tool_name.split(":", 1)[1]
+        else:
+            original_tool_name = raw_tool_name
+        lc_tool_name = f"{server_name}{name_prefix_sep}{original_tool_name}" if server_name else original_tool_name
     description = getattr(mcp_tool, "description", "") or f"MCP tool {original_tool_name} from {server_name}"
     raw_input_schema = getattr(mcp_tool, "inputSchema", None) or getattr(mcp_tool, "input_schema", None) or {}
     input_schema = _clean_mcp_schema(raw_input_schema)
@@ -637,12 +657,12 @@ class MCPSessionManager:
 
             session = await asyncio.wait_for(
                 exit_stack.enter_async_context(create_session(conn)),
-                timeout=5.0,
+                timeout=_CONNECT_TIMEOUT,
             )
-            await asyncio.wait_for(session.initialize(), timeout=5.0)
+            await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT)
 
             # Discover and wrap tools
-            tools_result = await asyncio.wait_for(session.list_tools(), timeout=5.0)
+            tools_result = await asyncio.wait_for(session.list_tools(), timeout=_CONNECT_TIMEOUT)
             raw_tools = getattr(tools_result, "tools", []) or []
             logger.info(
                 "Discovered %d tools from MCP server '%s'",

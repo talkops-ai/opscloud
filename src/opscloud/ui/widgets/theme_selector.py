@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from opscloud.utils.logger import get_logger
 import os
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical
@@ -78,6 +78,7 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
         self._terminal_default = terminal_default or load_terminal_default()
         self._session_terminal_default: str | None = None
         self._show_keys = False
+        self._dismissed: bool = False
 
     def _format_option(self, name: str, label: str) -> str:
         text = name if self._show_keys else label
@@ -128,8 +129,35 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
                 except Exception:
                     pass
 
+    def dismiss(self, result: str | None = None) -> Any:
+        """Safely dismiss the modal screen with idempotency protection."""
+        if getattr(self, "_dismissed", False):
+            return None
+        self._dismissed = True
+
+        try:
+            app = self.app
+        except Exception:
+            app = None
+
+        if app is not None:
+            try:
+                screen_stack = app._screen_stack
+            except Exception:
+                screen_stack = None
+            if screen_stack is not None:
+                if len(screen_stack) <= 1 or self not in screen_stack:
+                    return None
+
+        try:
+            return super().dismiss(result)
+        except Exception:
+            return None
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Commit selected theme."""
+        if getattr(self, "_dismissed", False):
+            return
         name = event.option.id
         registry = get_registry()
         if name is not None and name in registry:
@@ -139,6 +167,8 @@ class ThemeSelectorScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         """Dismiss screen and revert to original or terminal-default theme."""
+        if getattr(self, "_dismissed", False):
+            return
         target = self._session_terminal_default or self._original_theme
         try:
             self.app.theme = target

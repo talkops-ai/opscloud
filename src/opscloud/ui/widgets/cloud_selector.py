@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from opscloud.utils.logger import get_logger
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
@@ -55,6 +55,13 @@ class CloudProfileOption(Static):
 
     def on_click(self, event: Click) -> None:
         event.stop()
+        if event.chain > 1:
+            return
+        try:
+            if getattr(self.screen, "_dismissed", False):
+                return
+        except Exception:
+            pass
         self.post_message(self.Clicked(self.profile_name, self.index))
 
 
@@ -175,6 +182,7 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         self._current_profile = current_profile or get_active_aws_profile()
         self._default_profile = load_aws_profile()
         self._recent_profiles = load_recent_aws_profiles()
+        self._dismissed: bool = False
 
         self._all_profiles: list[AWSProfileInfo] = []
         self._filtered_profiles: list[AWSProfileInfo] = []
@@ -451,7 +459,41 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         opt = self._option_widgets[self._selected_index]
         self.dismiss((opt.profile_name, opt.profile_info.region))
 
+    def dismiss(
+        self,
+        result: tuple[str, str | None] | None = None,
+    ) -> Any:
+        """Safely dismiss the modal screen with idempotency protection."""
+        if getattr(self, "_dismissed", False):
+            return None
+        self._dismissed = True
+
+        try:
+            app = self.app
+        except Exception:
+            app = None
+
+        if app is not None:
+            try:
+                screen_stack = app._screen_stack
+            except Exception:
+                screen_stack = None
+            if screen_stack is not None:
+                if len(screen_stack) <= 1 or self not in screen_stack:
+                    logger.debug(
+                        "CloudProfileSelectorScreen.dismiss bypassed: not in stack or stack size <= 1"
+                    )
+                    return None
+
+        try:
+            return super().dismiss(result)
+        except Exception as exc:
+            logger.warning("Error dismissing CloudProfileSelectorScreen: %s", exc)
+            return None
+
     def action_cancel(self) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         self.dismiss(None)
 
     def action_tab_complete(self) -> None:
@@ -476,6 +518,8 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         self._rebuild_options()
 
     def on_cloud_profile_option_clicked(self, event: CloudProfileOption.Clicked) -> None:
+        if getattr(self, "_dismissed", False):
+            return
         opt = self._option_widgets[event.index] if 0 <= event.index < len(self._option_widgets) else None
         region = opt.profile_info.region if opt else None
         self.dismiss((event.profile_name, region))

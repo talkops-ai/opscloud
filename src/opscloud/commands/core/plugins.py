@@ -56,11 +56,11 @@ class PluginsHandler(BaseCommandHandler):
         # Fallback: check app._discovered_plugins if set on mock app
         if ctx.app and getattr(ctx.app, "_discovered_plugins", None):
             plugins_list = ctx.app._discovered_plugins or []
-            lines = ["🔌 **Installed Plugins:**\n"]
+            lines = ["**Installed Plugins:**\n"]
             for p in plugins_list:
                 name = getattr(p, "name", str(p))
                 desc = getattr(p, "description", "")
-                status = "✅" if getattr(p, "healthy", True) else "❌"
+                status = "[ok]" if getattr(p, "healthy", True) else "[error]"
                 lines.append(f"  {status} `{name}`: {desc}")
             return CommandResult(success=True, message="\n".join(lines))
 
@@ -72,18 +72,18 @@ class PluginsHandler(BaseCommandHandler):
         if not plugins:
             available = list_available_plugins(project_root=_project_root)
             if available:
-                lines = ["🔌 **Available Plugins:**\n"]
+                lines = ["**Available Plugins:**\n"]
                 for p_id, desc, enabled in available:
-                    status = "✅" if enabled else "⚪"
+                    status = "[enabled]" if enabled else "[disabled]"
                     lines.append(f"  {status} `{p_id}`: {desc}")
                 return CommandResult(success=True, message="\n".join(lines))
-            return CommandResult(success=True, message="🔌 No plugins installed or discovered.")
+            return CommandResult(success=True, message="No plugins installed or discovered.")
 
-        lines = ["🔌 **Installed Plugins:**\n"]
+        lines = ["**Installed Plugins:**\n"]
         for p in plugins:
             name = getattr(p, "name", str(p))
             p_id = getattr(p, "plugin_id", name)
-            lines.append(f"  ✅ `{p_id}` (v{p.version or '1.0'})")
+            lines.append(f"  • `{p_id}` (v{p.version or '1.0'})")
         return CommandResult(success=True, message="\n".join(lines))
 
 

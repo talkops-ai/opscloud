@@ -47,7 +47,7 @@ class TerraformPlanRenderer:
         change_cnt = sum(1 for r in resource_changes if "update" in r.get("change", {}).get("actions", []))
         delete_cnt = sum(1 for r in resource_changes if "delete" in r.get("change", {}).get("actions", []))
 
-        text.append(f"📊 Terraform Plan Summary: +{add_cnt} add, ~{change_cnt} change, -{delete_cnt} destroy\n\n", style="bold magenta")
+        text.append(f"Terraform Plan Summary: +{add_cnt} add, ~{change_cnt} change, -{delete_cnt} destroy\n\n", style="bold magenta")
         for r in resource_changes:
             address = r.get("address", "resource")
             actions = r.get("change", {}).get("actions", [])
@@ -67,8 +67,8 @@ class TerraformPlanWidget(Widget):
     TerraformPlanWidget {
         padding: 1;
         margin: 1 0;
-        background: $surface;
-        border: solid $primary;
+        background: $background;
+        border: solid $panel;
     }
     """
 
@@ -88,7 +88,7 @@ class TerraformPlanWidget(Widget):
         else:
             rendered = renderer.render(self._plan_output)
 
-        yield Static("🏗️ Terraform Plan Output", classes="title")
+        yield Static("Terraform Plan Output", classes="title")
         yield Static(rendered)
 
 

@@ -255,7 +255,7 @@ class LoopHandler(BaseCommandHandler):
         return CommandResult(
             success=True,
             message=(
-                f"🔄 Loop started: `{instance.id}`\n"
+                f"Loop started: `{instance.id}`\n"
                 f"  Interval: {instance.interval_human}\n"
                 f"  Max iterations: {instance.max_iterations}\n"
                 f"  Instruction: {instruction}\n\n"
@@ -273,7 +273,7 @@ class LoopHandler(BaseCommandHandler):
 
         lines = ["**Active Loops:**", ""]
         for loop in loops:
-            status = "🟢 running" if loop.is_running else "⚪ finished"
+            status = "[running]" if loop.is_running else "[finished]"
             lines.append(
                 f"  • `{loop.id}` {status} — every {loop.interval_human}, "
                 f"iteration {loop.iteration_count}/{loop.max_iterations}\n"

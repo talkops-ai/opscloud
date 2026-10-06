@@ -209,7 +209,7 @@ class UpdateHandler(BaseCommandHandler):
         if success:
             return CommandResult(
                 success=True,
-                message=f"✅ Updated from v{current_version} → v{latest}.\n"
+                message=f"Updated from v{current_version} → v{latest}.\n"
                 "Restart OpsCode to use the new version (`/restart`).",
                 mount_as_app_message=True,
             )

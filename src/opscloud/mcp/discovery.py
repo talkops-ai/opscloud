@@ -175,6 +175,10 @@ class MCPDiscovery:
         if plugins_dir.is_dir():
             for plugin in sorted(plugins_dir.iterdir()):
                 if plugin.is_dir() and not plugin.name.startswith("."):
+                    from opscloud.plugins.models import is_agent_plugin_dir
+
+                    if is_agent_plugin_dir(plugin):
+                        continue  # Dynamic subagent plugins isolate their own MCP servers
                     for candidate in (plugin / ".mcp.json", plugin / "mcp.json"):
                         if candidate.is_file():
                             for name, config in _load_mcp_json(candidate).items():

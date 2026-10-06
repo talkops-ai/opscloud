@@ -680,12 +680,14 @@ class OpsCloudApp(App):
                 banner.set_connected()
             except Exception:
                 pass
+            if not self._mcp_server_info and not self._mcp_preload_kwargs.get("no_mcp"):
+                self.run_worker(self._preload_mcp_metadata_background(), group="mcp-preload")
         else:
             # No server at all — offline/widget-only mode
             self._agent_thread_id = "local_session"
             await self._mount_message(
                 SystemMessage(
-                    "🚀 **OpsCloud TUI Ready** (offline) — "
+                    "**OpsCloud TUI Ready** (offline) — "
                     "Type `/help` for slash commands."
                 )
             )
@@ -798,7 +800,7 @@ class OpsCloudApp(App):
 
         await self._mount_message(
             SystemMessage(
-                f"⏳ **Credentials configured!** Starting agent server for model `{model_spec}`..."
+                f"**Credentials configured!** Starting agent server for model `{model_spec}`..."
             )
         )
         self.run_worker(self._start_server_background(), group="server-startup")
@@ -856,6 +858,25 @@ class OpsCloudApp(App):
             logger.exception("Server startup failed: %s", exc)
             self.post_message(self.ServerStartFailed(error=exc))
 
+    async def _preload_mcp_metadata_background(self) -> None:
+        """Preload MCP server metadata in background and refresh open viewer if active."""
+        try:
+            from opscloud.mcp.preload import preload_mcp_server_info
+
+            infos = await preload_mcp_server_info(**self._mcp_preload_kwargs)
+            if infos:
+                self._mcp_server_info = infos
+                logger.debug("Background MCP preload populated %d servers", len(infos))
+                try:
+                    from opscloud.ui.widgets.mcp_viewer import MCPViewerScreen
+
+                    if isinstance(self.screen, MCPViewerScreen):
+                        await self.screen.refresh_server_info(infos)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("Background MCP preload failed: %s", exc)
+
     @on(ServerReady)
     async def _on_server_ready(self, event: ServerReady) -> None:
         """Handle successful background server startup."""
@@ -863,6 +884,13 @@ class OpsCloudApp(App):
         self._server_proc = event.server_proc
         if event.mcp_server_info is not None:
             self._mcp_server_info = event.mcp_server_info
+            try:
+                from opscloud.ui.widgets.mcp_viewer import MCPViewerScreen
+
+                if isinstance(self.screen, MCPViewerScreen):
+                    await self.screen.refresh_server_info(self._mcp_server_info)
+            except Exception:
+                pass
 
         # Bind the now-live client to the adapter
         if self._adapter:
@@ -937,7 +965,7 @@ class OpsCloudApp(App):
             if session_state:
                 session_state.thread_id = self._resume_thread
             await self._mount_message(
-                SystemMessage(f"🔄 Resumed thread: `{self._resume_thread}`")
+                SystemMessage(f"Resumed thread: `{self._resume_thread}`")
             )
             await self._load_thread_history(self._resume_thread)
         else:
@@ -954,7 +982,7 @@ class OpsCloudApp(App):
         logger.debug("TUI: connection finalized, thread_id=%s", self._agent_thread_id)
 
         if self._startup_cmd:
-            await self._mount_message(SystemMessage(f"⚡ Running startup command: `{self._startup_cmd}`"))
+            await self._mount_message(SystemMessage(f"Running startup command: `{self._startup_cmd}`"))
             await self._submit_input(self._startup_cmd, "shell")
 
         if self._initial_skill:
@@ -1273,6 +1301,11 @@ class OpsCloudApp(App):
                 context["aws_profile"] = active_aws_prof
             if active_aws_reg:
                 context["aws_region"] = active_aws_reg
+            panel = self._get_subagent_panel()
+            if panel is not None:
+                spec = self._model or ""
+                display_label = spec.split(":")[-1] if ":" in spec else spec
+                panel.prepare_turn(model_label=display_label)
 
             await self._adapter.stream_turn(
                 prompt=message,
@@ -2139,7 +2172,7 @@ class OpsCloudApp(App):
             if self._agent_running and handler.bypass_tier == BypassTier.QUEUED:
                 self._pending_messages.append(QueuedMessage(text=text, mode="command"))
                 await self._mount_message(
-                    SystemMessage(f"⏳ Command `{cmd_name}` queued...")
+                    SystemMessage(f"Command `{cmd_name}` queued...")
                 )
                 return
 
@@ -2179,7 +2212,7 @@ class OpsCloudApp(App):
         if self._agent_running and command.bypass_tier == BypassTier.QUEUED:
             self._pending_messages.append(QueuedMessage(text=text, mode="command"))
             await self._mount_message(
-                SystemMessage(f"⏳ Command `{cmd_name}` queued...")
+                SystemMessage(f"Command `{cmd_name}` queued...")
             )
             return
 
@@ -2851,7 +2884,7 @@ class OpsCloudApp(App):
         await self._mount_message(SystemMessage(f"Updating OpsCloud v{cli_version} → v{latest}..."))
         success, output = await asyncio.to_thread(_perform_upgrade, target_version=latest, prerelease=prerelease)
         if success:
-            await self._mount_message(SystemMessage(f"✅ Updated OpsCloud to v{latest}. Run `/restart` to apply."))
+            await self._mount_message(SystemMessage(f"Updated OpsCloud to v{latest}. Run `/restart` to apply."))
         else:
             await self._mount_message(ErrorMessage(f"Failed to update OpsCloud:\n{output}"))
 
@@ -3302,7 +3335,7 @@ class OpsCloudApp(App):
             if hasattr(self, "_sync_goal_state_from_checkpoint"):
                 await self._sync_goal_state_from_checkpoint(force=True)
 
-        label = "✨ Created new thread" if is_new else "🔄 Resumed thread"
+        label = "Created new thread" if is_new else "Resumed thread"
         await self._mount_message(
             SystemMessage(f"{label}: `{thread_id}`")
         )
@@ -3345,9 +3378,20 @@ class OpsCloudApp(App):
     async def _get_conversation_token_count(self) -> int | None:
         """Get approximate token count of conversation message history."""
         try:
-            msgs = self.get_thread_messages()
+            msgs = None
+            if hasattr(self, "_get_thread_state_values"):
+                try:
+                    state_values = await self._get_thread_state_values()
+                    msgs = state_values.get("messages")
+                except Exception:
+                    pass
+            if not msgs:
+                msgs = self.get_thread_messages()
             if not msgs:
                 return None
+            if any(isinstance(m, dict) for m in msgs):
+                from langchain_core.messages.utils import convert_to_messages
+                msgs = convert_to_messages(msgs)
             from langchain_core.messages.utils import count_tokens_approximately
             return count_tokens_approximately(msgs)
         except Exception:
@@ -3416,7 +3460,18 @@ class OpsCloudApp(App):
 
     def get_mcp_servers(self) -> list:
         """Return MCP server metadata for /mcp, /skills, and /doctor commands."""
-        return getattr(self, "_mcp_server_info", [])
+        servers = getattr(self, "_mcp_server_info", [])
+        if not servers:
+            try:
+                from opscloud.mcp.preload import get_cached_mcp_server_infos
+
+                cached = get_cached_mcp_server_infos()
+                if cached:
+                    self._mcp_server_info = cached
+                    return cached
+            except Exception:
+                pass
+        return servers
 
     def get_discovered_skills(self) -> list[dict[str, Any]]:
         """Get list of discovered skills (project, user, plugin, built-in)."""
@@ -4552,12 +4607,35 @@ class OpsCloudApp(App):
             )
         )
 
+    # ── Screen Stack Safety ───────────────────────────────
+
+    def pop_screen(self) -> Any:
+        """Pop current screen, guarding against ScreenStackError if only default screen remains."""
+        screen_stack = getattr(self, "_screen_stack", None)
+        if screen_stack is not None and len(screen_stack) <= 1:
+            logger.warning(
+                "Attempted to pop screen when only default screen remains on stack (%r)",
+                screen_stack,
+            )
+            from textual.await_complete import AwaitComplete
+
+            async def _noop() -> None:
+                pass
+
+            return AwaitComplete(_noop()).call_next(self)
+        return super().pop_screen()
+
     # ── Model Selector Integration ────────────────────────
 
     async def _show_model_selector(self) -> None:
         """Open the interactive model picker modal."""
         from opscloud.ui.widgets.model_selector import ModelSelectorScreen
         from opscloud.model.config import resolve_model_spec
+
+        for s in getattr(self, "_screen_stack", []):
+            if isinstance(s, ModelSelectorScreen):
+                logger.debug("ModelSelectorScreen already open on screen stack, skipping")
+                return
 
         current_provider, current_model = None, None
         if self._model:
@@ -4575,10 +4653,14 @@ class OpsCloudApp(App):
             current_effort=current_effort,
         )
 
+        _handled = False
+
         def _on_model_selected(result: tuple[str, str, str | None] | tuple[str, str] | None) -> None:
             """Callback when the model selector is dismissed."""
-            if result is None:
+            nonlocal _handled
+            if _handled or result is None:
                 return
+            _handled = True
             spec = result[0]
             effort = result[2] if len(result) > 2 else None
             extra = screen.pending_install_extra
@@ -4821,7 +4903,7 @@ class OpsCloudApp(App):
                 pass
             await self._mount_message(
                 SystemMessage(
-                    f"⏳ **Model configured!** Starting agent server for model `{spec}`..."
+                    f"**Model configured!** Starting agent server for model `{spec}`..."
                 )
             )
             self.run_worker(self._start_server_background(), group="server-startup")

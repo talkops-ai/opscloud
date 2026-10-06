@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from opscloud.plugins.models import PluginInstance
     from opscloud.subagents.types import SubagentMetadata
 
@@ -24,6 +25,12 @@ def _enrich_plugin_subagent(meta: SubagentMetadata, plugin: PluginInstance) -> S
         meta["name"] = f"{p_id}:{raw_name}"
 
     meta["source"] = f"plugin:{p_id}"
+    meta["plugin_id"] = p_id
+    meta["bundle_dir"] = str(plugin.root)
+
+    skills_dir = plugin.root / "skills"
+    if skills_dir.is_dir():
+        meta["skills_dir"] = str(skills_dir)
 
     # Attach default plugin skill wildcard if no skills explicitly set
     if not meta.get("skills"):
@@ -37,6 +44,29 @@ def _enrich_plugin_subagent(meta: SubagentMetadata, plugin: PluginInstance) -> S
             meta["mcp_config"] = {"mcpServers": plugin.manifest.inline_mcp}
 
     return meta
+
+
+def get_subagent_bundle_dir(subagent_meta: SubagentMetadata | Mapping[str, Any]) -> Path | None:
+    """Return the plugin or bundle root directory for a subagent."""
+    if "bundle_dir" in subagent_meta and subagent_meta["bundle_dir"]:
+        return Path(str(subagent_meta["bundle_dir"]))
+    path = subagent_meta.get("path")
+    if not path:
+        return None
+    p = Path(path)
+    return p.parent.parent if p.parent.name == "agents" else p.parent
+
+
+def get_subagent_skills_source(subagent_meta: SubagentMetadata | Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return the skill source tuple for a subagent's bundled skills, if any."""
+    subagent_name = subagent_meta.get("name", "subagent")
+    skills_dir_str = subagent_meta.get("skills_dir")
+    if skills_dir_str and Path(skills_dir_str).is_dir():
+        return (skills_dir_str, f"Subagent ({subagent_name})")
+    bundle_dir = get_subagent_bundle_dir(subagent_meta)
+    if bundle_dir and (bundle_dir / "skills").is_dir():
+        return (str(bundle_dir / "skills"), f"Subagent ({subagent_name})")
+    return None
 
 
 def plugin_subagents(plugins: tuple[PluginInstance, ...] | list[PluginInstance]) -> list[SubagentMetadata]:

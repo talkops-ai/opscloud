@@ -82,7 +82,7 @@ class CompactHandler(BaseCommandHandler):
         summary_str = f"Summarized {len(to_compact)} prior messages:\n{summary_body[:300]}"
 
         from langchain_core.messages import RemoveMessage, SystemMessage
-        summary_msg = SystemMessage(content=f"🧹 **Summary of prior conversation:**\n{summary_str}")
+        summary_msg = SystemMessage(content=f"**Summary of prior conversation:**\n{summary_str}")
 
         new_messages: list = []
         if ctx.agent is not None and thread_id:
@@ -108,7 +108,7 @@ class CompactHandler(BaseCommandHandler):
         freed_tokens = max(0, before_tokens - after_tokens)
 
         msg = (
-            f"🧹 **Conversation Compacted**\n"
+            f"**Conversation Compacted**\n"
             f"├ **Before:** ~{before_tokens:,} tokens ({len(messages)} messages)\n"
             f"├ **After:**  ~{after_tokens:,} tokens ({len(new_messages) if new_messages else 'compacted'} messages)\n"
             f"└ **Freed:**  ~{freed_tokens:,} tokens"

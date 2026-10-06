@@ -47,6 +47,7 @@ class _TurnStreamState:
     pending_text_by_namespace: dict[tuple[str, ...], str] = field(default_factory=dict)
     tool_call_buffers: dict[ToolCallBufferKey, ToolCallBuffer] = field(default_factory=dict)
     displayed_tool_ids: set[str] = field(default_factory=set)
+    recorded_message_usage: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 def _read_mentioned_file(file_path: Path, max_embed_bytes: int = 256 * 1024) -> str:
@@ -64,7 +65,7 @@ def _read_mentioned_file(file_path: Path, max_embed_bytes: int = 256 * 1024) -> 
 
 
 def _is_renderable_subagent_event(data: Any, *, is_main_agent: bool) -> bool:
-    return is_main_agent and isinstance(data, dict) and data.get("type") == "subagent"
+    return isinstance(data, dict) and data.get("type") == "subagent"
 
 
 def _is_auto_mode_classifier_chunk(metadata: dict[str, Any] | None) -> bool:
@@ -611,20 +612,52 @@ class TextualAdapter:
                     self._status_bar.set_tokens(total_tokens, context_tokens=ctx_toks)
             return
 
+        if isinstance(data, dict) and data.get("type") == "subagent_progress":
+            action = str(data.get("action") or "Working...")
+            sub_name = data.get("subagent_name") or data.get("id")
+            sub_str = str(sub_name) if sub_name else None
+            panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
+            if panel is not None:
+                panel.set_subagent_activity(sub_str, action)
+            has_attached_panel = panel is not None and getattr(panel, "is_attached", False)
+            if self._set_spinner:
+                if has_attached_panel:
+                    try:
+                        import asyncio
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self._set_spinner(None))
+                    except RuntimeError:
+                        pass
+                else:
+                    display_name = f"Subagent [{sub_str}]" if sub_str else "Subagent"
+                    try:
+                        import asyncio
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self._set_spinner(f"{display_name}: {action}"))
+                    except RuntimeError:
+                        pass
+            return
+
         if isinstance(data, dict) and data.get("type") == "model_routed":
             provider = str(data.get("provider") or "")
             model_name = str(data.get("model") or "")
             effort = str(data.get("effort") or "")
-            if self._status_bar is not None and model_name:
-                self._status_bar.set_model(
-                    provider=provider,
-                    model=model_name,
-                    effort=effort,
-                )
-            if self._app is not None and model_name:
-                self._app._model = f"{provider}:{model_name}" if provider else model_name
-                if effort:
-                    self._app._reasoning_effort = effort
+            is_sub = data.get("is_subagent") or not is_main_agent
+            if is_sub:
+                panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
+                if panel is not None:
+                    panel.set_subagent_model(None, model_name)
+            else:
+                if self._status_bar is not None and model_name:
+                    self._status_bar.set_model(
+                        provider=provider,
+                        model=model_name,
+                        effort=effort,
+                    )
+                if self._app is not None and model_name:
+                    self._app._model = f"{provider}:{model_name}" if provider else model_name
+                    if effort:
+                        self._app._reasoning_effort = effort
             return
 
         if self._on_subagent_event is not None and _is_renderable_subagent_event(data, is_main_agent=is_main_agent):
@@ -701,23 +734,67 @@ class TextualAdapter:
             or (meta or {}).get("usage")
         )
         if isinstance(usage_meta, dict):
-            inp_toks = usage_meta.get("input_tokens") or usage_meta.get("prompt_tokens") or 0
-            out_toks = usage_meta.get("output_tokens") or usage_meta.get("completion_tokens") or 0
-            if inp_toks > 0:
-                self._stats.input_tokens = inp_toks
-            if out_toks > 0:
-                self._stats.output_tokens = out_toks
-            if inp_toks > 0 or out_toks > 0:
-                context_toks = (inp_toks or 0) + (out_toks or 0)
-                stream_state.turn_context_tokens = max(stream_state.turn_context_tokens, context_toks)
+            inp_toks = int(usage_meta.get("input_tokens") or usage_meta.get("prompt_tokens") or 0)
+            out_toks = int(usage_meta.get("output_tokens") or usage_meta.get("completion_tokens") or 0)
+            msg_id = getattr(msg_obj, "id", None)
+            if not msg_id or not isinstance(msg_id, str):
+                msg_id = f"{ns_key}:{id(msg_obj)}"
+
+            prev_inp, prev_out = stream_state.recorded_message_usage.get(msg_id, (0, 0))
+            delta_inp = max(0, inp_toks - prev_inp)
+            delta_out = max(0, out_toks - prev_out)
+
+            if delta_inp > 0 or delta_out > 0:
+                stream_state.recorded_message_usage[msg_id] = (max(prev_inp, inp_toks), max(prev_out, out_toks))
+                self._stats.input_tokens += delta_inp
+                self._stats.output_tokens += delta_out
+
+                # Track active conversation context size
+                if is_main_agent and inp_toks > 0:
+                    stream_state.turn_context_tokens = max(stream_state.turn_context_tokens, inp_toks + out_toks)
+                elif stream_state.turn_context_tokens == 0:
+                    stream_state.turn_context_tokens = inp_toks + out_toks
+
                 if self._app:
                     setattr(self._app, "_context_tokens", stream_state.turn_context_tokens)
-                if not stream_state.received_session_tokens and self._app:
-                    setattr(
-                        self._app,
-                        "_cumulative_session_tokens",
-                        stream_state.start_session_tokens + stream_state.turn_context_tokens,
-                    )
+
+                total_delta = delta_inp + delta_out
+                if self._app:
+                    current_cum = getattr(self._app, "_cumulative_session_tokens", 0) or 0
+                    if not stream_state.received_session_tokens:
+                        new_cum = current_cum + total_delta
+                        setattr(self._app, "_cumulative_session_tokens", new_cum)
+
+                # Estimate cost for this delta so the status bar updates live
+                from opscloud.middleware.cost_tracking import estimate_cost
+
+                model_name = ""
+                provider = ""
+                model_spec = getattr(self._app, "_model", "") if self._app else ""
+                if model_spec:
+                    if ":" in model_spec:
+                        provider, model_name = model_spec.split(":", 1)
+                    else:
+                        model_name = model_spec
+
+                resp_meta = getattr(msg_obj, "response_metadata", {}) or {}
+                if isinstance(resp_meta, dict):
+                    model_name = resp_meta.get("model_name") or resp_meta.get("model") or model_name
+
+                cost_delta = estimate_cost(
+                    {"input_tokens": delta_inp, "output_tokens": delta_out},
+                    model_name,
+                    provider,
+                )
+                if cost_delta is not None and cost_delta > 0:
+                    self._stats.total_cost_usd += cost_delta
+                    if not stream_state.received_session_tokens and self._app:
+                        cur_cost = getattr(self._app, "_session_cost_usd", 0.0) or 0.0
+                        new_cost = cur_cost + cost_delta
+                        setattr(self._app, "_session_cost_usd", new_cost)
+                        if self._status_bar is not None:
+                            self._status_bar.set_cost(new_cost)
+
                 if self._status_bar is not None:
                     cumulative = getattr(self._app, "_cumulative_session_tokens", 0) if self._app else 0
                     display_tokens = cumulative or stream_state.turn_context_tokens
@@ -741,7 +818,18 @@ class TextualAdapter:
             content = str(getattr(msg_obj, "content", ""))
             if self._messages is not None and is_main_agent:
                 self._messages.update_tool_result(call_id=call_id, result=content, name=tool_name)
-            if self._set_spinner:
+
+            if not is_main_agent:
+                panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
+                if panel is not None:
+                    panel.set_subagent_activity(None, "Thinking")
+                has_panel = panel is not None and getattr(panel, "is_attached", False)
+                if self._set_spinner and not has_panel:
+                    try:
+                        await self._set_spinner("Subagent: Thinking")
+                    except Exception:
+                        pass
+            elif self._set_spinner:
                 try:
                     await self._set_spinner("Thinking")
                 except Exception:
@@ -770,7 +858,17 @@ class TextualAdapter:
                 thinking_dur = time.time() - stream_state.thinking_start_t
                 if self._messages is not None and is_main_agent:
                     self._messages.append_thinking_token(thinking, duration_seconds=thinking_dur)
-                if self._set_spinner:
+                if not is_main_agent:
+                    panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
+                    if panel is not None:
+                        panel.set_subagent_activity(None, "Thinking")
+                    has_panel = panel is not None and getattr(panel, "is_attached", False)
+                    if self._set_spinner and not has_panel:
+                        try:
+                            await self._set_spinner("Subagent: Thinking")
+                        except Exception:
+                            pass
+                elif self._set_spinner:
                     try:
                         await self._set_spinner("Thinking")
                     except Exception:
@@ -825,15 +923,26 @@ class TextualAdapter:
 
                 if buffer_id is not None and buffer_id not in stream_state.displayed_tool_ids:
                     stream_state.displayed_tool_ids.add(buffer_id)
-                    if self._set_spinner:
-                        try:
-                            await self._set_spinner("Thinking")
-                        except Exception:
-                            pass
+                    if not is_main_agent:
+                        panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
+                        if panel is not None:
+                            panel.set_subagent_activity(None, buffer_name)
+                        has_panel = panel is not None and getattr(panel, "is_attached", False)
+                        if self._set_spinner and not has_panel:
+                            try:
+                                await self._set_spinner(f"Subagent: {buffer_name}")
+                            except Exception:
+                                pass
+                    else:
+                        if self._set_spinner:
+                            try:
+                                await self._set_spinner("Thinking")
+                            except Exception:
+                                pass
 
-                    if self._messages is not None and is_main_agent:
-                        self._messages.add_tool_call(name=buffer_name, call_id=buffer_id, args=parsed_args)
-                        self._active_tools_map[buffer_id] = buffer_name
+                        if self._messages is not None and is_main_agent:
+                            self._messages.add_tool_call(name=buffer_name, call_id=buffer_id, args=parsed_args)
+                            self._active_tools_map[buffer_id] = buffer_name
 
     async def _resolve_pending_interrupts(
         self,

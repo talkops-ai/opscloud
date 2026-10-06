@@ -15,10 +15,11 @@ from opscloud.middleware.ask_user import AskUserMiddleware
 from opscloud.middleware.resume_state import ResumeStateMiddleware
 from opscloud.middleware.compaction import create_cli_compaction_middleware
 from opscloud.middleware.skills import PluginSkillsMiddleware
-from opscloud.middleware.cost_tracking import CostState, CostTrackingMiddleware
+from opscloud.middleware.cost_tracking import ACTIVE_SESSION_THREAD_ID, CostState, CostTrackingMiddleware
 from opscloud.middleware.auto_mode_hitl import AutoModeHITLMiddleware, AutoModeState
 from opscloud.middleware.auto_mode import AUTO_MODE_EVENT_TYPE, is_potentially_destructive
 from opscloud.middleware.subagents import SubagentsMiddleware
+from opscloud.middleware.subagent_telemetry import SubagentTelemetryMiddleware
 from opscloud.middleware.goal_state_notice import (
     GOAL_CONTROL_MESSAGE_SOURCE,
     GOAL_STATE_MESSAGE_SOURCE,
@@ -65,6 +66,7 @@ __all__ = [
     "ResumeStateMiddleware",
     "CostTrackingMiddleware",
     "CostState",
+    "ACTIVE_SESSION_THREAD_ID",
     "create_cli_compaction_middleware",
     "PluginSkillsMiddleware",
     "AutoModeHITLMiddleware",
@@ -72,6 +74,7 @@ __all__ = [
     "AUTO_MODE_EVENT_TYPE",
     "is_potentially_destructive",
     "SubagentsMiddleware",
+    "SubagentTelemetryMiddleware",
     "GoalToolsMiddleware",
     "GoalCriteriaMiddleware",
     "GoalCriteriaRequest",

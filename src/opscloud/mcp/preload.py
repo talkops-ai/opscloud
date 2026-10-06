@@ -6,7 +6,9 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 import fnmatch
+import hashlib
 import os
+import re
 from typing import Any
 
 from opscloud.mcp.config import resolve_mcp_server_env, sync_mcp_env_aliases
@@ -15,8 +17,31 @@ from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_PROBE_TIMEOUT = 5.0
+_DEFAULT_PROBE_TIMEOUT = 30.0
+_PROBE_TIMEOUT = float(os.environ.get("OPSCLOUD_MCP_PROBE_TIMEOUT", str(_DEFAULT_PROBE_TIMEOUT)))
 _MAX_CONCURRENT_PROBES = 8
+
+_MCP_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_MCP_TOOL_NAME_MAX_LENGTH = 64
+_MCP_TOOL_NAME_HASH_LENGTH = 12
+
+
+def _mcp_tool_name(server_name: str, tool_name: str) -> str:
+    """Compose a provider-safe MCP tool name within max length limits."""
+    raw_name = f"{server_name}_{tool_name}"
+    sanitized = _MCP_TOOL_NAME_RE.sub("_", raw_name).strip("_") or "unnamed"
+    if sanitized == raw_name and len(sanitized) <= _MCP_TOOL_NAME_MAX_LENGTH:
+        return sanitized
+    digest = hashlib.sha256(f"{server_name}\0{tool_name}".encode()).hexdigest()[
+        :_MCP_TOOL_NAME_HASH_LENGTH
+    ]
+    server = _MCP_TOOL_NAME_RE.sub("_", server_name).strip("_") or "unnamed"
+    tool = _MCP_TOOL_NAME_RE.sub("_", tool_name).strip("_") or "unnamed"
+    available = _MCP_TOOL_NAME_MAX_LENGTH - len(digest) - 2
+    tool_length = min(len(tool), available // 2)
+    server_length = min(len(server), available - tool_length)
+    tool_length = min(len(tool), available - server_length)
+    return f"{server[:server_length]}_{tool[:tool_length]}_{digest}"
 
 
 def _resolve_transport(config: Mapping[str, Any]) -> str:
@@ -53,11 +78,24 @@ def _filter_tool_names(
 
 
 def _clean_mcp_schema(schema: Any) -> dict[str, Any]:
-    """Clean JSON Schema for compatibility with LLM provider tool schemas (Gemini, Anthropic, OpenAI)."""
+    """Clean JSON Schema for compatibility with LLM provider tool schemas (Gemini, Anthropic, OpenAI).
+
+    Dereferences all `$ref` pointers (such as `#/$defs/...` or `#/definitions/...`)
+    using LangChain's `dereference_refs` so that referenced models (like PricingFilter)
+    are inlined directly into properties before removing metadata keys.
+    """
     if not isinstance(schema, dict):
         return {}
 
-    cleaned = dict(schema)
+    from langchain_core.utils.json_schema import dereference_refs
+
+    try:
+        resolved = dereference_refs(schema)
+    except Exception as exc:
+        logger.debug("Failed to dereference MCP schema refs: %s", exc)
+        resolved = schema
+
+    cleaned = dict(resolved) if isinstance(resolved, dict) else dict(schema)
     for key in ("$schema", "$id", "$defs", "definitions", "additionalProperties"):
         cleaned.pop(key, None)
 
@@ -157,7 +195,7 @@ def _extract_root_mcp_error(
         if "connecterror" in type(e).__name__.lower() or "connection refused" in msg.lower():
             return "error", f"Connection refused: {msg}"
         if isinstance(e, asyncio.TimeoutError):
-            return "error", "Connection timed out after 5.0s"
+            return "error", f"Connection timed out after {_PROBE_TIMEOUT:.1f}s"
 
     stderr_diag = _clean_stderr_diagnostic(stderr_output)
     if stderr_diag:
@@ -297,12 +335,13 @@ async def probe_one_mcp_server(
                 continue
 
             clean_schema = _clean_mcp_schema(getattr(t, "inputSchema", None))
-            prefixed_name = f"{name}:{raw_name}"
+            tool_name = _mcp_tool_name(name, raw_name)
             tools.append(
                 MCPToolInfo(
-                    name=prefixed_name,
+                    name=tool_name,
                     description=getattr(t, "description", "") or "",
                     input_schema=clean_schema,
+                    original_name=raw_name,
                 )
             )
 
@@ -453,6 +492,7 @@ async def preload_mcp_server_info(
 
 
 __all__ = [
+    "_mcp_tool_name",
     "clear_cached_mcp_server_infos",
     "evict_cached_mcp_server_info",
     "format_mcp_status_response",

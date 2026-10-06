@@ -97,7 +97,7 @@ class SkillsHandler(BaseCommandHandler):
                 loc = f"\n    Location: `{Path(path).parent}/`" if path else ""
                 d_str = f"\n    Purpose: {desc}" if desc else ""
                 lines.append(f"  • **{name}**{loc}{d_str}")
-            sections.append("🎯 **Project Skills:**\n\n" + "\n\n".join(lines))
+            sections.append("**Project Skills:**\n\n" + "\n\n".join(lines))
 
         if user_skills:
             lines = []
@@ -105,7 +105,7 @@ class SkillsHandler(BaseCommandHandler):
                 loc = f"\n    Location: `{Path(path).parent}/`" if path else ""
                 d_str = f"\n    Purpose: {desc}" if desc else ""
                 lines.append(f"  • **{name}**{loc}{d_str}")
-            sections.append("🎯 **User Skills:**\n\n" + "\n\n".join(lines))
+            sections.append("**User Skills:**\n\n" + "\n\n".join(lines))
 
         if plugin_skills:
             lines = []
@@ -113,7 +113,7 @@ class SkillsHandler(BaseCommandHandler):
                 loc = f"\n    Location: `{Path(path).parent}/`" if path else ""
                 d_str = f"\n    Purpose: {desc}" if desc else ""
                 lines.append(f"  • **{name}**{loc}{d_str}")
-            sections.append("🔌 **Plugin Skills:**\n\n" + "\n\n".join(lines))
+            sections.append("**Plugin Skills:**\n\n" + "\n\n".join(lines))
 
         if builtin_skills:
             lines = []
@@ -121,7 +121,7 @@ class SkillsHandler(BaseCommandHandler):
                 loc = f"\n    Location: `{Path(path).parent}/`" if path else ""
                 d_str = f"\n    Purpose: {desc}" if desc else ""
                 lines.append(f"  • **{name}**{loc}{d_str}")
-            sections.append("📦 **Built-in Skills:**\n\n" + "\n\n".join(lines))
+            sections.append("**Built-in Skills:**\n\n" + "\n\n".join(lines))
 
 
         # 2. Built-in Tools & MCP Tools (shown when /tools alias is called or if explicitly requested)
@@ -138,7 +138,7 @@ class SkillsHandler(BaseCommandHandler):
                     t_name, t_desc, _, _ = _extract_name_desc(item)
                     tool_lines.append(f"  • `{t_name}`: {t_desc}" if t_desc else f"  • `{t_name}`")
                 if tool_lines:
-                    sections.append("🛠️ **Built-in Core Tools:**\n" + "\n".join(tool_lines))
+                    sections.append("**Built-in Core Tools:**\n" + "\n".join(tool_lines))
 
             if ctx.app and hasattr(ctx.app, "get_mcp_servers"):
                 raw_mcp = ctx.app.get_mcp_servers()
@@ -146,7 +146,7 @@ class SkillsHandler(BaseCommandHandler):
                 for srv in mcp_servers:
                     srv_name = getattr(srv, "name", str(srv.get("name") if isinstance(srv, dict) else "unknown"))
                     status = getattr(srv, "status", srv.get("status") if isinstance(srv, dict) else "ok")
-                    status_icon = "✅" if status in ("ok", True) else "⚠️"
+                    status_icon = "[ok]" if status in ("ok", True) else "[warn]"
                     raw_tools = srv.get("tools") if isinstance(srv, dict) else getattr(srv, "tools", ())
                     tools = list(raw_tools) if raw_tools is not None else []
                     tool_lines = []
@@ -154,11 +154,11 @@ class SkillsHandler(BaseCommandHandler):
                         t_name, t_desc, _, _ = _extract_name_desc(t)
                         tool_lines.append(f"  • `{t_name}`: {t_desc}" if t_desc else f"  • `{t_name}`")
                     if tool_lines:
-                        sections.append(f"🔌 **MCP Server `{srv_name}` ({status_icon} {status}):**\n" + "\n".join(tool_lines))
+                        sections.append(f"**MCP Server `{srv_name}` ({status_icon} {status}):**\n" + "\n".join(tool_lines))
 
         if not sections:
             empty_msg = (
-                "🎯 **Skills**\n\n"
+                "**Skills**\n\n"
                 "No skills found.\n"
                 "Skills are loaded from these directories (highest precedence first):\n"
                 "  1. `.opscloud/skills/`                 project skills\n"

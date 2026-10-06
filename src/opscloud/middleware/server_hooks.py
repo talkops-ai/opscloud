@@ -150,20 +150,47 @@ def _subagent_transcript_config(
     call: ToolCallData,
     config: RunnableConfig,
 ) -> Generator[None, None, None]:
-    if call.name not in _SUBAGENT_TOOL_NAMES:
+    if call.name not in _TASK_TOOL_NAMES:
         yield
         return
 
     from langchain_core.runnables.config import var_child_runnable_config
+    from opscloud.middleware.cost_tracking import ACTIVE_SESSION_THREAD_ID
 
     metadata = config.get("metadata")
     child_metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
     child_metadata["subagent_transcript_id"] = call.id
-    child_config: RunnableConfig = {**config, "metadata": child_metadata}
+
+    configurable = config.get("configurable")
+    child_configurable = dict(configurable) if isinstance(configurable, Mapping) else {}
+
+    parent_thread_id = (
+        child_configurable.get("thread_id")
+        or child_metadata.get("thread_id")
+        or ACTIVE_SESSION_THREAD_ID.get()
+    )
+    if parent_thread_id:
+        child_metadata["thread_id"] = parent_thread_id
+        child_configurable["thread_id"] = parent_thread_id
+        child_configurable["checkpoint_ns"] = f"subagent:{call.id}"
+        child_metadata["checkpoint_ns"] = f"subagent:{call.id}"
+
+    child_config: RunnableConfig = {
+        **config,
+        "metadata": child_metadata,
+        "configurable": child_configurable,
+    }
     token = var_child_runnable_config.set(child_config)
+    cost_token = (
+        ACTIVE_SESSION_THREAD_ID.set(parent_thread_id)
+        if parent_thread_id
+        else None
+    )
     try:
         yield
     finally:
+        if cost_token is not None:
+            ACTIVE_SESSION_THREAD_ID.reset(cost_token)
         var_child_runnable_config.reset(token)
 
 
@@ -266,6 +293,26 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
                 call.args.get("subagent_type") or call.args.get("name") or call.args.get("agent") or call.name
             )
             description = str(call.args.get("description") or call.args.get("prompt") or call.args.get("task") or "")
+            model = call.args.get("model")
+            if not model:
+                try:
+                    from opscloud.subagents.loader import list_subagents
+
+                    for meta in list_subagents():
+                        name = meta.get("name")
+                        alias = meta.get("alias")
+                        name_str = name if isinstance(name, str) else ""
+                        alias_str = alias if isinstance(alias, str) else ""
+                        if (
+                            subagent_type in {name_str, alias_str}
+                            or (name_str and name_str.startswith(subagent_type))
+                            or (alias_str and alias_str.startswith(subagent_type))
+                        ):
+                            if meta.get("model"):
+                                model = meta.get("model")
+                                break
+                except Exception:
+                    pass
             try:
                 dispatch_custom_event(
                     "subagent",
@@ -276,6 +323,7 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
                         "subagent_type": subagent_type,
                         "description": description,
                         "label": f"{subagent_type}: {description}",
+                        "model": model,
                     },
                     config=request.runtime.config,
                 )
@@ -333,6 +381,26 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
                 call.args.get("subagent_type") or call.args.get("name") or call.args.get("agent") or call.name
             )
             description = str(call.args.get("description") or call.args.get("prompt") or call.args.get("task") or "")
+            model = call.args.get("model")
+            if not model:
+                try:
+                    from opscloud.subagents.loader import list_subagents
+
+                    for meta in list_subagents():
+                        name = meta.get("name")
+                        alias = meta.get("alias")
+                        name_str = name if isinstance(name, str) else ""
+                        alias_str = alias if isinstance(alias, str) else ""
+                        if (
+                            subagent_type in {name_str, alias_str}
+                            or (name_str and name_str.startswith(subagent_type))
+                            or (alias_str and alias_str.startswith(subagent_type))
+                        ):
+                            if meta.get("model"):
+                                model = meta.get("model")
+                                break
+                except Exception:
+                    pass
             try:
                 await adispatch_custom_event(
                     "subagent",
@@ -343,6 +411,7 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
                         "subagent_type": subagent_type,
                         "description": description,
                         "label": f"{subagent_type}: {description}",
+                        "model": model,
                     },
                     config=request.runtime.config,
                 )
@@ -994,7 +1063,7 @@ def _tool_result_failed(result: ToolMessage | Command[Any], call_id: str) -> boo
         if result.status == "error":
             return True
         content = getattr(result, "content", "")
-        return bool(isinstance(content, str) and (content.startswith("Error:") or content.startswith("Traceback")))
+        return isinstance(content, str) and (content.startswith("Error:") or content.startswith("Traceback"))
     return any(
         _is_call_result(message, call_id)
         and (

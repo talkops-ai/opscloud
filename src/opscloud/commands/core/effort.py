@@ -49,7 +49,7 @@ class EffortHandler(BaseCommandHandler):
             eff_label = current or "default"
             return CommandResult(
                 success=True,
-                message=f"🧠 **Reasoning Effort:** `{eff_label}` · Model: `{model}`",
+                message=f"**Reasoning Effort:** `{eff_label}` · Model: `{model}`",
             )
 
         if level in ("clear", "off", "none", "0"):
@@ -101,7 +101,7 @@ class EffortHandler(BaseCommandHandler):
 
         return CommandResult(
             success=True,
-            message=f"🧠 **Reasoning Effort Set:** `{level}` · `{model}`",
+            message=f"**Reasoning Effort Set:** `{level}` · `{model}`",
         )
 
 

@@ -513,18 +513,18 @@ class ToolCallMessage(Vertical):
        light/dark/ansi themes while the border carries the primary signal. */
     ToolCallMessage.-status-success {
         border-left: wide $success;
-        background: $success 8%;
+        background: transparent;
     }
 
     ToolCallMessage.-status-error {
         border-left: wide $error;
-        background: $error 10%;
+        background: transparent;
     }
 
     ToolCallMessage.-status-rejected,
     ToolCallMessage.-status-skipped {
         border-left: wide $warning;
-        background: $warning 8%;
+        background: transparent;
     }
 
     ToolCallMessage:hover {
@@ -646,15 +646,21 @@ class ToolCallMessage(Vertical):
         if self._tool_name not in _TOOLS_WITH_HEADER_INFO:
             args = self._filtered_args()
             if args:
-                args_str = ", ".join(
-                    f"{k}={v!r}" for k, v in list(args.items())[:_MAX_INLINE_ARGS]
-                )
-                if len(args) > _MAX_INLINE_ARGS:
-                    args_str += ", ..."
-                yield Static(
-                    Content.from_markup("[dim]($args)[/dim]", args=args_str),
-                    classes="tool-args",
-                )
+                inline_items = {}
+                for k, v in list(args.items())[:_MAX_INLINE_ARGS]:
+                    if k in {"code", "script"} or (isinstance(v, str) and "\n" in v):
+                        continue
+                    inline_items[k] = v
+                if inline_items:
+                    args_str = ", ".join(
+                        f"{k}={v!r}" for k, v in inline_items.items()
+                    )
+                    if len(args) > len(inline_items):
+                        args_str += ", ..."
+                    yield Static(
+                        Content.from_markup("[dim]($args)[/dim]", args=args_str),
+                        classes="tool-args",
+                    )
         # Collapsed argument detail for tools whose args are too noisy inline.
         # Mounted for every tool but only populated when `has_expandable_args` is True.
         self._args_widget = Static("", classes="tool-args", id="args-full")
@@ -2404,17 +2410,34 @@ class ToolCallMessage(Vertical):
         """Whether the tool's args are large enough to deserve a collapsible block.
 
         - `ask_user`: its `questions` payload is too noisy to render inline.
-        - `execute`: the header truncates the shell command at
+        - `execute` / `run_command`: the header truncates the shell command at
             `EXECUTE_HEADER_MAX_LENGTH`, so the full command is offered as a
-            collapsible block when the command, after stripping surrounding
-            whitespace, is longer than `EXECUTE_HEADER_MAX_LENGTH`.
+            collapsible block when the command is longer than `EXECUTE_HEADER_MAX_LENGTH`.
+        - `js_eval`, `run_script`, or script/code args: full source code block.
         """
         if self._tool_name == "ask_user":
             return bool(self._args)
-        if self._tool_name == "execute":
-            command = self._args.get("command")
+        if self._tool_name in {"execute", "run_command"}:
+            command = (
+                self._args.get("command")
+                or self._args.get("cmd")
+                or self._args.get("command_line")
+                or self._args.get("CommandLine")
+            )
             if isinstance(command, str) and command.strip():
                 return len(command.strip()) > EXECUTE_HEADER_MAX_LENGTH
+        if (
+            "code" in self._args
+            or "script" in self._args
+            or self._tool_name.endswith("run_script")
+            or "run_script" in self._tool_name
+        ):
+            code = self._args.get("code") or self._args.get("script")
+            if isinstance(code, str) and ("\n" in code or len(code) > 40):
+                return True
+        for val in self._args.values():
+            if isinstance(val, str) and ("\n" in val or len(val) > 80):
+                return True
         return False
 
     @property
@@ -2495,7 +2518,7 @@ class ToolCallMessage(Vertical):
             A plain `Content` renderable with a blank line of padding on
                 top and bottom.
         """
-        code = self._args.get("code")
+        code = self._args.get("code") or self._args.get("script")
         code_str = code.strip("\n") if isinstance(code, str) else str(code)
 
         # Blank lines of top/bottom padding separate the block from the header
@@ -2513,7 +2536,12 @@ class ToolCallMessage(Vertical):
             A plain `Content` renderable with a blank line of padding on
                 top and bottom.
         """
-        command = self._args.get("command")
+        command = (
+            self._args.get("command")
+            or self._args.get("cmd")
+            or self._args.get("command_line")
+            or self._args.get("CommandLine")
+        )
         command_str = command.strip("\n") if isinstance(command, str) else str(command)
         return Content("\n").join((Content(""), Content(command_str), Content("")))
 
@@ -2553,9 +2581,15 @@ class ToolCallMessage(Vertical):
             self._args_hint_widget.display = False
             return
 
-        if self._tool_name == "js_eval":
+        if (
+            self._tool_name == "js_eval"
+            or "code" in self._args
+            or "script" in self._args
+            or self._tool_name.endswith("run_script")
+            or "run_script" in self._tool_name
+        ):
             noun, detail_fn = "code", self._format_code_detail
-        elif self._tool_name == "execute":
+        elif self._tool_name in {"execute", "run_command"}:
             noun, detail_fn = "command", self._format_command_detail
         else:
             noun, detail_fn = "arguments", self._format_args_detail
@@ -2605,9 +2639,13 @@ _TOOL_SUMMARY_CATEGORY: dict[str, str] = {
     "glob": "search",
     "execute": "shell",
     "run_command": "shell",
+    "run_script": "script",
+    "execute_script": "script",
     "web_search": "web_search",
     "fetch_url": "fetch",
+    "js_eval": "js",
     "task": "task",
+    "subagent": "task",
     "write_todos": "todos",
 }
 
@@ -2620,6 +2658,7 @@ _TOOL_SUMMARY_PHRASES: dict[str, tuple[str, str, str, str]] = {
     "ls": ("Listing", "Listed", "directory", "directories"),
     "search": ("Searching for", "Searched for", "pattern", "patterns"),
     "shell": ("Running", "Ran", "shell command", "shell commands"),
+    "script": ("Running", "Ran", "script", "scripts"),
     "js": ("Running", "Ran", "JS evaluation", "JS evaluations"),
     "fetch": ("Fetching", "Fetched", "URL", "URLs"),
     "task": ("Running", "Ran", "agent", "agents"),
@@ -2641,20 +2680,32 @@ def _summary_segment(category: str, count: int, tool_name: str, tense: _Tense) -
     Returns:
         The phrased segment for this category, count, and tense.
     """
-    if category == "web_search":
+    from opscloud.ui.widgets.tool_display import parse_scoped_tool_name
+
+    scope_tag = ""
+    clean_cat = category
+    if "[" in category and category.endswith("]"):
+        parts = category.split("[", 1)
+        clean_cat = parts[0].strip()
+        scope_tag = f" [{parts[1]}"
+
+    if clean_cat == "web_search":
         base = "Searching the web" if tense == "present" else "Searched the web"
-        return base if count == 1 else f"{base} {count} times"
-    if category == "todos":
-        return "Updating todos" if tense == "present" else "Updated todos"
-    phrase = _TOOL_SUMMARY_PHRASES.get(category)
+        res = base if count == 1 else f"{base} {count} times"
+        return f"{res}{scope_tag}"
+    if clean_cat == "todos":
+        res = "Updating todos" if tense == "present" else "Updated todos"
+        return f"{res}{scope_tag}"
+    phrase = _TOOL_SUMMARY_PHRASES.get(clean_cat)
     if phrase is None:
+        base_tool, _ = parse_scoped_tool_name(tool_name)
         present, past = "Running", "Ran"
-        singular, plural = f"{tool_name} call", f"{tool_name} calls"
+        singular, plural = f"{base_tool} call", f"{base_tool} calls"
     else:
         present, past, singular, plural = phrase
     verb = present if tense == "present" else past
     noun = singular if count == 1 else plural
-    return f"{verb} {count} {noun}"
+    return f"{verb} {count} {noun}{scope_tag}"
 
 
 def summarize_tool_group(tool_names: list[str], *, tense: _Tense = "past") -> str:
@@ -2671,11 +2722,15 @@ def summarize_tool_group(tool_names: list[str], *, tense: _Tense = "past") -> st
     Returns:
         The aggregated one-line summary string in the requested tense.
     """
+    from opscloud.ui.widgets.tool_display import parse_scoped_tool_name
+
     counts: dict[str, int] = {}
     order: list[str] = []
     rep_name: dict[str, str] = {}
     for name in tool_names:
-        category = _TOOL_SUMMARY_CATEGORY.get(name, name)
+        base_name, scope = parse_scoped_tool_name(name)
+        base_cat = _TOOL_SUMMARY_CATEGORY.get(base_name, _TOOL_SUMMARY_CATEGORY.get(name, base_name))
+        category = f"{base_cat} [{scope}]" if scope else base_cat
         if category not in counts:
             counts[category] = 0
             order.append(category)
@@ -3549,7 +3604,7 @@ class DiffMessage(Static):
 
     def __init__(self, patch_or_diff: str, file_path: str = "") -> None:
         diff_lines = compose_diff_lines(patch_or_diff)
-        header = Text(f"📝 Diff: {file_path}\n" if file_path else "📝 Diff\n", style="bold cyan")
+        header = Text(f"Diff: {file_path}\n" if file_path else "Diff\n", style="bold cyan")
         super().__init__(header + diff_lines)
 
 class _SkillToggle(Static):
@@ -3870,7 +3925,7 @@ class SystemMessage(Static):
         # markdown-formatted (code blocks, bold, or slash-command references).
         is_multiline = "\n" in content
         is_markdown = any(tok in content for tok in ("```", "**", "__", "# ", "- ", "  /"))
-        already_bulleted = content.startswith("● ") or content.startswith("🧹")
+        already_bulleted = content.startswith("● ")
         if not already_bulleted and not is_multiline and not is_markdown:
             content = f"● {content}"
         # Ensure single newlines in non-codeblock text are treated as hard line breaks
@@ -4121,6 +4176,8 @@ class MessageList(VerticalScroll):
     ) -> None:
         """Add a tool-call widget."""
         msg = ToolCallMessage(name, args)
+        if live:
+            msg.set_running()
         self._tool_calls[call_id] = msg
         from contextlib import nullcontext
         batch_ctx = self.app.batch_update() if (self.is_attached and self.app is not None) else nullcontext()
@@ -4218,7 +4275,7 @@ class ThinkingMessage(Static):
         color: $text-muted;
     }
     ThinkingMessage:hover {
-        background: $surface;
+        color: $text;
     }
     """
 
@@ -4237,12 +4294,26 @@ class ThinkingMessage(Static):
             self.update(self._build_display())
 
     def _build_display(self) -> Text:
-        arrow = "˅" if self._expanded else "❯"
+        glyphs = get_glyphs()
+        arrow = glyphs.disclosure_expanded if self._expanded else glyphs.disclosure_collapsed
         dur_str = f" for {int(self._duration_seconds)}s" if self._duration_seconds > 0 else ""
         display = Text(f"Thought{dur_str} {arrow}", style="dim bold")
 
         if self._expanded and self._content:
-            display.append(f"\n\n{self._content.strip()}", style="dim")
+            display.append("\n\n")
+            for line in self._content.strip().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("**") and stripped.endswith("**"):
+                    title = stripped.strip("*").strip()
+                    display.append(f"{title}\n", style="bold dim")
+                elif stripped.startswith("### "):
+                    display.append(f"{stripped[4:]}\n", style="bold dim")
+                elif stripped.startswith("## "):
+                    display.append(f"{stripped[3:]}\n", style="bold dim")
+                elif stripped.startswith("# "):
+                    display.append(f"{stripped[2:]}\n", style="bold dim")
+                else:
+                    display.append(f"{line}\n", style="dim")
         return display
 
     def on_click(self, event: events.Click) -> None:
@@ -4272,7 +4343,7 @@ class QueuedUserMessage(Static):
     def render(self) -> Content:
         """Render the queued message with live theme colors."""
         return Content.assemble(
-            ("⏳ Queued: ", "italic bold $warning"),
+            ("Queued: ", "italic bold $warning"),
             (self._raw_content, "italic dim"),
         )
 

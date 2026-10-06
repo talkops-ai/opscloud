@@ -60,7 +60,7 @@ class ConfigHandler(BaseCommandHandler):
         if settings is None:
             return CommandResult(success=False, message="Settings not available.")
         path = settings.config_path
-        return CommandResult(success=True, message=f"📁 **Config file:** `{path}`")
+        return CommandResult(success=True, message=f"**Config file:** `{path}`")
 
     def _show_config(self, ctx: CommandContext) -> CommandResult:
         if ctx.app is not None:

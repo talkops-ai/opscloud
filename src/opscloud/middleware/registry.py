@@ -107,6 +107,7 @@ class MiddlewareRegistry:
             "opscloud.middleware.shell_allow_list",
             "opscloud.middleware.skills",
             "opscloud.middleware.subagents",
+            "opscloud.middleware.subagent_artifacts",
             "opscloud.middleware.tool_filter",
             "opscloud.middleware.unified_system_message",
         ]

@@ -154,9 +154,9 @@ class CloudHandler(BaseCommandHandler):
                 lines.append(f"- **Account ID:** `{identity.account_id}`")
             if identity.arn:
                 lines.append(f"- **Caller ARN:** `{identity.arn}`")
-            lines.append("- **Authentication:** ✅ Validated via STS")
+            lines.append("- **Authentication:** [Validated via STS]")
         else:
-            lines.append("- **Authentication:** ⚠️ Not validated / credentials local")
+            lines.append("- **Authentication:** [Not validated / credentials local]")
 
         return CommandResult(success=True, message="\n".join(lines))
 

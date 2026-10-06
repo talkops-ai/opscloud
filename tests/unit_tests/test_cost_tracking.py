@@ -160,3 +160,136 @@ def test_cost_tracking_middleware_subagent_cost_transfers():
     assert first_transfer["tokens"] == 300
     assert first_transfer["cost_usd"] == 0.02
 
+
+def test_active_session_thread_id_fallback():
+    from uuid import uuid4
+    from langchain_core.outputs import LLMResult, ChatGeneration
+    from opscloud.middleware.cost_tracking import (
+        ACTIVE_SESSION_THREAD_ID,
+        _RECORDER,
+        _drain_recorded_costs,
+        _thread_id,
+    )
+
+    test_thread = f"test-ctx-thread-{uuid4().hex[:8]}"
+    token = ACTIVE_SESSION_THREAD_ID.set(test_thread)
+    try:
+        # 1. _thread_id without execution_info falls back to ContextVar
+        mock_runtime = MagicMock()
+        mock_runtime.execution_info = None
+        mock_runtime.context = None
+        mock_runtime.config = None
+        assert _thread_id(mock_runtime) == test_thread
+
+        # 2. _SessionCostRecorder._start falls back to ContextVar
+        run_id = uuid4()
+        _RECORDER.on_chat_model_start({}, [[]], run_id=run_id, metadata={})
+        with _RECORDER._lock:
+            assert run_id in _RECORDER._run_contexts
+            assert _RECORDER._run_contexts[run_id].thread_id == test_thread
+
+        # 3. on_llm_end records under test_thread
+        ai_msg = AIMessage(
+            id="sub_call_1",
+            content="result",
+            usage_metadata={"input_tokens": 250, "output_tokens": 50, "total_tokens": 300},
+            response_metadata={"model_name": "gpt-4o", "model_provider": "openai"},
+        )
+        llm_res = LLMResult(generations=[[ChatGeneration(message=ai_msg)]])
+        _RECORDER.on_llm_end(llm_res, run_id=run_id)
+
+        # 4. _drain_recorded_costs drains from ContextVar thread
+        records = _drain_recorded_costs(None)
+        assert len(records) == 1
+        assert records[0].usage_metadata["input_tokens"] == 250
+        assert records[0].usage_metadata["output_tokens"] == 50
+    finally:
+        ACTIVE_SESSION_THREAD_ID.reset(token)
+
+
+def test_cost_tracking_middleware_wrap_model_call():
+    from opscloud.middleware.cost_tracking import (
+        ACTIVE_SESSION_THREAD_ID,
+        CostTrackingMiddleware,
+    )
+
+    mw = CostTrackingMiddleware(nested=False)
+    runtime_mock = MagicMock()
+    runtime_mock.execution_info.thread_id = "parent-thread-99"
+
+    request_mock = MagicMock()
+    request_mock.runtime = runtime_mock
+
+    seen_thread = None
+
+    def dummy_handler(req):
+        nonlocal seen_thread
+        seen_thread = ACTIVE_SESSION_THREAD_ID.get()
+        return "response"
+
+    assert ACTIVE_SESSION_THREAD_ID.get() is None
+    res = mw.wrap_model_call(request_mock, dummy_handler)
+    assert res == "response"
+    assert seen_thread == "parent-thread-99"
+    # Thread ID reset after model call
+    assert ACTIVE_SESSION_THREAD_ID.get() is None
+
+
+@pytest.mark.asyncio
+async def test_cost_tracking_middleware_awrap_model_call():
+    from opscloud.middleware.cost_tracking import (
+        ACTIVE_SESSION_THREAD_ID,
+        CostTrackingMiddleware,
+    )
+
+    mw = CostTrackingMiddleware(nested=False)
+    runtime_mock = MagicMock()
+    runtime_mock.execution_info.thread_id = "parent-thread-async-99"
+
+    request_mock = MagicMock()
+    request_mock.runtime = runtime_mock
+
+    seen_thread = None
+
+    async def dummy_handler(req):
+        nonlocal seen_thread
+        seen_thread = ACTIVE_SESSION_THREAD_ID.get()
+        return "async_response"
+
+    assert ACTIVE_SESSION_THREAD_ID.get() is None
+    res = await mw.awrap_model_call(request_mock, dummy_handler)
+    assert res == "async_response"
+    assert seen_thread == "parent-thread-async-99"
+    assert ACTIVE_SESSION_THREAD_ID.get() is None
+
+
+def test_cost_tracking_zero_cost_token_transfer_claim():
+    """Verify that transfers with 0 cost but positive tokens are claimed."""
+    from opscloud.middleware.cost_tracking import CostTrackingMiddleware
+
+    root_mw = CostTrackingMiddleware(nested=False)
+    transfers = {
+        "subagent:1": {
+            "owner_scope": "",
+            "cost_usd": 0.0,
+            "tokens": 450,
+        }
+    }
+    state = {
+        "_session_cost_transfers": transfers,
+        "_session_cost_usd": 0.0,
+        "_session_total_tokens": 100,
+        "messages": [],
+    }
+    runtime = MagicMock()
+    runtime.execution_info = None
+    runtime.context = {"thread_id": "thread-toks-only"}
+
+    update = root_mw._charge(state, runtime, price_latest_message=False)
+    assert update is not None
+    assert update.get("_session_total_tokens") == 450
+    # The transfer was claimed and removed
+    remaining = update.get("_session_cost_transfers").value
+    assert "subagent:1" not in remaining
+
+

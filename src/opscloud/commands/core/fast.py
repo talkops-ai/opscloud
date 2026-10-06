@@ -116,7 +116,7 @@ class FastHandler(BaseCommandHandler):
 
             return CommandResult(
                 success=True,
-                message=f"⚡ **Fast Mode OFF:** Restored model `{restored_model}`, effort: `{restored_effort}`",
+                message=f"**Fast Mode OFF:** Restored model `{restored_model}`, effort: `{restored_effort}`",
             )
 
         # Toggle ON — save current state, switch to fast model with low effort
@@ -141,7 +141,7 @@ class FastHandler(BaseCommandHandler):
 
         return CommandResult(
             success=True,
-            message=f"⚡ **Fast Mode ON:** Model: `{fast_model}`, effort: `low`",
+            message=f"**Fast Mode ON:** Model: `{fast_model}`, effort: `low`",
         )
 
 

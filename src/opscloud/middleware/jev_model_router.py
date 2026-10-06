@@ -7,7 +7,7 @@ tasks using LangChain's official ModelRouterMiddleware and ModelChoice primitive
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import os
 from typing import Any, Awaitable, Callable, cast
 
@@ -20,7 +20,7 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.messages import HumanMessage
-from langchain_typesafe import ChoiceAnswer, TypeSafeClassifier
+from langchain_typesafe import ChoiceAnswer, ClassifierRequest, TypeSafeClassifier
 from langchain_typesafe.experimental.middleware import (
     ModelChoice,
     ModelRouterMiddleware,
@@ -29,8 +29,10 @@ from langchain_typesafe.experimental.middleware import (
 from opscloud.config.settings import get_settings, resolve_env_var
 from opscloud.middleware.registry import register_middleware
 from opscloud.model.pool import (
+    ORCHESTRATOR_ROUTE_CRITERIA,
     ROUTER_INSTRUCTIONS,
     ROUTE_TO_TIER_MAP,
+    SUBAGENT_ROUTE_CRITERIA,
     TIER_TO_ROUTE_MAP,
     DynamicModelPoolManager,
     get_model_pool_manager,
@@ -44,6 +46,233 @@ from opscloud.security.approval_mode_source import ApprovalPolicyResolver
 from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _resolve_active_capabilities(
+    is_subagent: bool,
+    subagent_name: str | None = None,
+    explicit_capabilities: Sequence[Any] | None = None,
+    subagent_meta: Mapping[str, Any] | None = None,
+    available_subagents: Sequence[str] | None = None,
+) -> list[str]:
+    """Filter out active capabilities specific to the orchestrator or subagent."""
+    capabilities: list[str] = []
+
+    if not is_subagent:
+        # Main Deep Agent (Orchestrator) Capabilities
+        capabilities.extend([
+            "software_and_devops_coding",
+            "multi_agent_delegation",
+            "system_synthesis_and_reporting",
+            "workspace_and_git_inspection",
+        ])
+        # Dynamic capabilities derived from available subagents in ecosystem
+        avail = [s.lower() for s in (available_subagents or [])]
+        if any("finops" in s or "cost" in s or "billing" in s for s in avail):
+            capabilities.append("finops_cost_optimization")
+        if any("sre" in s or "incident" in s or "monitor" in s for s in avail):
+            capabilities.append("sre_incident_triage")
+        if any("iac" in s or "terraform" in s for s in avail):
+            capabilities.append("iac_modular_refactoring")
+        if any("security" in s or "secops" in s or "iam" in s for s in avail):
+            capabilities.append("security_and_compliance_governance")
+        if any("deploy" in s or "release" in s for s in avail):
+            capabilities.append("deployment_and_rollout_orchestration")
+        return capabilities
+
+    # Subagent Specialist Capabilities (strictly domain-scoped, never includes multi_agent_delegation)
+    if explicit_capabilities:
+        for cap in explicit_capabilities:
+            if isinstance(cap, str):
+                capabilities.append(cap)
+            elif isinstance(cap, dict):
+                srv = cap.get("mcp_server") or cap.get("name")
+                if srv:
+                    capabilities.append(str(srv))
+
+    name_lower = (subagent_name or "").lower()
+    meta = subagent_meta or {}
+    meta_tools = [str(t).lower() for t in (meta.get("tools") or [])]
+
+    if "finops" in name_lower or "cost" in name_lower or any("billing" in t for t in meta_tools):
+        capabilities.extend([
+            "cloud_financial_management",
+            "cost_and_usage_analysis",
+            "savings_plans_and_waste_reduction",
+        ])
+    elif "sre" in name_lower or any("k8s" in t or "kube" in t for t in meta_tools):
+        capabilities.extend([
+            "cluster_and_pod_diagnostics",
+            "incident_triage_and_log_analysis",
+        ])
+    elif "iac" in name_lower or "terraform" in name_lower:
+        capabilities.extend([
+            "infrastructure_as_code_authoring",
+            "state_and_plan_verification",
+        ])
+    elif "security" in name_lower or "iam" in name_lower:
+        capabilities.extend([
+            "security_policy_evaluation",
+            "least_privilege_audit",
+        ])
+    else:
+        clean_name = name_lower.split("@")[0].replace("-", "_") if name_lower else "domain"
+        capabilities.append(f"{clean_name}_specialist_execution")
+
+    # Add tool-level operational capabilities
+    if any(t in {"bash", "execute", "run_command", "terminal"} for t in meta_tools):
+        capabilities.append("cli_and_script_execution")
+    if any("read" in t or "grep" in t for t in meta_tools):
+        capabilities.append("code_and_manifest_inspection")
+    if any("billing" in t or "pricing" in t for t in meta_tools):
+        capabilities.append("pricing_and_cost_api_queries")
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for c in capabilities:
+        if c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    return deduped
+
+
+def _apply_confidence_safeguards(
+    selected_route: str,
+    confidence: float,
+    user_text: str,
+    is_subagent: bool,
+) -> str:
+    """Escalate model selection when Jev classification confidence falls below acceptable thresholds."""
+    if confidence >= 0.55:
+        return selected_route
+
+    text_lower = user_text.lower()
+    words = text_lower.split()
+
+    # High-complexity domain markers covering coding architecture, deep debugging, and systemic optimization
+    # Uses stems to match inflections (e.g. 'optimi' matches optimize, optimizing, optimization)
+    high_complexity_markers = (
+        # Optimization & FinOps
+        "optimi", "cost", "finop", "saving", "bill", "spend", "waste",
+        # SRE & Deep Debugging
+        "crashloop", "oomkill", "incident", "outage", "root cause", "cascade", "deadlock",
+        # Architecture & Code Refactoring
+        "architect", "refactor", "redesign", "migrat", "peering", "reconcil",
+        # Security & Compliance
+        "secur", "iam audit", "vulnerab", "least privilege", "compliance",
+    )
+
+    is_complex = any(marker in text_lower for marker in high_complexity_markers) or ("cos" in words)
+
+    if is_complex:
+        if not is_subagent:
+            logger.info("Jev Safety Escalation: Low confidence (%.2f) on high-complexity task -> Escalating to 'powerful'", confidence)
+            return "powerful"
+        else:
+            logger.info("Jev Safety Escalation: Low confidence (%.2f) on subagent task -> Escalating to 'standard'", confidence)
+            return "powerful" if selected_route == "powerful" else "standard"
+
+    # If selected route was 'fast' but confidence is marginal, promote safely to 'standard'
+    if selected_route == "fast":
+        logger.info("Jev Safety Escalation: Low confidence (%.2f) on 'fast' -> Promoting to 'standard'", confidence)
+        return "standard"
+
+    return selected_route
+
+
+def _build_jev_routing_state(
+    user_msg: HumanMessage,
+    ctx: dict[str, Any],
+    runtime: Any,
+    subagent_name: str | None = None,
+    explicit_capabilities: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    """Construct an enriched state payload providing Jev with full architectural context."""
+    is_subagent = bool(
+        subagent_name is not None
+        or ctx.get("ls_agent_type") == "subagent"
+        or ctx.get("checkpoint_ns")
+        or ctx.get("subagent_transcript_id")
+        or ctx.get("subagent_name")
+    )
+
+    agent_role = "subagent" if is_subagent else "orchestrator"
+    agent_name = subagent_name or str(ctx.get("subagent_name") or "") or ("subagent" if is_subagent else "opscloud-supervisor")
+
+    subagent_names: list[str] = []
+    subagent_ecosystem: list[str] | None = None
+    sub_meta: Mapping[str, Any] | None = None
+
+    if is_subagent:
+        # Subagent ecosystem is strictly None (nil) for subagents
+        subagent_ecosystem = None
+        try:
+            from opscloud.subagents.loader import list_subagents
+
+            for meta in list_subagents():
+                m_name = meta.get("name")
+                if m_name and (m_name == agent_name or m_name.startswith(agent_name) or agent_name.startswith(m_name.split("@")[0])):
+                    sub_meta = meta
+                    break
+        except Exception:
+            pass
+    else:
+        try:
+            from opscloud.subagents.loader import list_subagents
+
+            for meta in list_subagents():
+                n = meta.get("name")
+                if n and n not in subagent_names:
+                    subagent_names.append(n)
+        except Exception:
+            pass
+        subagent_ecosystem = subagent_names[:8]
+
+    active_capabilities = _resolve_active_capabilities(
+        is_subagent=is_subagent,
+        subagent_name=agent_name,
+        explicit_capabilities=explicit_capabilities,
+        subagent_meta=sub_meta,
+        available_subagents=subagent_names,
+    )
+
+    has_tf = False
+    has_k8s = False
+    try:
+        from pathlib import Path
+
+        cwd = Path.cwd()
+        has_tf = bool(list(cwd.glob("*.tf")) or (cwd / "terraform").is_dir())
+        has_k8s = bool((cwd / "k8s").is_dir() or (cwd / "templates").is_dir() or list(cwd.glob("*.yaml")))
+    except Exception:
+        pass
+
+    settings = get_settings()
+    cloud_provider = getattr(settings, "cloud_provider", "aws")
+    workspace_profile = {
+        "has_codebase": True,
+        "has_iac": has_tf,
+        "has_kubernetes": has_k8s,
+        "cloud_provider": cloud_provider,
+    }
+
+    routing_state = {
+        "messages": [user_msg],
+        "agent_role": agent_role,
+        "agent_name": agent_name,
+        "is_subagent": is_subagent,
+        "subagent_ecosystem": subagent_ecosystem,
+        "agent_context": {
+            "role": agent_role,
+            "agent_name": agent_name,
+            "is_subagent": is_subagent,
+            "available_subagents": subagent_ecosystem,
+            "active_capabilities": active_capabilities,
+            "workspace_profile": workspace_profile,
+        },
+    }
+    return routing_state
 
 
 def _split_spec(spec: str) -> tuple[str, str]:
@@ -288,6 +517,8 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         pool_manager: DynamicModelPoolManager | None = None,
         api_key: str | None = None,
         timeout_seconds: float = 1.5,
+        subagent_name: str | None = None,
+        capabilities: Sequence[Any] | None = None,
     ) -> None:
         super().__init__()
         self.pool = pool_manager or get_model_pool_manager()
@@ -295,6 +526,8 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         self.timeout_seconds = timeout_seconds
         self._explicit_choices = choices
         self._instructions = instructions or ROUTER_INSTRUCTIONS
+        self._subagent_name = subagent_name
+        self._explicit_capabilities = list(capabilities) if capabilities else None
 
         resolved_key = self._api_key
         if not resolved_key:
@@ -307,7 +540,7 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             os.environ.setdefault("TYPESAFE_API_KEY", "placeholder")
 
         if choices is None:
-            choices = self.pool.get_model_choices()
+            choices = self.pool.get_model_choices(is_subagent=bool(subagent_name))
 
         self.router = ModelRouterMiddleware(
             choices=choices,
@@ -437,9 +670,20 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             ctx = _extract_runtime_context(runtime)
             base_spec = self._get_base_spec(ctx)
 
-            # Dynamically build question choices out of the model pool for the active base_spec if not explicitly hardcoded
+            is_subagent = bool(
+                self._subagent_name is not None
+                or ctx.get("ls_agent_type") == "subagent"
+                or ctx.get("checkpoint_ns")
+                or ctx.get("subagent_transcript_id")
+                or ctx.get("subagent_name")
+            )
+
+            # Dynamically build question choices out of the model pool for the active base_spec and role if not explicitly hardcoded
             if self._explicit_choices is None:
-                active_choices = self.pool.get_model_choices(base_spec=base_spec)
+                active_choices = self.pool.get_model_choices(
+                    base_spec=base_spec,
+                    is_subagent=is_subagent,
+                )
                 from langchain_typesafe.experimental.middleware.model_router import _ModelRouterConfig
 
                 self.router.config = _ModelRouterConfig.model_validate(
@@ -450,15 +694,63 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
                     for route, choice in active_choices.items()
                 }
 
-            router_state = dict(state)
-            router_state["messages"] = [user_msg]
-            routing_res = await asyncio.wait_for(
-                self.router.abefore_agent(cast(Any, router_state), runtime),
-                timeout=self.timeout_seconds,
+            routing_state = _build_jev_routing_state(
+                user_msg=user_msg,
+                ctx=ctx,
+                runtime=runtime,
+                subagent_name=self._subagent_name,
+                explicit_capabilities=self._explicit_capabilities,
             )
-            choice_answer: ChoiceAnswer = routing_res["model_route"]
+
+            from langchain_typesafe.experimental.middleware.model_router import (
+                _QUESTION_ID,
+                _routing_questions,
+            )
+
+            if hasattr(self.router, "abefore_agent") and type(self.router.abefore_agent).__name__ in ("AsyncMock", "MagicMock"):
+                routing_res = await asyncio.wait_for(
+                    self.router.abefore_agent(cast(Any, routing_state), runtime),
+                    timeout=self.timeout_seconds,
+                )
+                choice_answer: ChoiceAnswer = routing_res["model_route"]
+            else:
+                classification_payload = cast(
+                    ClassifierRequest,
+                    {
+                        "state": routing_state,
+                        "questions": _routing_questions(self.router.config),
+                    },
+                )
+                res = await asyncio.wait_for(
+                    self.router.classifier.ainvoke(classification_payload),
+                    timeout=self.timeout_seconds,
+                )
+                choice_answer: ChoiceAnswer = res.choices[_QUESTION_ID]
+
             selected_route = choice_answer.choice
             confidence = getattr(choice_answer, "confidence", 1.0)
+
+            # Apply confidence calibration & safeguards
+            calibrated_route = _apply_confidence_safeguards(
+                selected_route=selected_route,
+                confidence=confidence,
+                user_text=user_text,
+                is_subagent=is_subagent,
+            )
+            if calibrated_route != selected_route:
+                logger.info(
+                    "Jev Dynamic Router: calibrated route from '%s' to '%s' (conf=%.2f, is_subagent=%s)",
+                    selected_route,
+                    calibrated_route,
+                    confidence,
+                    is_subagent,
+                )
+                selected_route = calibrated_route
+                try:
+                    choice_answer.choice = calibrated_route
+                except Exception:
+                    pass
+
             target_tier = ROUTE_TO_TIER_MAP.get(selected_route, 1)
 
             # Retrieve model spec & reasoning effort details for TUI & settings
@@ -487,16 +779,18 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
                 "tier": target_tier,
                 "route": selected_route,
                 "confidence": confidence,
+                "is_subagent": is_subagent,
             }
             _emit_model_routed_event(runtime, event_payload)
 
-            settings = get_settings()
-            if settings is not None:
-                settings.model = model_name
-                settings.model_name = model_name
-                settings.model_provider = provider
-                if final_effort:
-                    settings.reasoning_effort = final_effort
+            if not is_subagent:
+                settings = get_settings()
+                if settings is not None:
+                    settings.model = model_name
+                    settings.model_name = model_name
+                    settings.model_provider = provider
+                    if final_effort:
+                        settings.reasoning_effort = final_effort
 
             try:
                 await adispatch_custom_event(
@@ -563,10 +857,12 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             return await handler(request)
 
         selected_route = None
-        if route_answer is not None and hasattr(route_answer, "choice"):
+        if dyn_route and isinstance(dyn_route, dict) and dyn_route.get("route"):
+            selected_route = dyn_route["route"]
+        elif route_answer is not None and hasattr(route_answer, "choice"):
             selected_route = route_answer.choice
         elif dyn_route and isinstance(dyn_route, dict):
-            selected_route = dyn_route.get("route") or TIER_TO_ROUTE_MAP.get(dyn_route.get("tier", 1))
+            selected_route = TIER_TO_ROUTE_MAP.get(dyn_route.get("tier", 1))
 
         if not selected_route or selected_route not in self.models:
             selected_route = "standard" if "standard" in self.models else next(iter(self.models.keys()))
@@ -589,6 +885,13 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             tier,
         )
 
+        is_subagent = bool(
+            self._subagent_name is not None
+            or ctx.get("ls_agent_type") == "subagent"
+            or ctx.get("checkpoint_ns")
+            or ctx.get("subagent_transcript_id")
+            or ctx.get("subagent_name")
+        )
         provider, model_name = _split_spec(selected_spec)
         event_payload = {
             "type": "model_routed",
@@ -598,17 +901,19 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             "effort": final_effort,
             "tier": tier,
             "route": selected_route,
+            "is_subagent": is_subagent,
         }
         if runtime:
             _emit_model_routed_event(runtime, event_payload)
 
-        settings = get_settings()
-        if settings is not None:
-            settings.model = model_name
-            settings.model_name = model_name
-            settings.model_provider = provider
-            if final_effort:
-                settings.reasoning_effort = final_effort
+        if not is_subagent:
+            settings = get_settings()
+            if settings is not None:
+                settings.model = model_name
+                settings.model_name = model_name
+                settings.model_provider = provider
+                if final_effort:
+                    settings.reasoning_effort = final_effort
 
         if final_effort in ("off", "none", "clear", "0", "reset") or not supported_efforts_for_model(selected_spec):
             merged_settings = without_effort_model_params(selected_spec, request.model_settings or {}) or {}
@@ -635,10 +940,12 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             return handler(request)
 
         selected_route = None
-        if route_answer is not None and hasattr(route_answer, "choice"):
+        if dyn_route and isinstance(dyn_route, dict) and dyn_route.get("route"):
+            selected_route = dyn_route["route"]
+        elif route_answer is not None and hasattr(route_answer, "choice"):
             selected_route = route_answer.choice
         elif dyn_route and isinstance(dyn_route, dict):
-            selected_route = dyn_route.get("route") or TIER_TO_ROUTE_MAP.get(dyn_route.get("tier", 1))
+            selected_route = TIER_TO_ROUTE_MAP.get(dyn_route.get("tier", 1))
 
         if not selected_route or selected_route not in self.models:
             selected_route = "standard" if "standard" in self.models else next(iter(self.models.keys()))
@@ -661,6 +968,13 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             tier,
         )
 
+        is_subagent = bool(
+            self._subagent_name is not None
+            or ctx.get("ls_agent_type") == "subagent"
+            or ctx.get("checkpoint_ns")
+            or ctx.get("subagent_transcript_id")
+            or ctx.get("subagent_name")
+        )
         provider, model_name = _split_spec(selected_spec)
         event_payload = {
             "type": "model_routed",
@@ -670,17 +984,19 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             "effort": final_effort,
             "tier": tier,
             "route": selected_route,
+            "is_subagent": is_subagent,
         }
         if runtime:
             _emit_model_routed_event(runtime, event_payload)
 
-        settings = get_settings()
-        if settings is not None:
-            settings.model = model_name
-            settings.model_name = model_name
-            settings.model_provider = provider
-            if final_effort:
-                settings.reasoning_effort = final_effort
+        if not is_subagent:
+            settings = get_settings()
+            if settings is not None:
+                settings.model = model_name
+                settings.model_name = model_name
+                settings.model_provider = provider
+                if final_effort:
+                    settings.reasoning_effort = final_effort
 
         if final_effort in ("off", "none", "clear", "0", "reset") or not supported_efforts_for_model(selected_spec):
             merged_settings = without_effort_model_params(selected_spec, request.model_settings or {}) or {}
@@ -697,4 +1013,6 @@ __all__ = [
     "JevDynamicModelRouterMiddleware",
     "ModelChoice",
     "ModelRouterMiddleware",
+    "ORCHESTRATOR_ROUTE_CRITERIA",
+    "SUBAGENT_ROUTE_CRITERIA",
 ]

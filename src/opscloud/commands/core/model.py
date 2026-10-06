@@ -79,7 +79,7 @@ class ModelHandler(BaseCommandHandler):
 
         return CommandResult(
             success=True,
-            message=f"🤖 **Switched Model:** `{model_name}`",
+            message=f"**Switched Model:** `{model_name}`",
         )
 
     async def _handle_default(self, ctx: CommandContext, args: str) -> CommandResult:

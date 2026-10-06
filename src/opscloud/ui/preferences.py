@@ -89,7 +89,7 @@ class ThemeSelector(Widget):
         self._registry = get_registry()
 
     def compose(self):
-        yield Static("🎨 Select Color Theme", classes="title")
+        yield Static("Select Color Theme", classes="title")
         option_list = OptionList(id="theme-options")
         for key, entry in self._registry.items():
             option_list.add_option(Option(f"{entry.label} (`{key}`)", id=key))

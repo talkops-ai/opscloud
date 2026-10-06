@@ -56,9 +56,24 @@ class McpHandler(BaseCommandHandler):
         if ctx.app is None:
             return CommandResult(success=False, message="App context not available.")
         try:
+            from opscloud.mcp.preload import get_cached_mcp_server_infos
             from opscloud.ui.widgets.mcp_viewer import MCPViewerScreen
+
             servers = ctx.app.get_mcp_servers() if hasattr(ctx.app, "get_mcp_servers") else []
-            ctx.app.push_screen(MCPViewerScreen(server_info=servers))
+            if not servers:
+                servers = get_cached_mcp_server_infos()
+                if hasattr(ctx.app, "_mcp_server_info") and servers:
+                    ctx.app._mcp_server_info = servers
+
+            is_connecting = False
+            if not servers and hasattr(ctx.app, "_mcp_preload_kwargs"):
+                no_mcp = ctx.app._mcp_preload_kwargs.get("no_mcp", False)
+                if not no_mcp and hasattr(ctx.app, "run_worker"):
+                    is_connecting = True
+                    if hasattr(ctx.app, "_preload_mcp_metadata_background"):
+                        ctx.app.run_worker(ctx.app._preload_mcp_metadata_background(), group="mcp-preload")
+
+            ctx.app.push_screen(MCPViewerScreen(server_info=servers, connecting=is_connecting))
             return CommandResult(success=True, message="", mount_as_app_message=False)
         except Exception as e:
             return CommandResult(success=False, message=f"Failed to open MCP viewer: {e}")
@@ -72,12 +87,12 @@ class McpHandler(BaseCommandHandler):
         if not servers:
             return CommandResult(success=True, message="No MCP servers configured.")
 
-        lines = ["🔌 **MCP Servers:**\n"]
+        lines = ["**MCP Servers:**\n"]
         for srv in servers:
             connected = getattr(srv, "connected", False)
             name = getattr(srv, "name", "unknown")
             tool_count = getattr(srv, "tool_count", 0)
-            icon = "🟢" if connected else "🔴"
+            icon = "[connected]" if connected else "[disconnected]"
             lines.append(f"  {icon} `{name}`: {tool_count} tools")
         return CommandResult(success=True, message="\n".join(lines))
 
@@ -91,7 +106,7 @@ class McpHandler(BaseCommandHandler):
             ctx.app._start_mcp_login(server_name)
             return CommandResult(
                 success=True,
-                message=f"🔐 Starting auth flow for MCP server `{server_name}`...",
+                message=f"Starting auth flow for MCP server `{server_name}`...",
             )
         return CommandResult(
             success=False,
@@ -107,11 +122,11 @@ class McpHandler(BaseCommandHandler):
             count = await ctx.app.reconnect_mcp_servers(force=force)
             return CommandResult(
                 success=True,
-                message=f"🔄 Reconnected {count} MCP server(s).",
+                message=f"Reconnected {count} MCP server(s).",
             )
         if hasattr(ctx.app, "_handle_mcp_reconnect_command"):
             await ctx.app._handle_mcp_reconnect_command(force=force)
-            return CommandResult(success=True, message="🔄 MCP reconnect triggered.")
+            return CommandResult(success=True, message="MCP reconnect triggered.")
 
         return CommandResult(success=False, message="MCP reconnect not available.")
 

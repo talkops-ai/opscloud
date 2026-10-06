@@ -88,7 +88,7 @@ class MemoryHandler(BaseCommandHandler):
             path = store.save(key.strip(), content.strip())
             return CommandResult(
                 success=True,
-                message=f"✅ Memory saved: `{key.strip()}` → `{path}`",
+                message=f"Memory saved: `{key.strip()}` → `{path}`",
             )
 
         if sub in {"delete", "rm", "remove"}:
@@ -178,7 +178,7 @@ class MemoryHandler(BaseCommandHandler):
                     content = path.read_text(encoding="utf-8").strip()
                     if content:
                         agents_found += 1
-                        lines.append(f"📄 **{path}**")
+                        lines.append(f"**{path}**")
                         preview = "\n".join(f"   {line}" for line in content.splitlines()[:10])
                         lines.append(preview)
                         if len(content.splitlines()) > 10:
@@ -228,7 +228,7 @@ class MemoryHandler(BaseCommandHandler):
                         if q_lower in line.lower()
                     ]
                     if matching_lines:
-                        results.append(f"📄 **{path}**:")
+                        results.append(f"**{path}**:")
                         for line in matching_lines[:5]:
                             results.append(f"   • {line}")
                         if len(matching_lines) > 5:
@@ -240,7 +240,7 @@ class MemoryHandler(BaseCommandHandler):
         for entry in store.list_all():
             if q_lower in entry.key.lower() or q_lower in entry.content.lower():
                 preview = entry.content.strip().splitlines()[0][:80] if entry.content.strip() else ""
-                results.append(f"📌 **{entry.key}** ({entry.source}) — {preview}")
+                results.append(f"• **{entry.key}** ({entry.source}) — {preview}")
 
         if not results:
             return CommandResult(

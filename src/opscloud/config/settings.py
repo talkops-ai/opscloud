@@ -654,7 +654,7 @@ class Glyphs:
     newline: str = "⏎"
     warning: str = "⚠"
     question: str = "?"
-    hourglass: str = "⏳"
+    hourglass: str = "⧗"
     retry: str = "↻"
     arrow_up: str = "↑"
     arrow_down: str = "↓"
@@ -669,6 +669,17 @@ class Glyphs:
     git_branch: str = "↗"
     cross: str = "✗"
     arrow_right: str = "➜"
+    separator: str = "·"
+    tree_branch: str = "├"
+    tree_last: str = "└"
+    square_filled: str = "■"
+    checkbox_empty: str = "☐"
+    checkbox_checked: str = "☑"
+    box_horizontal_heavy: str = "━"
+    hunk_break: str = "⋮"
+    line_continuation: str = "…"
+    tool: str = "[T]"
+    file: str = "[F]"
 
 
 UNICODE_GLYPHS = Glyphs(
@@ -684,7 +695,7 @@ UNICODE_GLYPHS = Glyphs(
     newline="⏎",
     warning="⚠",
     question="?",
-    hourglass="⏳",
+    hourglass="⧗",
     retry="↻",
     arrow_up="↑",
     arrow_down="↓",
@@ -699,6 +710,17 @@ UNICODE_GLYPHS = Glyphs(
     git_branch="↗",
     cross="✗",
     arrow_right="➜",
+    separator="·",
+    tree_branch="├",
+    tree_last="└",
+    square_filled="■",
+    checkbox_empty="☐",
+    checkbox_checked="☑",
+    box_horizontal_heavy="━",
+    hunk_break="⋮",
+    line_continuation="…",
+    tool="[T]",
+    file="[F]",
 )
 
 ASCII_GLYPHS = Glyphs(
@@ -729,6 +751,17 @@ ASCII_GLYPHS = Glyphs(
     git_branch="git:",
     cross="[X]",
     arrow_right="->",
+    separator="|",
+    tree_branch="|-",
+    tree_last="`-",
+    square_filled="[#]",
+    checkbox_empty="[ ]",
+    checkbox_checked="[x]",
+    box_horizontal_heavy="=",
+    hunk_break=":",
+    line_continuation=".",
+    tool="[T]",
+    file="[F]",
 )
 
 _glyphs_cache: Glyphs | None = None

@@ -193,6 +193,11 @@ async def _run_headless(
         if rubric:
             input_data["rubric"] = rubric
 
+        if effective_thread:
+            from opscloud.middleware.cost_tracking import ACTIVE_SESSION_THREAD_ID
+
+            ACTIVE_SESSION_THREAD_ID.set(effective_thread)
+
         try:
             async for ns, mode, chunk in agent.astream(
                 input_data,

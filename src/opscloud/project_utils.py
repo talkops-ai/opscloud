@@ -65,6 +65,11 @@ class ProjectContext:
             return None
         return self.project_root / ".agents" / "skills"
 
+    def project_claude_skills_dir(self) -> Path | None:
+        if self.project_root is None:
+            return None
+        return self.project_root / ".claude" / "skills"
+
 
 def get_server_project_context(
     env: Mapping[str, str] | None = None,

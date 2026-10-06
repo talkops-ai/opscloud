@@ -19,7 +19,8 @@ from textual.css.query import NoMatches, TooManyMatches
 from textual.reactive import reactive
 from textual.widgets import Static
 
-from opscloud.config.settings import settings
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.theme import get_theme_colors
 from opscloud.ui.widgets.loading import Spinner
 
 if TYPE_CHECKING:
@@ -77,10 +78,14 @@ class _SubagentRecord:
 
     id: str
     label: str
+    subagent_type: str = ""
+    description: str = ""
     status: SubagentStatus = "running"
     started_monotonic: float = field(default_factory=time.monotonic)
     duration_ms: int | None = None
     error: str | None = None
+    model: str | None = None
+    current_action: str | None = None
 
     def elapsed_seconds(self) -> float:
         if self.duration_ms is not None:
@@ -96,15 +101,37 @@ class _Phase:
     index: int
     records: dict[str, _SubagentRecord] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
+    aliases: dict[str, str] = field(default_factory=dict)
 
     def add(self, record: _SubagentRecord) -> None:
         if record.id not in self.records:
             self.order.append(record.id)
         self.records[record.id] = record
 
+    def replace_id(self, old_id: str, new_id: str, updated_record: _SubagentRecord) -> None:
+        """Update record id and order when a subagent is resumed after interrupt."""
+        if old_id in self.order:
+            idx = self.order.index(old_id)
+            self.order[idx] = new_id
+        elif new_id not in self.order:
+            self.order.append(new_id)
+
+        self.records.pop(old_id, None)
+        self.records[new_id] = updated_record
+        self.aliases[old_id] = new_id
+
+    def find_record(self, sub_id: str) -> _SubagentRecord | None:
+        rec = self.records.get(sub_id)
+        if rec is not None:
+            return rec
+        alias = self.aliases.get(sub_id)
+        if alias is not None:
+            return self.records.get(alias)
+        return None
+
     def counts(self) -> tuple[int, int]:
-        total = len(self.records)
-        done = sum(1 for r in self.records.values() if r.status != "running")
+        total = len(self.order)
+        done = sum(1 for sub_id in self.order if (rec := self.records.get(sub_id)) and rec.status != "running")
         return done, total
 
     def any_running(self) -> bool:
@@ -150,8 +177,8 @@ class SubagentPanel(Vertical):
     DEFAULT_CSS = """
     SubagentPanel {
         height: auto;
-        background: $surface;
-        border-top: solid $primary;
+        background: $background;
+        border-top: solid $panel;
         display: none;
         padding: 1 2;
     }
@@ -165,7 +192,7 @@ class SubagentPanel(Vertical):
     }
 
     SubagentPanel:focus {
-        border-top: solid $accent;
+        border-top: solid $primary;
     }
 
     SubagentPanel #subagent-header {
@@ -187,7 +214,7 @@ class SubagentPanel(Vertical):
     SubagentPanel #subagent-phases-scroll {
         width: 24;
         height: 100%;
-        border-right: solid $primary-darken-2;
+        border-right: solid $panel;
         padding-right: 2;
         margin-right: 2;
     }
@@ -265,9 +292,16 @@ class SubagentPanel(Vertical):
             self.on_subagent_event(event)
 
     def _find_record_by_name(self, agent_name: str) -> _SubagentRecord | None:
+        clean_name = agent_name.split("@")[0] if "@" in agent_name else agent_name
         for phase in self._phases.values():
             for record in phase.records.values():
-                if agent_name in record.label or record.id == agent_name:
+                if (
+                    record.id == agent_name
+                    or record.subagent_type == clean_name
+                    or clean_name in record.subagent_type
+                    or clean_name in record.label
+                    or agent_name in record.label
+                ):
                     return record
         return None
 
@@ -290,17 +324,118 @@ class SubagentPanel(Vertical):
 
         self._refresh()
 
+    def _resolve_subagent_model(self, subagent_type: str | None) -> str | None:
+        if not subagent_type:
+            return None
+        try:
+            from opscloud.subagents.loader import list_subagents
+
+            for meta in list_subagents():
+                name = meta.get("name")
+                alias = meta.get("alias")
+                name_str = name if isinstance(name, str) else ""
+                alias_str = alias if isinstance(alias, str) else ""
+                if (
+                    subagent_type in {name_str, alias_str}
+                    or (name_str and name_str.startswith(subagent_type))
+                    or (alias_str and alias_str.startswith(subagent_type))
+                ):
+                    m = meta.get("model")
+                    if isinstance(m, str) and m:
+                        return m
+                    if m is not None:
+                        return str(m)
+        except Exception:
+            pass
+        return None
+
+    def set_subagent_activity(self, sub_id: str | None, action: str | None) -> None:
+        """Update live activity/tool description for a subagent."""
+        if sub_id:
+            record = self._find_record(sub_id) or self._find_record_by_name(sub_id)
+            if record:
+                record.current_action = action
+                self._refresh()
+                return
+        for phase in self._phases.values():
+            for record in phase.records.values():
+                if record.status == "running":
+                    record.current_action = action
+                    self._refresh()
+                    return
+
+    def set_subagent_model(self, sub_id: str | None, model: str | None) -> None:
+        """Update model description for a subagent."""
+        if not model:
+            return
+        clean_model = model.split(":")[-1] if ":" in model else model
+        if sub_id:
+            record = self._find_record(sub_id) or self._find_record_by_name(sub_id)
+            if record:
+                record.model = _sanitize(clean_model, max_chars=60)
+                self._refresh()
+                return
+        for phase in self._phases.values():
+            for record in phase.records.values():
+                if record.status == "running":
+                    record.model = _sanitize(clean_model, max_chars=60)
+                    self._refresh()
+                    return
+
     def _handle_start(self, sub_id: str, eval_key: str, event: dict[str, Any]) -> None:
         if self._pending_reset:
             self._clear()
         phase = self._ensure_phase(eval_key)
         self._active_eval_id = eval_key
 
-        record = _SubagentRecord(
-            id=sub_id,
-            label=_sanitize(self._row_label(event), max_chars=200),
-        )
-        phase.add(record)
+        sub_model = event.get("model")
+        raw_sub_type = str(event.get("subagent_type") or "")
+        clean_sub_type = raw_sub_type.split("@")[0] if "@" in raw_sub_type else raw_sub_type
+        description = str(event.get("description") or "")
+
+        if not sub_model:
+            sub_model = self._resolve_subagent_model(raw_sub_type) or self._resolve_subagent_model(clean_sub_type)
+        if not sub_model:
+            sub_model = self._model_label
+        if not sub_model:
+            try:
+                if hasattr(self, "app") and self.app is not None:
+                    sub_model = getattr(self.app, "_model", None)
+            except Exception:
+                pass
+
+        if sub_model and ":" in sub_model:
+            sub_model = sub_model.split(":")[-1]
+
+        label = _sanitize(self._row_label(event), max_chars=200)
+
+        # Check if this subagent was already running in this phase (e.g. resumed from HITL approval interrupt)
+        existing_record: _SubagentRecord | None = None
+        for rec in phase.records.values():
+            if rec.status == "running":
+                if rec.label == label or (
+                    clean_sub_type and rec.subagent_type == clean_sub_type and description and rec.description == description
+                ):
+                    existing_record = rec
+                    break
+
+        if existing_record is not None and existing_record.id != sub_id:
+            # Resumed subagent: update ID and preserve continuity without duplicate row
+            old_id = existing_record.id
+            existing_record.id = sub_id
+            if sub_model:
+                existing_record.model = _sanitize(sub_model, max_chars=60)
+            phase.replace_id(old_id, sub_id, existing_record)
+        else:
+            record = _SubagentRecord(
+                id=sub_id,
+                label=label,
+                subagent_type=clean_sub_type,
+                description=description,
+                model=_sanitize(sub_model, max_chars=60) if sub_model else None,
+            )
+            phase.add(record)
+
         self._show()
         self._apply_body_height()
         self._ensure_timer()
@@ -315,13 +450,27 @@ class SubagentPanel(Vertical):
 
     @staticmethod
     def _row_label(event: dict[str, Any]) -> str:
-        sub_type = event.get("subagent_type", "subagent")
+        sub_type = str(event.get("subagent_type") or "subagent")
+        # Clean plugin suffix if present (e.g. aws-finops-agent@talkops-devops-plugins -> aws-finops-agent)
+        if "@" in sub_type:
+            sub_type = sub_type.split("@")[0]
+
+        # Prefer full description over pre-truncated label to prevent awkward mid-word cutoffs
+        description = event.get("description")
         label = event.get("label")
-        if not isinstance(label, str) or not label:
-            description = event.get("description")
-            label = description if isinstance(description, str) else ""
-            label = " ".join(label.split())[:_LABEL_FALLBACK_MAX_CHARS]
-        return f"{sub_type}: {label}"
+        if isinstance(description, str) and description.strip():
+            clean_desc = " ".join(description.split())
+            text = clean_desc
+        elif isinstance(label, str) and label.strip():
+            clean_label = " ".join(label.split())
+            text = clean_label
+        else:
+            text = ""
+
+        if len(text) > 100:
+            text = text[:97] + "..."
+
+        return f"{sub_type}: {text}" if text else sub_type
 
     def _handle_finish(
         self, sub_id: str, eval_key: str, outcome: str, event: dict[str, Any]
@@ -332,6 +481,7 @@ class SubagentPanel(Vertical):
                 return
             record = self._adopt_orphan_finish(sub_id, eval_key, event)
         record.status = "done" if outcome == "complete" else "error"
+        record.current_action = None
         duration = event.get("duration_ms")
         if isinstance(duration, (int, float)):
             record.duration_ms = int(duration)
@@ -361,7 +511,7 @@ class SubagentPanel(Vertical):
 
     def _find_record(self, sub_id: str) -> _SubagentRecord | None:
         for phase in self._phases.values():
-            record = phase.records.get(sub_id)
+            record = phase.find_record(sub_id)
             if record is not None:
                 return record
         return None
@@ -551,30 +701,31 @@ class SubagentPanel(Vertical):
         self._refresh_agents()
 
     def _refresh_header(self) -> None:
+        colors = get_theme_colors(self)
+        glyphs = get_glyphs()
+        caret = (
+            glyphs.disclosure_expanded if self.expanded else glyphs.disclosure_collapsed
+        )
         done, total, failed, cancelled = self._turn_counts()
         if self._any_running() or not total:
-            icon = "⠋"
-            tint = "yellow"
+            icon, tint = self._spinner.next_frame(), colors.warning
         elif failed:
-            icon = "✗"
-            tint = "red"
+            icon, tint = glyphs.error, colors.error
         elif cancelled:
-            icon = "○"
-            tint = "dim"
+            icon, tint = glyphs.circle_empty, colors.muted
         else:
-            icon = "✓"
-            tint = "green"
-        lead_text = f"▼ {icon}  dynamic subagents"
+            icon, tint = glyphs.checkmark, colors.success
+        lead_text = f"{caret} {icon}  dynamic subagents"
         parts: list[Content] = [Content.styled(lead_text, tint)]
         left_len = len(lead_text)
 
         if self.expanded and total:
-            meta = self._header_meta_parts(done, total, failed, cancelled)
+            meta = self._header_meta_parts(done, total, failed, cancelled, colors)
             parts.extend(meta)
             left_len += sum(len(p.plain) for p in meta)
         hint = "click to collapse" if self.expanded else "click to expand"
         spacer = max(2, self._header_width() - left_len - len(hint))
-        parts.append(Content.styled(" " * spacer + hint, "dim"))
+        parts.append(Content.styled(" " * spacer + hint, colors.muted))
         self._update_cached("subagent-header", Content.assemble(*parts))
 
     def _header_meta_parts(
@@ -583,17 +734,20 @@ class SubagentPanel(Vertical):
         total: int,
         failed: int,
         cancelled: int,
+        colors: Any,
     ) -> list[Content]:
+        glyphs = get_glyphs()
+        separator = getattr(glyphs, "separator", "·")
         meta_text = f"   {done}/{total} done"
         count = len(self._phase_order)
         if count:
             plural = "phase" if count == 1 else "phases"
-            meta_text += f"  ·  {count} {plural}"
-        parts: list[Content] = [Content.styled(meta_text, "dim")]
+            meta_text += f"  {separator}  {count} {plural}"
+        parts: list[Content] = [Content.styled(meta_text, colors.muted)]
         if failed:
-            parts.append(Content.styled(f"  ·  {failed} failed", "red"))
+            parts.append(Content.styled(f"  {separator}  {failed} failed", colors.error))
         if cancelled:
-            parts.append(Content.styled(f"  ·  {cancelled} cancelled", "dim"))
+            parts.append(Content.styled(f"  {separator}  {cancelled} cancelled", colors.muted))
         return parts
 
     def _header_width(self) -> int:
@@ -613,33 +767,36 @@ class SubagentPanel(Vertical):
             self._update_cached("subagent-phases", Content(""))
             return
         scroll.remove_class("-hidden")
+        colors = get_theme_colors(self)
         displayed = self._displayed_phase()
         displayed_key = displayed.eval_id if displayed else None
-        rows: list[Content] = [Content.styled("Phases", "dim")]
+        rows: list[Content] = [Content.styled("Phases", colors.muted)]
         rows.extend(
-            self._phase_row(self._phases[key], selected=key == displayed_key)
+            self._phase_row(self._phases[key], selected=key == displayed_key, colors=colors)
             for key in self._phase_order
         )
         self._update_cached("subagent-phases", Content("\n").join(rows))
 
-    def _phase_row(self, phase: _Phase, *, selected: bool) -> Content:
+    def _phase_row(self, phase: _Phase, *, selected: bool, colors: Any) -> Content:
+        glyphs = get_glyphs()
         done, total = phase.counts()
         if phase.all_terminal():
             if phase.any_error():
-                mark = "✗"
+                mark = glyphs.error
             elif phase.any_cancelled():
-                mark = "○"
+                mark = glyphs.circle_empty
             else:
-                mark = "✓"
+                mark = glyphs.checkmark
         elif phase.eval_id == self._active_eval_id:
-            mark = "▶"
+            mark = glyphs.disclosure_collapsed
         else:
-            mark = "•"
-        caret = "›" if selected else " "
-        tint = "cyan" if selected else "dim"
+            mark = glyphs.bullet
+        caret = glyphs.cursor if selected else " "
+        tint = colors.primary if selected else colors.muted
         elapsed = _format_timing(phase.elapsed_seconds())
+        sep = getattr(glyphs, "separator", "·")
         return Content.styled(
-            f"{caret} {mark} {phase.index} {done}/{total} · {elapsed}", tint
+            f"{caret} {mark} {phase.index} {done}/{total} {sep} {elapsed}", tint
         )
 
     def _agents_width(self) -> int:
@@ -657,13 +814,16 @@ class SubagentPanel(Vertical):
 
     def _refresh_agents(self) -> None:
         phase = self._displayed_phase()
+        glyphs = get_glyphs()
+        colors = get_theme_colors(self)
         rows: list[Content] = []
         if phase is not None and phase.order:
             task_col = self._task_col()
-            rows.append(self._heading_row(task_col))
+            rows.append(self._heading_row(task_col, colors))
             rows.extend(
-                self._render_row(phase.records[sub_id], task_col)
+                self._render_row(record, task_col, glyphs, colors)
                 for sub_id in phase.order
+                if (record := phase.find_record(sub_id)) is not None
             )
         self._update_cached(
             "subagent-agents", Content("\n").join(rows) if rows else Content("")
@@ -676,37 +836,86 @@ class SubagentPanel(Vertical):
             f"{timing[:_TIMING_COL].rjust(_TIMING_COL)}"
         )
 
-    def _render_row(self, record: _SubagentRecord, task_col: int) -> Content:
+    def _render_row(
+        self,
+        record: _SubagentRecord,
+        task_col: int,
+        glyphs: Any,
+        colors: Any,
+    ) -> Content:
         if record.status == "running":
-            icon = "⠋"
-            tint = "yellow"
+            icon = self._spinner.current_frame()
+            tint = colors.warning
         elif record.status == "done":
-            icon = "✓"
-            tint = "green"
+            icon = glyphs.checkmark
+            tint = colors.success
         elif record.status == "cancelled":
-            icon = "○"
-            tint = "dim"
+            icon = glyphs.circle_empty
+            tint = colors.muted
         else:
-            icon = "✗"
-            tint = "red"
+            icon = glyphs.error
+            tint = colors.error
+
         label = record.label
-        if record.status == "error" and record.error:
-            label = f"{record.label} - {record.error}"
         timing = _format_timing(record.elapsed_seconds())
-        task = _sanitize(label, max_chars=task_col - 1).ljust(task_col)
-        model = self._model_label or ""
+
+        model = record.model or self._model_label
+        if not model:
+            try:
+                if hasattr(self, "app") and self.app is not None:
+                    model = getattr(self.app, "_model", None)
+            except Exception:
+                pass
+        if model:
+            if ":" in model:
+                _, _, m_part = model.partition(":")
+                model = m_part or model
+            model = _sanitize(model, max_chars=_MODEL_COL)
+        else:
+            model = ""
         right = self._right_block(model, timing)
+
+        if record.status == "error" and record.error:
+            err_text = f" - {record.error}"
+            avail = max(10, task_col - len(err_text) - 1)
+            task_label = _sanitize(label, max_chars=avail)
+            task_str = f"{task_label}{err_text}".ljust(task_col)
+            return Content.assemble(
+                Content.styled(f"  {icon}  ", tint),
+                Content.styled(task_str, colors.foreground),
+                Content.styled(right, colors.muted),
+            )
+
+        if record.status == "running" and record.current_action:
+            action_badge = f"‣ {record.current_action}"
+            # Reserve space for the action badge so it remains visible
+            max_label_len = max(12, task_col - len(action_badge) - 2)
+            if len(label) > max_label_len:
+                task_label = label[: max_label_len - 3] + "..."
+            else:
+                task_label = label
+            padding_len = max(1, task_col - len(task_label) - len(action_badge))
+            padding = " " * padding_len
+            return Content.assemble(
+                Content.styled(f"  {icon}  ", tint),
+                Content.styled(task_label, colors.foreground),
+                Content.styled(padding, colors.foreground),
+                Content.styled(action_badge, colors.warning),
+                Content.styled(right, colors.muted),
+            )
+
+        task = _sanitize(label, max_chars=task_col - 1).ljust(task_col)
         return Content.assemble(
             Content.styled(f"  {icon}  ", tint),
-            Content.styled(task, "white"),
-            Content.styled(right, "dim"),
+            Content.styled(task, colors.foreground),
+            Content.styled(right, colors.muted),
         )
 
-    def _heading_row(self, task_col: int) -> Content:
+    def _heading_row(self, task_col: int, colors: Any) -> Content:
         prefix = " " * _STATUS_COL
         task = "TASK".ljust(task_col)
         right = self._right_block("MODEL", "TIME")
-        return Content.styled(f"{prefix}{task}{right}", "dim")
+        return Content.styled(f"{prefix}{task}{right}", colors.muted)
 
 
 class SubagentColumn(Vertical):

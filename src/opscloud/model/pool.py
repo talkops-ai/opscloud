@@ -34,22 +34,61 @@ from opscloud.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-ROUTER_INSTRUCTIONS = "Choose the least costly model that can complete the task."
+ROUTER_INSTRUCTIONS = (
+    "Select the optimal operational tier based on task complexity and reasoning requirements. "
+    "Match conversational, read-only, and trivial queries to 'fast'. "
+    "Match focused, routine, and single-scope coding or operational tasks to 'standard'. "
+    "Match multi-agent delegation, comprehensive audits and optimization (cost, performance, security), "
+    "complex debugging, and cross-system architectural refactoring to 'powerful'."
+)
 
-DEFAULT_ROUTE_CRITERIA: dict[str, str] = {
+# ── Orchestrator Route Criteria (Main Supervisor Agent) ─────────────────────────
+
+ORCHESTRATOR_ROUTE_CRITERIA: dict[str, str] = {
     "fast": (
-        "Direct lookups, greetings, chit-chat, conceptual explanations, status checks, "
-        "or simple text queries requiring no cloud CLI tools or complex multi-step reasoning."
+        "Conversational greetings, capability inquiries ('who are you?', 'what can you do?'), "
+        "read-only workspace exploration (viewing files, checking git status/diff, directory listing), "
+        "trivial syntax checks, or general explanations requiring no code modifications, "
+        "no multi-step operations, and no subagent delegation."
     ),
     "standard": (
-        "Routine cloud operations, AWS/GCP/Azure CLI execution, Kubernetes manifests, "
-        "Terraform edits, cloud resource listing/mutations, and standard DevOps tasks."
+        "Focused single-domain coding or operational tasks, editing a single file, script, "
+        "manifest, or configuration (e.g. localized bug fix, Dockerfile update), routine resource "
+        "inspection and state queries, executing pre-defined workflows, or delegating a narrow, "
+        "well-defined single-step task."
     ),
     "powerful": (
-        "Complex incident triage, debugging crashlooping pods, distributed telemetry and trace correlation, "
-        "root-cause analysis, and complex cloud architecture design."
+        "Multi-agent delegation and coordination (e.g. planning and launching specialized agents), "
+        "comprehensive system assessments (cost/FinOps optimization, waste analysis, performance "
+        "tuning, security compliance), complex debugging and root-cause analysis (cascading failures, "
+        "subtle code bugs, error spikes), architectural code refactoring across multiple modules, "
+        "and any workflow requiring cross-service synthesis, blast-radius safeguards, and structured "
+        "deliverable authoring."
     ),
 }
+
+# ── Subagent Route Criteria (Specialized Worker Subagents) ──────────────────────
+
+SUBAGENT_ROUTE_CRITERIA: dict[str, str] = {
+    "fast": (
+        "Direct single-item lookups, checking individual resource/component status, "
+        "verifying credentials or environment variables, or reading local configuration files."
+    ),
+    "standard": (
+        "Domain-specific workflows, running multiple tools or analysis steps in sequence, "
+        "auditing configurations or resources across a domain, generating inventory data, "
+        "and formatting structured markdown reports."
+    ),
+    "powerful": (
+        "Deep cross-service root-cause correlation, multi-variable mathematical, financial, "
+        "or capacity modeling, complex code/state reconciliation, parsing large log or trace "
+        "outputs to isolate transient issues, or executing high-stakes destructive operations "
+        "requiring blast-radius calculation."
+    ),
+}
+
+# Backward compatibility alias
+DEFAULT_ROUTE_CRITERIA = ORCHESTRATOR_ROUTE_CRITERIA
 
 ROUTE_TO_TIER_MAP: dict[str, int] = {
     "fast": 0,
@@ -354,6 +393,7 @@ class DynamicModelPoolManager:
         provider: str | None = None,
         base_spec: str | None = None,
         criteria: dict[str, str] | None = None,
+        is_subagent: bool = False,
     ) -> dict[str, ModelChoice]:
         """Build dictionary of ModelChoice instances for ModelRouterMiddleware.
 
@@ -362,7 +402,13 @@ class DynamicModelPoolManager:
         The candidate model spec and reasoning effort are explicitly embedded in
         the criteria so the candidate model names appear on the input payload sent to Jev.
         """
-        criteria_map = criteria or DEFAULT_ROUTE_CRITERIA
+        if criteria is not None:
+            criteria_map = criteria
+        else:
+            criteria_map = SUBAGENT_ROUTE_CRITERIA if is_subagent else ORCHESTRATOR_ROUTE_CRITERIA
+
+        fallback_criteria = SUBAGENT_ROUTE_CRITERIA if is_subagent else ORCHESTRATOR_ROUTE_CRITERIA
+
         m0, spec0, eff0, _ = self.get_model_for_tier(0, provider=provider, base_spec=base_spec)
         m1, spec1, eff1, _ = self.get_model_for_tier(1, provider=provider, base_spec=base_spec)
         m2, spec2, eff2, _ = self.get_model_for_tier(2, provider=provider, base_spec=base_spec)
@@ -375,15 +421,15 @@ class DynamicModelPoolManager:
         return {
             "fast": ModelChoice(
                 model=m0,
-                criteria=_format_criteria(spec0, eff0, criteria_map.get("fast", DEFAULT_ROUTE_CRITERIA["fast"])),
+                criteria=_format_criteria(spec0, eff0, criteria_map.get("fast", fallback_criteria["fast"])),
             ),
             "standard": ModelChoice(
                 model=m1,
-                criteria=_format_criteria(spec1, eff1, criteria_map.get("standard", DEFAULT_ROUTE_CRITERIA["standard"])),
+                criteria=_format_criteria(spec1, eff1, criteria_map.get("standard", fallback_criteria["standard"])),
             ),
             "powerful": ModelChoice(
                 model=m2,
-                criteria=_format_criteria(spec2, eff2, criteria_map.get("powerful", DEFAULT_ROUTE_CRITERIA["powerful"])),
+                criteria=_format_criteria(spec2, eff2, criteria_map.get("powerful", fallback_criteria["powerful"])),
             ),
         }
 
@@ -403,8 +449,10 @@ __all__ = [
     "DEFAULT_ROUTE_CRITERIA",
     "DynamicModelPoolManager",
     "ModelChoice",
+    "ORCHESTRATOR_ROUTE_CRITERIA",
     "ROUTER_INSTRUCTIONS",
     "ROUTE_TO_TIER_MAP",
+    "SUBAGENT_ROUTE_CRITERIA",
     "TIER_TO_ROUTE_MAP",
     "TierResolution",
     "get_model_pool_manager",

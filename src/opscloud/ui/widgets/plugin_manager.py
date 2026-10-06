@@ -18,6 +18,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.css.query import NoMatches
+from textual.events import Key
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Rule, Static
@@ -715,6 +716,9 @@ class PluginManagerScreen(ModalScreen[None]):
             if query in row.plugin_id.casefold()
             or query in row.label.casefold()
             or query in row.description.casefold()
+            or (row.author and query in row.author.casefold())
+            or any(query in s.casefold() for s in row.skill_names)
+            or any(query in s.casefold() for s in row.mcp_server_names)
         )
 
     def _current_options(self) -> list[Option]:
@@ -768,6 +772,21 @@ class PluginManagerScreen(ModalScreen[None]):
         except NoMatches:
             return self._DIVIDER_FALLBACK_WIDTH
         return width if width > 0 else self._DIVIDER_FALLBACK_WIDTH
+
+    @staticmethod
+    def _nearest_enabled_index(options: OptionList, candidate: int) -> int | None:
+        """Return the nearest selectable option index to candidate."""
+        if not options.option_count:
+            return None
+        if not options.get_option_at_index(candidate).disabled:
+            return candidate
+        for index in range(candidate + 1, options.option_count):
+            if not options.get_option_at_index(index).disabled:
+                return index
+        for index in range(candidate - 1, -1, -1):
+            if not options.get_option_at_index(index).disabled:
+                return index
+        return None
 
     def _details_mode_active(self) -> bool:
         return self._mode in {
@@ -842,14 +861,21 @@ class PluginManagerScreen(ModalScreen[None]):
         source_input.display = False
         options.display = True
         search_input.display = self._search_available()
+        if search_input.display and search_input.value != self._search_query:
+            search_input.value = self._search_query
+        highlighted = options.highlighted
         options.clear_options()
         for option in self._current_options():
             options.add_option(option)
+        if options.option_count:
+            candidate = 0 if highlighted is None else min(highlighted, options.option_count - 1)
+            options.highlighted = self._nearest_enabled_index(options, candidate)
         if not search_input.has_focus:
             options.focus()
 
+        search_hint = f"/ search {glyphs.bullet} " if self._search_available() else ""
         help_text.update(
-            f"{glyphs.arrow_up}/{glyphs.arrow_down} select {glyphs.bullet} Enter choose {glyphs.bullet} Left/Right tabs {glyphs.bullet} Esc close"
+            f"{glyphs.arrow_up}/{glyphs.arrow_down} select {glyphs.bullet} Enter choose {glyphs.bullet} {search_hint}Left/Right tabs {glyphs.bullet} Esc close"
         )
 
     def _active_details_options(self) -> list[Option]:
@@ -875,6 +901,43 @@ class PluginManagerScreen(ModalScreen[None]):
         )
         self._refresh_view()
 
+    def check_action(
+        self,
+        action: str,
+        parameters: tuple[object, ...],
+    ) -> bool | None:
+        """Gate priority bindings that would otherwise steal Input keystrokes."""
+        if action in {"arrow_previous_tab", "arrow_next_tab"}:
+            focused = self.focused
+            return not (isinstance(focused, Input) and bool(focused.value))
+        if action == "focus_search":
+            if not self._search_available():
+                return False
+            try:
+                return not self.query_one("#plugin-manager-search", Input).has_focus
+            except NoMatches:
+                return True
+        return True
+
+    def on_key(self, event: Key) -> None:
+        """Focus plugin search when a letter is typed from another control."""
+        if not self._search_available():
+            return
+
+        search_input = self.query_one("#plugin-manager-search", Input)
+        if search_input.has_focus:
+            return
+
+        character = event.character
+        if not character or not character.isalpha():
+            return
+
+        new_value = f"{search_input.value}{character}"
+        search_input.value = new_value
+        search_input.selection = type(search_input.selection).cursor(len(new_value))
+        search_input.focus()
+        event.stop()
+
     def on_plugin_tab_selected(self, event: PluginTabSelected) -> None:
         self._select_tab(event.tab)
 
@@ -885,6 +948,7 @@ class PluginManagerScreen(ModalScreen[None]):
                 self._search_query = ""
                 search_input.value = ""
                 self._refresh_view()
+                search_input.focus()
             else:
                 self.query_one("#plugin-manager-options", OptionList).focus()
             return
@@ -937,7 +1001,26 @@ class PluginManagerScreen(ModalScreen[None]):
     def action_cursor_up(self) -> None:
         self.query_one("#plugin-manager-options", OptionList).action_cursor_up()
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Filter the current plugin list as the search query changes."""
+        if event.input.id != "plugin-manager-search":
+            return
+        self._search_query = event.value
+        self._refresh_view()
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "plugin-manager-search":
+            event.stop()
+            options = self.query_one("#plugin-manager-options", OptionList)
+            highlighted = options.highlighted
+            if highlighted is None:
+                return
+            option_id = options.get_option_at_index(highlighted).id
+            if option_id is None or not option_id.startswith(("detail:", "installed:")):
+                return
+            options.focus()
+            options.action_select()
+            return
         if event.input.id == "plugin-marketplace-source":
             source = event.value.strip()
             if not source:

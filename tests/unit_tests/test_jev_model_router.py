@@ -25,6 +25,20 @@ class DummyRuntime:
         self.context = context
 
 
+@pytest.fixture(autouse=True)
+def isolate_agent_pool(monkeypatch):
+    from opscloud.config import toml_config
+
+    orig_load = toml_config.load_agent_pool
+
+    def _safe_load(config_path=None):
+        if config_path is None:
+            return None
+        return orig_load(config_path)
+
+    monkeypatch.setattr("opscloud.config.toml_config.load_agent_pool", _safe_load)
+
+
 @pytest.fixture
 def pool_manager():
     return DynamicModelPoolManager()
@@ -88,7 +102,8 @@ def test_dynamic_tier_discovery_all_22_providers(pool_manager):
 
 
 def test_pool_manager_get_model_choices(pool_manager):
-    choices = pool_manager.get_model_choices(provider="google_genai")
+    # 1. Orchestrator criteria (default)
+    choices = pool_manager.get_model_choices(provider="google_genai", is_subagent=False)
     assert "fast" in choices
     assert "standard" in choices
     assert "powerful" in choices
@@ -97,14 +112,36 @@ def test_pool_manager_get_model_choices(pool_manager):
     assert isinstance(choices["standard"], ModelChoice)
     assert isinstance(choices["powerful"], ModelChoice)
 
-    # Candidate model specs and efforts are embedded directly in criteria for Jev
-    assert "Model: google_genai:gemini-3.6-flash (effort: off)" in choices["fast"].criteria
-    assert "Model: google_genai:gemini-3.7-flash (effort: medium)" in choices["standard"].criteria
-    assert "Model: google_genai:gemini-3.1-pro-preview (effort: high)" in choices["powerful"].criteria
+    fast_crit = choices["fast"].criteria
+    standard_crit = choices["standard"].criteria
+    powerful_crit = choices["powerful"].criteria
 
-    assert "Direct lookups" in choices["fast"].criteria
-    assert "Routine cloud operations" in choices["standard"].criteria
-    assert "incident triage" in choices["powerful"].criteria
+    assert isinstance(fast_crit, str)
+    assert isinstance(standard_crit, str)
+    assert isinstance(powerful_crit, str)
+
+    # Candidate model specs and efforts are embedded directly in criteria for Jev
+    assert "Model: google_genai:gemini-3.6-flash (effort: off)" in fast_crit
+    assert "Model: google_genai:gemini-3.8-flash (effort: medium)" in standard_crit
+    assert "Model: google_genai:gemini-3.1-pro-preview (effort: high)" in powerful_crit
+
+    assert "Conversational greetings" in fast_crit
+    assert "Focused single-domain" in standard_crit
+    assert "Multi-agent delegation" in powerful_crit
+
+    # 2. Subagent criteria
+    sub_choices = pool_manager.get_model_choices(provider="google_genai", is_subagent=True)
+    sub_fast_crit = sub_choices["fast"].criteria
+    sub_standard_crit = sub_choices["standard"].criteria
+    sub_powerful_crit = sub_choices["powerful"].criteria
+
+    assert isinstance(sub_fast_crit, str)
+    assert isinstance(sub_standard_crit, str)
+    assert isinstance(sub_powerful_crit, str)
+
+    assert "Direct single-item lookups" in sub_fast_crit
+    assert "Domain-specific workflows" in sub_standard_crit
+    assert "Deep cross-service root-cause correlation" in sub_powerful_crit
 
 
 @pytest.mark.asyncio
@@ -134,9 +171,15 @@ async def test_middleware_sends_candidate_models_in_question_choices():
                 assert "fast" in criteria
                 assert "standard" in criteria
                 assert "powerful" in criteria
-                assert "google_genai:gemini-3.6-flash" in criteria["fast"]
-                assert "google_genai:gemini-3.7-flash" in criteria["standard"]
-                assert "google_genai:gemini-3.1-pro-preview" in criteria["powerful"]
+                fast_route_crit = criteria["fast"]
+                standard_route_crit = criteria["standard"]
+                powerful_route_crit = criteria["powerful"]
+                assert isinstance(fast_route_crit, str)
+                assert isinstance(standard_route_crit, str)
+                assert isinstance(powerful_route_crit, str)
+                assert "google_genai:gemini-3.6-flash" in fast_route_crit
+                assert "google_genai:gemini-3.7-flash" in standard_route_crit
+                assert "google_genai:gemini-3.1-pro-preview" in powerful_route_crit
 
 
 def test_auto_detect_provider_with_various_credentials(pool_manager):
@@ -484,9 +527,15 @@ def test_user_configured_agent_pool_in_toml(tmp_path, pool_manager):
 
         # Model choices also reflect user-configured pool in criteria
         choices = pool_manager.get_model_choices(provider="google_genai")
-        assert "gemini-2.5-flash-lite" in choices["fast"].criteria
-        assert "gemini-2.5-flash" in choices["standard"].criteria
-        assert "gemini-2.5-pro" in choices["powerful"].criteria
+        c_fast = choices["fast"].criteria
+        c_standard = choices["standard"].criteria
+        c_powerful = choices["powerful"].criteria
+        assert isinstance(c_fast, str)
+        assert isinstance(c_standard, str)
+        assert isinstance(c_powerful, str)
+        assert "gemini-2.5-flash-lite" in c_fast
+        assert "gemini-2.5-flash" in c_standard
+        assert "gemini-2.5-pro" in c_powerful
 
     # Clear pool
     assert clear_agent_pool(tmp_config) is True
@@ -509,7 +558,7 @@ async def test_pool_command_handler(tmp_path):
     ctx_status = CommandContext(app=mock_app, raw_command="/pool status", args="status")
     res_status = await handler.execute(ctx_status)
     assert res_status.success is True
-    assert "Agent Model Pool Status" in res_status.message
+    assert res_status.message is not None and "Agent Model Pool Status" in res_status.message
 
     # 2. Set command
     with patch("opscloud.commands.core.pool.save_agent_pool") as mock_save:
@@ -532,11 +581,203 @@ async def test_pool_command_handler(tmp_path):
         res_clear = await handler.execute(ctx_clear)
         assert res_clear.success is True
         mock_clear.assert_called_once()
-        assert "Cleared" in res_clear.message
+        assert res_clear.message is not None and "Cleared" in res_clear.message
 
     # 4. Interactive UI command (no args)
     ctx_ui = CommandContext(app=mock_app, raw_command="/pool", args="")
     res_ui = await handler.execute(ctx_ui)
     assert res_ui.success is True
     mock_app._show_pool_selector.assert_called_once()
+
+
+# ── Benchmark Test Suite & Safeguard Tests (OPSCLOUD-JEV-09) ───────────────────
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_route", "expected_tier", "simulated_choice", "simulated_conf"),
+    [
+        (
+            "can you help me in optimizing my aws cost",
+            "powerful",
+            2,
+            "powerful",
+            0.88,
+        ),
+        (
+            "pod payment-service is crashlooping with OOMKilled across 3 nodes",
+            "powerful",
+            2,
+            "powerful",
+            0.92,
+        ),
+        (
+            "refactor our terraform vpc module to support dual-region transit gateway peering",
+            "powerful",
+            2,
+            "powerful",
+            0.89,
+        ),
+        (
+            "list all running ec2 instances in us-east-1 and filter by tag Environment=prod",
+            "standard",
+            1,
+            "standard",
+            0.95,
+        ),
+        (
+            "update Dockerfile to use python:3.12-slim and add non-root user",
+            "standard",
+            1,
+            "standard",
+            0.85,
+        ),
+        (
+            "what is your capability?",
+            "fast",
+            0,
+            "fast",
+            0.96,
+        ),
+        (
+            "show me lines 20-50 of main.tf",
+            "fast",
+            0,
+            "fast",
+            0.94,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_operational_benchmark_classification(
+    prompt: str,
+    expected_route: str,
+    expected_tier: int,
+    simulated_choice: str,
+    simulated_conf: float,
+):
+    """Verify classification mapping across all 7 operational benchmark test cases (TC-1 to TC-7)."""
+    middleware = JevDynamicModelRouterMiddleware()
+    runtime = DummyRuntime(context={"approval_mode": "smart", "smart": True, "model": "google_genai:gemini-3.7-flash"})
+    state = {"messages": [HumanMessage(content=prompt)]}
+
+    mock_choice = MagicMock(choice=simulated_choice, confidence=simulated_conf)
+    mock_response = MagicMock(choices={"model_route": mock_choice})
+
+    with patch.object(middleware, "is_available", return_value=True):
+        with patch.object(TypeSafeClassifier, "ainvoke", new_callable=AsyncMock) as mock_inv:
+            mock_inv.return_value = mock_response
+            with patch("opscloud.middleware.jev_model_router.adispatch_custom_event", new=AsyncMock()):
+                res = await middleware.abefore_agent(state, runtime)
+                assert res is not None
+                route_info = res["_dynamic_model_route"]
+                assert route_info["route"] == expected_route
+                assert route_info["tier"] == expected_tier
+
+
+@pytest.mark.asyncio
+async def test_confidence_safeguard_escalates_incident_prompt():
+    """Verify the exact incident prompt escalates from standard (conf=0.40) to powerful on Orchestrator."""
+    middleware = JevDynamicModelRouterMiddleware(subagent_name=None)
+    runtime = DummyRuntime(context={"approval_mode": "smart", "smart": True})
+    # The actual user prompt from the incident
+    state = {"messages": [HumanMessage(content="can you help me in optimizing my aws cos")]}
+
+    # Simulate Jev returning standard with near-entropy confidence 0.40
+    mock_choice = MagicMock(choice="standard", confidence=0.40)
+    mock_response = MagicMock(choices={"model_route": mock_choice})
+
+    with patch.object(middleware, "is_available", return_value=True):
+        with patch.object(TypeSafeClassifier, "ainvoke", new_callable=AsyncMock) as mock_inv:
+            mock_inv.return_value = mock_response
+            with patch("opscloud.middleware.jev_model_router.adispatch_custom_event", new=AsyncMock()):
+                res = await middleware.abefore_agent(state, runtime)
+                assert res is not None
+                route_info = res["_dynamic_model_route"]
+                # Safeguard must escalate orchestrator from standard -> powerful due to 'optimizing' / 'cos' markers
+                assert route_info["route"] == "powerful"
+                assert route_info["tier"] == 2
+
+
+@pytest.mark.asyncio
+async def test_confidence_safeguard_for_subagent_escalates_to_standard():
+    """Verify low confidence on subagent specialist task escalates to standard (Tier 1), not powerful."""
+    middleware = JevDynamicModelRouterMiddleware(subagent_name="aws-finops-agent")
+    runtime = DummyRuntime(context={"approval_mode": "smart", "smart": True, "ls_agent_type": "subagent"})
+    state = {"messages": [HumanMessage(content="audit unattached ebs volumes")]}
+
+    mock_choice = MagicMock(choice="fast", confidence=0.40)
+    mock_response = MagicMock(choices={"model_route": mock_choice})
+
+    with patch.object(middleware, "is_available", return_value=True):
+        with patch.object(TypeSafeClassifier, "ainvoke", new_callable=AsyncMock) as mock_inv:
+            mock_inv.return_value = mock_response
+            with patch("opscloud.middleware.jev_model_router.adispatch_custom_event", new=AsyncMock()):
+                res = await middleware.abefore_agent(state, runtime)
+                assert res is not None
+                route_info = res["_dynamic_model_route"]
+                # Subagent low confidence promotes to standard
+                assert route_info["route"] == "standard"
+                assert route_info["tier"] == 1
+
+
+@pytest.mark.asyncio
+async def test_confidence_safeguard_promotes_ambiguous_fast_to_standard():
+    """Verify low-confidence fast route without high-complexity markers safely promotes to standard."""
+    middleware = JevDynamicModelRouterMiddleware()
+    runtime = DummyRuntime(context={"approval_mode": "smart", "smart": True})
+    state = {"messages": [HumanMessage(content="run the check routine")]}
+
+    mock_choice = MagicMock(choice="fast", confidence=0.42)
+    mock_response = MagicMock(choices={"model_route": mock_choice})
+
+    with patch.object(middleware, "is_available", return_value=True):
+        with patch.object(TypeSafeClassifier, "ainvoke", new_callable=AsyncMock) as mock_inv:
+            mock_inv.return_value = mock_response
+            with patch("opscloud.middleware.jev_model_router.adispatch_custom_event", new=AsyncMock()):
+                res = await middleware.abefore_agent(state, runtime)
+                assert res is not None
+                route_info = res["_dynamic_model_route"]
+                assert route_info["route"] == "standard"
+                assert route_info["tier"] == 1
+
+
+@pytest.mark.asyncio
+async def test_enriched_routing_state_orchestrator_vs_subagent():
+    """Verify enriched state payload has subagent_ecosystem on orchestrator and None (nil) on subagent."""
+    from opscloud.middleware.jev_model_router import _build_jev_routing_state
+
+    user_msg = HumanMessage(content="can you help me in optimizing my aws cost")
+
+    # 1. Main Orchestrator state
+    orch_state = _build_jev_routing_state(
+        user_msg=user_msg,
+        ctx={},
+        runtime=None,
+        subagent_name=None,
+    )
+    assert orch_state["is_subagent"] is False
+    assert orch_state["agent_role"] == "orchestrator"
+    assert orch_state["agent_name"] == "opscloud-supervisor"
+    assert isinstance(orch_state["subagent_ecosystem"], list)
+    assert "software_and_devops_coding" in orch_state["agent_context"]["active_capabilities"]
+    assert "multi_agent_delegation" in orch_state["agent_context"]["active_capabilities"]
+    assert "system_synthesis_and_reporting" in orch_state["agent_context"]["active_capabilities"]
+
+    # 2. Subagent state
+    sub_state = _build_jev_routing_state(
+        user_msg=user_msg,
+        ctx={"ls_agent_type": "subagent"},
+        runtime=None,
+        subagent_name="aws-finops-agent",
+    )
+    assert sub_state["is_subagent"] is True
+    assert sub_state["agent_role"] == "subagent"
+    assert sub_state["agent_name"] == "aws-finops-agent"
+    # CRITICAL: subagent_ecosystem must be None (nil) for subagents
+    assert sub_state["subagent_ecosystem"] is None
+    assert sub_state["agent_context"]["available_subagents"] is None
+    # Subagent capabilities must NOT include multi_agent_delegation
+    assert "multi_agent_delegation" not in sub_state["agent_context"]["active_capabilities"]
+    assert "cloud_financial_management" in sub_state["agent_context"]["active_capabilities"]
+    assert "cost_and_usage_analysis" in sub_state["agent_context"]["active_capabilities"]
 

@@ -321,8 +321,31 @@ def discover_plugins(
     enabled = load_all_enabled_plugin_ids(project_root=project_root)
     plugins: list[PluginInstance] = []
     warnings: list[str] = []
+    seen_plugin_ids: set[str] = set()
+
+    # 1. Local filesystem discovery (e.g. project plugins directory)
+    if project_root:
+        proj_plugins = Path(project_root) / "plugins"
+        if proj_plugins.is_dir():
+            for p in sorted(proj_plugins.iterdir()):
+                if p.is_dir() and not p.name.startswith("."):
+                    p_id = f"{p.name}@project"
+                    inst, p_warns = _plugin_from_install_path(
+                        plugin_id=p_id,
+                        root=p,
+                        marketplace_name="project",
+                        fallback_name=p.name,
+                    )
+                    warnings.extend(p_warns)
+                    if inst:
+                        plugins.append(inst)
+                        seen_plugin_ids.add(p_id)
+
+    enabled = load_all_enabled_plugin_ids(project_root=project_root)
 
     for plugin_id in sorted(enabled):
+        if plugin_id in seen_plugin_ids:
+            continue
         try:
             plugin_name, marketplace_name = split_plugin_id(plugin_id)
         except ValueError:

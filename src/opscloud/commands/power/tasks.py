@@ -134,7 +134,7 @@ class TasksHandler(BaseCommandHandler):
             task = store.add(remainder)
             return CommandResult(
                 success=True,
-                message=f"✅ Added task #{task.id}: {task.text}",
+                message=f"Added task #{task.id}: {task.text}",
             )
 
         if sub == "done":
@@ -144,7 +144,7 @@ class TasksHandler(BaseCommandHandler):
             task = store.done(task_id)
             if task is None:
                 return CommandResult(success=False, message=f"Task #{task_id} not found.")
-            return CommandResult(success=True, message=f"✅ Completed task #{task.id}: {task.text}")
+            return CommandResult(success=True, message=f"Completed task #{task.id}: {task.text}")
 
         if sub in {"rm", "remove", "delete"}:
             task_id = _parse_id(remainder)
@@ -164,7 +164,7 @@ class TasksHandler(BaseCommandHandler):
         task = store.add(args)
         return CommandResult(
             success=True,
-            message=f"✅ Added task #{task.id}: {task.text}",
+            message=f"Added task #{task.id}: {task.text}",
         )
 
     def _list_tasks(self, store: SessionTaskStore, ctx: CommandContext) -> CommandResult:
@@ -179,13 +179,13 @@ class TasksHandler(BaseCommandHandler):
         lines = ["**Session Tasks:**", ""]
         for t in tasks:
             if t.status == "done":
-                marker = "✅"
+                marker = "[x]"
                 style = "~~"
             elif t.status == "in-progress":
-                marker = "🔄"
+                marker = "[>]"
                 style = ""
             else:
-                marker = "⬜"
+                marker = "[ ]"
                 style = ""
 
             text = f"{style}{t.text}{style}" if style else t.text

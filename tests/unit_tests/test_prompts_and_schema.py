@@ -2,7 +2,6 @@
 
 from pathlib import Path
 import re
-import pytest
 
 from opscloud.prompts import (
     CloudProvider,
@@ -10,7 +9,6 @@ from opscloud.prompts import (
     OPSCLOUD_MEMORY_HEADLESS_SYSTEM_PROMPT,
     OPSCLOUD_MEMORY_READONLY_SYSTEM_PROMPT,
     OPSCLOUD_MEMORY_SYSTEM_PROMPT,
-    build_cloud_provider_section,
     build_fs_tool_guidance,
     build_model_identity_section,
     build_working_dir_section,
@@ -18,7 +16,7 @@ from opscloud.prompts import (
     get_memory_system_prompt,
     normalize_cloud_provider,
 )
-from opscloud.schema.interrupts import HitlDecision, HitlResumePayload
+from opscloud.schema.interrupts import HitlResumePayload
 
 
 def test_build_model_identity_section():
@@ -67,6 +65,7 @@ def test_get_base_system_prompt_aws_default():
     assert "aws-eks-autopilot" in prompt
     assert "Computational Verification" in prompt
     assert "Blast Radius Safeguards" in prompt
+    assert "Preserving Subagent Technical Deliverables" in prompt
 
 
 def test_get_base_system_prompt_azure():
@@ -223,3 +222,45 @@ def test_hitl_resume_payload_parsing():
     payload_auto = HitlResumePayload.from_raw({"decisions": [{"type": "auto"}]})
     assert payload_auto.auto_approve_requested is True
     assert payload_auto.decisions[0].type == "approve"
+
+
+def test_get_base_system_prompt_dual_engine_and_tool_discipline():
+    prompt = get_base_system_prompt(
+        assistant_id="opscloud",
+        interactive=True,
+        model_name="claude-3-7-sonnet",
+    )
+    # Validate Dual-Engine Architecture
+    assert "Dual-Engine Architecture" in prompt
+    assert "Platform Engineering & DevOps Coding Specialist" in prompt
+    assert "Multi-Agent Cloud Operations & Orchestrator" in prompt
+    assert "Infrastructure as Code (IaC)" in prompt
+    assert "Cloud-Native & Container Orchestration" in prompt
+    assert "CI/CD & GitOps Automation" in prompt
+
+    # Validate Cloud Foundation & Plugin Marketplace Ecosystem
+    assert "Native Cloud Foundation (AWS)" in prompt
+    assert "Extensible Plugin Marketplace Ecosystem" in prompt
+
+    # Validate Tool-Specific Output Discipline
+    assert "Tool Usage & Tool-Specific Output Discipline" in prompt
+    assert "`read_file`" in prompt
+    assert "`edit_file`" in prompt
+    assert "`write_file`" in prompt
+    assert "`task` & `js_eval` (Subagent Delegation)" in prompt
+
+    # Ensure stale draft phrasing was eliminated
+    assert "(primarily AWS for this release" not in prompt
+
+
+def test_adaptive_output_granularity_contract():
+    prompt = get_base_system_prompt(
+        assistant_id="opscloud",
+        interactive=True,
+        model_name="claude-3-7-sonnet",
+    )
+    assert "Adaptive Output Granularity Contract" in prompt
+    assert "Conversational & Capability Inquiries" in prompt
+    assert "DO NOT output an exhaustive laundry list" in prompt
+    assert "Artifact vs Inline Output Separation" in prompt
+

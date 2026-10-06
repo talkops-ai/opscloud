@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from typing import Any
 
 from opscloud.approval_mode import ApprovalMode
 from opscloud.config.settings import sync_aws_env_aliases
@@ -107,6 +108,12 @@ def run_interactive(
     if initial_skill and not effective_prompt:
         effective_prompt = f"Use skill {initial_skill}"
 
+    mcp_preload_kwargs: dict[str, Any] = {
+        "mcp_config_path": mcp_config_path,
+        "no_mcp": no_mcp,
+        "trust_project_mcp": trust_project_mcp,
+    }
+
     try:
         app = OpsCloudApp(
             server_url=url,
@@ -118,6 +125,7 @@ def run_interactive(
             defer_server_start=defer_server_start,
             goal=goal,
             cwd=resolved_cwd,
+            mcp_preload_kwargs=mcp_preload_kwargs,
         )
         if effective_prompt and hasattr(app, "_initial_prompt"):
             app._initial_prompt = effective_prompt

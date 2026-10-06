@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import threading
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from opscloud.skills.sources import CodeSkillSource
 
 import yaml
 
@@ -196,7 +199,11 @@ class SkillRegistry:
         from opscloud.skills.load import list_skills
 
         effective_root = project_root or settings.project_root
-        discovered = list_skills(project_root=effective_root, include_plugins=True)
+        discovered = list_skills(
+            project_root=effective_root,
+            include_plugins=True,
+            include_subagents=False,
+        )
 
         for s in discovered:
             name = s.get("name", "")
@@ -222,61 +229,22 @@ class SkillRegistry:
         project_root: Any = None,
         include_subagent_skills: bool = False,
         subagents: Any = None,
-    ) -> list[tuple[str, str, str | None]]:
-        """Return ordered skill sources for PluginSkillsMiddleware."""
-        from opscloud.skills.load import list_skills
+    ) -> list[CodeSkillSource]:
+        """Return sources ordered by precedence for PluginSkillsMiddleware.
+
+        When ``include_subagent_skills`` is False (default), agent-bound plugin skills
+        are excluded so that the main agent maintains context isolation. When True,
+        all skills across agents, agent plugins, and subagents are returned.
+        """
+        from opscloud.skills.sources import get_skill_sources
 
         effective_root = Path(project_root) if project_root else settings.project_root
-        discovered = list_skills(
+        return get_skill_sources(
             project_root=effective_root,
-            include_plugins=True,
-            include_subagents=include_subagent_skills,
+            include_subagent_skills=include_subagent_skills,
+            subagents=subagents,
+            store=self._store,
         )
-
-        seen_dirs: set[str] = set()
-        sources: list[tuple[str, str, str | None]] = []
-
-        # 1. Built-in
-        bi_dir = paths.get_built_in_skills_dir()
-        if bi_dir.is_dir() and str(bi_dir) not in seen_dirs:
-            sources.append((str(bi_dir), "Built-in", None))
-            seen_dirs.add(str(bi_dir))
-
-        # 2. Plugins
-        try:
-            from opscloud.plugins.adapters.skills import discover_plugin_skill_sources_and_roots
-
-            p_srcs, _ = discover_plugin_skill_sources_and_roots(project_root=effective_root)
-            for p_path, p_ns in p_srcs:
-                if str(p_path) not in seen_dirs and p_path.is_dir():
-                    sources.append((str(p_path), f"Plugin: {p_ns}", p_ns))
-                    seen_dirs.add(str(p_path))
-        except Exception:
-            pass
-
-        # 3. User
-        u_dir = paths.get_user_skills_dir("opscloud")
-        if u_dir.is_dir() and str(u_dir) not in seen_dirs:
-            sources.append((str(u_dir), "User Skills", None))
-            seen_dirs.add(str(u_dir))
-
-        ua_dir = paths.get_user_agent_skills_dir()
-        if ua_dir and ua_dir.is_dir() and str(ua_dir) not in seen_dirs:
-            sources.append((str(ua_dir), "User Agent Skills", None))
-            seen_dirs.add(str(ua_dir))
-
-        # 4. Project
-        p_dir = paths.get_project_skills_dir(effective_root)
-        if p_dir and p_dir.is_dir() and str(p_dir) not in seen_dirs:
-            sources.append((str(p_dir), "Project Skills", None))
-            seen_dirs.add(str(p_dir))
-
-        pa_dir = paths.get_project_agent_skills_dir(effective_root)
-        if pa_dir and pa_dir.is_dir() and str(pa_dir) not in seen_dirs:
-            sources.append((str(pa_dir), "Project Agent Skills", None))
-            seen_dirs.add(str(pa_dir))
-
-        return sources
 
 
 def get_skill_registry(store: Any = None) -> SkillRegistry:

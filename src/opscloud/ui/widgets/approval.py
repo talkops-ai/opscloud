@@ -708,7 +708,7 @@ class ApprovalModalScreen(ModalScreen[ApprovalDecided]):
     def compose(self) -> ComposeResult:
         rendered = render_tool_approval(self._tool_name, self._args)
         with VerticalScroll(id="modal-container"):
-            yield Static("🔴 HIGH RISK / PRODUCTION OPERATION APPROVAL", classes="modal-title")
+            yield Static("HIGH RISK / PRODUCTION OPERATION APPROVAL", classes="modal-title")
             yield Static(f"Tool: {rendered.title}", classes="modal-title")
             with VerticalScroll(id="modal-args-scroll"):
                 if rendered.diff_lines:

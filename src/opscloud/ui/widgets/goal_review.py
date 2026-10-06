@@ -572,7 +572,7 @@ class GoalReviewScreen(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="goal-review-container"):
-            yield Label("🎯 Goal Review", id="goal-title")
+            yield Label("Goal Review", id="goal-title")
             yield Static(self._objective, id="goal-objective")
             yield Label("Acceptance Criteria:", id="rubric-title")
             yield Static(self._rubric, id="rubric-content")

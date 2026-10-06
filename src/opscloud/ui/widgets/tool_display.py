@@ -36,6 +36,62 @@ _CUSTOM_DISPLAY_NAMES: dict[str, str] = {
 
 _CUSTOM_SUMMARY_FORMATTERS: dict[str, Callable[[str], str]] = {}
 
+import re
+
+
+def parse_scoped_tool_name(tool_name: str) -> tuple[str, str | None]:
+    """Parse scoped tool name into (base_tool_name, scope_label).
+
+    Handles:
+    - plugin scoped: plugin__aws-compute_talkops-devops_aws__run_script_f0b5243c096e
+      -> ('run_script', 'aws-compute')
+    - mcp scoped: mcp__github__create_issue -> ('create_issue', 'github')
+    - subagent scoped: subagent__helm-operator__install -> ('install', 'helm-operator')
+    - hash suffixed: run_script_f0b5243c096e -> ('run_script', None)
+    - standard: read_file -> ('read_file', None)
+    """
+    if not tool_name or tool_name == "None":
+        return ("tool", None)
+
+    # 1. MCP Subagent scoped: mcp__plugin__<subagent>__<server>__<tool>
+    sub_mcp_m = re.match(
+        r"^mcp__plugin__([^_]+(?:_[^_]+)*?)__([^_]+(?:_[^_]+)*?)__(.+?)(?:_[0-9a-f]{8,16})?$",
+        tool_name,
+    )
+    if sub_mcp_m:
+        scope = sub_mcp_m.group(1).split("_")[0]
+        base = sub_mcp_m.group(3)
+        return (base, scope)
+
+    # 2. Standard MCP scoped: mcp__<server>__<tool>
+    mcp_m = re.match(r"^mcp__([^_]+(?:_[^_]+)*?)__(.+?)(?:_[0-9a-f]{8,16})?$", tool_name)
+    if mcp_m:
+        server = mcp_m.group(1).split("_")[0]
+        base = mcp_m.group(2)
+        return (base, server)
+
+    # 3. Plugin scoped: plugin__<namespace>__<tool>(_<hex8+>)?
+    plug_m = re.match(r"^plugin__([a-zA-Z0-9_-]+?)__(.+?)(?:_[0-9a-f]{8,16})?$", tool_name)
+    if plug_m:
+        ns = plug_m.group(1)
+        plugin_name = ns.split("_")[0]
+        base = plug_m.group(2)
+        return (base, plugin_name)
+
+    # 4. Subagent scoped: subagent__<subagent>__<tool>(_<hex8+>)?
+    sub_m = re.match(r"^subagent__([a-zA-Z0-9_-]+?)__(.+?)(?:_[0-9a-f]{8,16})?$", tool_name)
+    if sub_m:
+        scope = sub_m.group(1)
+        base = sub_m.group(2)
+        return (base, scope)
+
+    # 5. Trailing hash fallback: <tool>_<hex8+>
+    hash_m = re.match(r"^(.+?)_[0-9a-f]{8,16}$", tool_name)
+    if hash_m:
+        return (hash_m.group(1), None)
+
+    return (tool_name, None)
+
 
 def register_tool_display_name(tool_name: str, display_name: str) -> None:
     """Register or override a custom display label for a tool."""
@@ -51,21 +107,28 @@ def get_tool_display_name(tool_name: str) -> str:
     """Resolve the display label for any tool name.
 
     Uses explicit override if present, otherwise transforms snake_case / kebab-case
-    into TitleCase automatically (e.g. ``deploy_helm_chart`` -> ``DeployHelmChart``).
+    into TitleCase automatically. Preserves and formats scoped identifiers
+    (e.g. `plugin__aws-compute...__run_script...` -> `RunScript [aws-compute]`).
     """
     if not tool_name or tool_name == "None":
         return "Tool"
 
-    raw_lower = tool_name.lower()
+    base_name, scope = parse_scoped_tool_name(tool_name)
+    raw_lower = base_name.lower()
     if raw_lower in _CUSTOM_DISPLAY_NAMES:
-        return _CUSTOM_DISPLAY_NAMES[raw_lower]
+        display = _CUSTOM_DISPLAY_NAMES[raw_lower]
+    else:
+        # Convert snake_case or kebab-case to TitleCase
+        normalized = base_name.replace("-", "_")
+        parts = [part for part in normalized.split("_") if part]
+        if parts:
+            display = "".join(part.capitalize() for part in parts)
+        else:
+            display = base_name.capitalize()
 
-    # Generic rule: convert snake_case or kebab-case to TitleCase
-    normalized = tool_name.replace("-", "_")
-    parts = [part for part in normalized.split("_") if part]
-    if parts:
-        return "".join(part.capitalize() for part in parts)
-    return tool_name.capitalize()
+    if scope:
+        return f"{display} [{scope}]"
+    return display
 
 
 # ── String & Path Formatting Helpers ───────────────────────
@@ -119,14 +182,15 @@ def format_tool_display(
     """
     args = tool_args or {}
     raw_name = tool_name if (tool_name and tool_name != "None") else "tool"
+    base_name, scope = parse_scoped_tool_name(raw_name)
     display_name = get_tool_display_name(raw_name)
 
     # 1. Dedicated formatters for core agent tools
-    if raw_name in {"task"}:
+    if base_name in {"task"}:
         sub_name = args.get("subagent_type") or args.get("agent_name") or args.get("subagent") or "subagent"
         return f"{prefix} {display_name} [{sub_name}]"
 
-    elif raw_name == "ask_user":
+    elif base_name == "ask_user":
         qs = args.get("questions")
         q_count = len(qs) if isinstance(qs, list) else 1
         return f"{prefix} {display_name}({q_count} question{'s' if q_count > 1 else ''})"
@@ -141,6 +205,7 @@ def format_tool_display(
         or args.get("file")
     )
     cmd_val = args.get("command") or args.get("cmd")
+    code_val = args.get("code") or args.get("script")
     query_val = args.get("query") or args.get("pattern")
     url_val = args.get("url") or args.get("uri")
     scope_val = args.get("search_path") or args.get("directory") or args.get("path")
@@ -150,13 +215,19 @@ def format_tool_display(
         return f"{prefix} {display_name}({path_str})"
 
     elif query_val is not None:
-        q_str = truncate_value(str(query_val), max_length=50)
-        scope = f" in {abbreviate_path(str(scope_val))}" if scope_val else ""
-        return f'{prefix} {display_name}("{q_str}"{scope})'
+        q_str = truncate_value(str(query_val).splitlines()[0] if str(query_val) else "", max_length=50)
+        scope_str = f" in {abbreviate_path(str(scope_val))}" if scope_val else ""
+        return f'{prefix} {display_name}("{q_str}"{scope_str})'
 
     elif cmd_val is not None:
-        cmd_str = truncate_value(str(cmd_val), max_length=60)
+        first_line = str(cmd_val).strip().splitlines()[0] if str(cmd_val).strip() else ""
+        cmd_str = truncate_value(first_line, max_length=60)
         return f'{prefix} {display_name}("{cmd_str}")'
+
+    elif code_val is not None:
+        first_line = str(code_val).strip().splitlines()[0] if str(code_val).strip() else ""
+        code_str = truncate_value(first_line, max_length=40)
+        return f'{prefix} {display_name}("{code_str}")'
 
     elif url_val is not None:
         u_str = truncate_value(str(url_val), max_length=60)
@@ -166,7 +237,8 @@ def format_tool_display(
     if args:
         first_key, first_val = next(iter(args.items()))
         if isinstance(first_val, str):
-            val_str = truncate_value(first_val, max_length=40)
+            first_line = first_val.strip().splitlines()[0] if first_val.strip() else ""
+            val_str = truncate_value(first_line, max_length=40)
             return f'{prefix} {display_name}("{val_str}")'
         elif isinstance(first_val, list):
             return f"{prefix} {display_name}({len(first_val)} items)"
@@ -246,6 +318,7 @@ __all__ = [
     "format_tool_display",
     "format_tool_result_summary",
     "get_tool_display_name",
+    "parse_scoped_tool_name",
     "register_tool_display_name",
     "register_tool_summary_formatter",
     "truncate_value",

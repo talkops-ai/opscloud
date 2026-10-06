@@ -167,6 +167,16 @@ class RemoteAgent:
         stream_context = payload if payload else context
         dropped_count = 0
 
+        active_tid = payload.get("thread_id") or (
+            prepared_config.get("configurable", {}).get("thread_id")
+            if isinstance(prepared_config.get("configurable"), dict)
+            else None
+        )
+        if active_tid:
+            from opscloud.middleware.cost_tracking import ACTIVE_SESSION_THREAD_ID
+
+            ACTIVE_SESSION_THREAD_ID.set(str(active_tid))
+
         async for raw_item in graph.astream(
             input,
             stream_mode=stream_mode or ["messages", "updates"],

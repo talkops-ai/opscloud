@@ -110,26 +110,26 @@ class InfraStatePanel(Widget):
 
     def compose(self):
         ctx = self._detect_context()
-        yield Static("🏗️ Infrastructure Context", classes="header")
+        yield Static("Infrastructure Context", classes="header")
 
         if ctx["is_prod"] == "true":
-            yield Static("🔴 PRODUCTION CONTEXT ACTIVE — DESTRUCTIVE OPS REQUIRES EXTRA APPROVAL", classes="prod-alert")
+            yield Static("PRODUCTION CONTEXT ACTIVE — DESTRUCTIVE OPS REQUIRES EXTRA APPROVAL", classes="prod-alert")
 
         with VerticalScroll():
-            cloud_txt = Text("☁️ Cloud Credentials\n", style="bold cyan")
+            cloud_txt = Text("Cloud Credentials\n", style="bold cyan")
             cloud_txt.append(f"AWS Profile: {ctx['aws_profile']}\n", style="dim")
             yield Static(cloud_txt, classes="section")
 
-            k8s_txt = Text("⎈ Kubernetes Cluster\n", style="bold green")
+            k8s_txt = Text("Kubernetes Cluster\n", style="bold green")
             k8s_txt.append(f"Context: {ctx['k8s_context']}\n", style="dim")
-            k8s_txt.append("Status: 🟢 Connected", style="green")
+            k8s_txt.append("Status: Connected", style="green")
             yield Static(k8s_txt, classes="section")
 
-            git_txt = Text("🌿 Git Repository\n", style="bold magenta")
+            git_txt = Text("Git Repository\n", style="bold magenta")
             git_txt.append(f"Branch: {ctx['git_branch']}\n", style="dim")
             yield Static(git_txt, classes="section")
 
-            tf_txt = Text("🏗️ Infrastructure-as-Code\n", style="bold yellow")
+            tf_txt = Text("Infrastructure-as-Code\n", style="bold yellow")
             tf_txt.append(f"Terraform Workspace: {ctx['tf_workspace']}\n", style="dim")
             yield Static(tf_txt, classes="section")
 

@@ -198,13 +198,13 @@ def render_tool_approval(
     if "terraform" in tool_name:
         action = "plan" if "plan" in tool_name else "apply"
         dir_path = args.get("dir", ".")
-        title = f"🏗️ Terraform {action.upper()}: {dir_path}"
+        title = f"Terraform {action.upper()}: {dir_path}"
     elif "kubectl" in tool_name:
-        title = f"⎈ Kubectl: {tool_name}"
+        title = f"Kubectl: {tool_name}"
     elif "helm" in tool_name:
-        title = f"☸️ Helm: {tool_name}"
+        title = f"Helm: {tool_name}"
     elif "ansible" in tool_name:
-        title = f"🅰️ Ansible: {tool_name}"
+        title = f"Ansible: {tool_name}"
     elif tool_name in {"execute", "bash", "shell"}:
         title = f"Shell: {tool_name}"
     elif tool_name in {"write_file", "write_to_file"}:

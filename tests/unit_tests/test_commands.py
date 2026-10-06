@@ -436,5 +436,61 @@ async def test_goal_command_create_when_no_active_goal():
     assert call_req["objective"] == "Create a file named nginx.conf"
 
 
+@pytest.mark.asyncio
+async def test_context_command_no_emojis_and_complete_metrics():
+    from opscloud.commands.core.context import ContextHandler
+    from unittest.mock import AsyncMock
+
+    mock_app = MagicMock()
+    mock_app._model = "google_genai:gemini-3.5-flash"
+    mock_app.get_context_tokens = MagicMock(return_value=14074)
+    mock_app.get_conversation_token_count = AsyncMock(return_value=119)
+    mock_app._cumulative_session_tokens = 37658
+    mock_app._session_cost_usd = 0.03579855
+    mock_adapter = MagicMock()
+    mock_adapter._stats = MagicMock(request_count=3, input_tokens=36420, output_tokens=1238, total_cost_usd=0.03579855)
+    mock_app._adapter = mock_adapter
+
+    mock_app.get_active_tools = MagicMock(return_value=["fetch_url", "bash", "edit_file"])
+    mock_app.get_mcp_servers = MagicMock(return_value=[])
+    mock_app.get_discovered_skills = MagicMock(return_value=["skill-creator", "cloud-doctor"])
+
+    ctx = CommandContext(app=mock_app, raw_command="/context", args="")
+    handler = ContextHandler()
+    result = await handler.execute(ctx)
+
+    assert result.success is True
+    msg = result.message
+
+    # Verify NO emojis in message
+    emojis = ["📊", "🧩", "☁️", "🤖", "⚡", "✨", "🔥"]
+    for e in emojis:
+        assert e not in msg, f"Found emoji {e} in context command output"
+
+    # Verify context window and breakdown
+    assert "**Context Window:**" in msg
+    assert "14,074" in msg
+    assert "System Prompt + Tools:" in msg
+    assert "Conversation History:" in msg
+    assert "Remaining Space:" in msg
+
+    # Verify session totals
+    assert "**Session Total:**" in msg
+    assert "37,658 tokens" in msg
+    assert "$0.04" in msg
+    assert "(3 requests)" in msg
+    assert "Input Tokens:" in msg
+    assert "36,420" in msg
+    assert "Output Tokens:" in msg
+    assert "1,238" in msg
+
+    # Verify active resources
+    assert "**Active Resources:**" in msg
+    assert "3 tools" in msg
+    assert "2 skills" in msg
+    assert "**Tools:** fetch_url, bash, edit_file" in msg
+    assert "**Skills:** skill-creator, cloud-doctor" in msg
+
+
 
 

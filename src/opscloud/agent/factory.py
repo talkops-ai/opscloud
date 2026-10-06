@@ -16,6 +16,7 @@ from typing import Any, cast
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
+from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware import MemoryMiddleware
 from deepagents.middleware.async_subagents import AsyncSubAgent
 from langchain.agents.middleware.types import AgentMiddleware
@@ -69,6 +70,7 @@ from opscloud.middleware.skills import (
     discover_skill_dirs,
 )
 from opscloud.middleware.subagents import SubagentsMiddleware
+from opscloud.middleware.subagent_telemetry import SubagentTelemetryMiddleware
 from opscloud.middleware.tool_filter import ToolFilterMiddleware
 from opscloud.middleware.unified_system_message import (
     UnifiedSystemMessageMiddleware,
@@ -333,10 +335,12 @@ def _subagent_cli_middleware(
     has_explicit_model: bool,
     assistant_id: str,
     subagent_name: str,
+    subagent_meta: SubagentMetadata | dict[str, Any] | None = None,
     allowed_tools: Sequence[str] | None = None,
     allowed_skills: Sequence[str] | None = None,
     capabilities: Sequence[dict[str, Any]] | None = None,
     interactive: bool = True,
+    auto_approve: bool = False,
     shell_allow_list: list[str] | None = None,
     interrupt_on: dict[str, Any] | None = None,
     worktree_root: str | Path | None = None,
@@ -345,16 +349,46 @@ def _subagent_cli_middleware(
     mcp_server_info: Sequence[Any] | None = None,
     mcp_config: dict[str, Any] | None = None,
     mcp_tools: list[Any] | None = None,
+    backend: BackendProtocol | None = None,
+    model: str | BaseChatModel | None = None,
 ) -> list[Any]:
     middleware: list[AgentMiddleware[Any, Any]] = []
-    if interrupt_on is not None:
+    subagent_cwd = Path(worktree_root) if worktree_root is not None else Path.cwd()
+
+    if interrupt_on is not None and interactive and not auto_approve:
+        middleware.append(
+            AutoModeHITLMiddleware(
+                interrupt_on,
+                worktree_root=subagent_cwd,
+                shell_allow_list=list(shell_allow_list or []),
+            )
+        )
+    elif interrupt_on is not None:
         middleware.append(AsyncApprovalHITLMiddleware(interrupt_on))
 
     if not has_explicit_model:
         middleware.append(ConfigurableModelMiddleware(persist_model_state=False))
 
+    middleware.append(
+        JevDynamicModelRouterMiddleware(
+            subagent_name=subagent_name,
+            capabilities=capabilities,
+        )
+    )
+
+    if backend is not None and model is not None:
+        try:
+            middleware.append(_create_cli_compaction_middleware(model, backend))
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize compaction middleware for subagent %s: %s",
+                subagent_name,
+                exc,
+            )
+
     middleware.append(CodeModelRetryMiddleware())
     middleware.append(CostTrackingMiddleware(nested=True))
+    middleware.append(SubagentTelemetryMiddleware(subagent_name=subagent_name))
 
     if not interactive:
         middleware.append(GlmTerminalStallRecoveryMiddleware())
@@ -362,7 +396,6 @@ def _subagent_cli_middleware(
     if shell_allow_list:
         middleware.append(ShellAllowListMiddleware(shell_allow_list))
 
-    subagent_cwd = Path(worktree_root) if worktree_root is not None else Path.cwd()
     middleware.append(
         ServerHooksMiddleware(
             cwd=subagent_cwd,
@@ -380,19 +413,37 @@ def _subagent_cli_middleware(
     if mcp_server_info or mcp_config or mcp_tools:
         middleware.append(MCPToolMiddleware())
 
+    server_keys: list[str] = []
+    if mcp_config:
+        server_keys.extend(mcp_config.keys())
+    if mcp_server_info:
+        server_keys.extend(getattr(s, "name", str(s)) for s in mcp_server_info)
+
     if allowed_tools or capabilities:
-        middleware.append(ToolFilterMiddleware(allowed_patterns=allowed_tools, capabilities=capabilities))
+        middleware.append(
+            ToolFilterMiddleware(
+                allowed_patterns=allowed_tools,
+                capabilities=capabilities,
+                subagent_name=subagent_name,
+                mcp_tools=mcp_tools,
+                known_mcp_servers=server_keys or None,
+            )
+        )
 
-    skill_sources: list[SkillSourceTuple] = []
-    if subagent_path:
-        p = Path(subagent_path)
-        bundle_dir = p.parent.parent if p.parent.name == "agents" else p.parent
-        sub_skills_dir = bundle_dir / "skills"
-        if sub_skills_dir.exists() and sub_skills_dir.is_dir():
-            skill_sources.append((str(sub_skills_dir), f"Subagent ({subagent_name})"))
+    from opscloud.plugins.adapters.agents import get_subagent_skills_source
+    from opscloud.skills.sources import CodeSkillSource, get_skill_sources
 
-    global_sources = SkillRegistry.get_instance().get_sources_for_middleware()
+    skill_sources: list[CodeSkillSource] = []
+    meta_for_skills = subagent_meta or {"path": subagent_path, "name": subagent_name}
+    bundled_source = get_subagent_skills_source(meta_for_skills)
+    if bundled_source and Path(bundled_source[0]).is_dir():
+        skill_sources.append(bundled_source)
+
     if allowed_skills is not None:
+        global_sources = get_skill_sources(
+            project_root=Path(worktree_root) if worktree_root else None,
+            include_subagent_skills=True,
+        )
         backend_fs = FilesystemBackend(virtual_mode=False)
         for src in global_sources:
             src_path = src[0]
@@ -404,12 +455,19 @@ def _subagent_cli_middleware(
                         fnmatch.fnmatch(skill_name, pat) or fnmatch.fnmatch(skill_name.lower(), pat.lower())
                         for pat in allowed_skills
                     ):
-                        skill_sources.append(src)
+                        if not any(s[0] == src[0] for s in skill_sources):
+                            skill_sources.append(src)
                         break
             except Exception as exc:
                 logger.debug("Skill discovery failed for source %s: %s", src_path, exc)
     elif not skill_sources:
-        skill_sources.extend(global_sources)
+        # If not a bundled subagent and no allowed_skills filter, inherit global sources
+        skill_sources.extend(
+            get_skill_sources(
+                project_root=Path(worktree_root) if worktree_root else None,
+                include_subagent_skills=True,
+            )
+        )
 
     if skill_sources:
         middleware.append(
@@ -417,6 +475,7 @@ def _subagent_cli_middleware(
                 backend=FilesystemBackend(virtual_mode=False),
                 sources=skill_sources,
                 allowed_skills=allowed_skills,
+                project_root=Path(worktree_root) if worktree_root else None,
             )
         )
 
@@ -425,10 +484,12 @@ def _subagent_cli_middleware(
             middleware.append(extra_mw)
 
     from opscloud.middleware.ask_user import AskUserMiddleware
+    from opscloud.middleware.subagent_artifacts import SubagentArtifactsMiddleware
 
     middleware.append(AskUserMiddleware())
 
     middleware.append(ManagedMemoryGuardMiddleware())
+    middleware.append(SubagentArtifactsMiddleware())
     middleware.append(UnifiedSystemMessageMiddleware())
     return middleware
 
@@ -478,11 +539,14 @@ def create_opscloud_agent(
     else:
         effective_cwd = Path.cwd().resolve()
 
-    effective_project_root = (
-        resolved_context.project_root
-        if resolved_context and resolved_context.project_root
-        else settings.effective_project_root
-    )
+    if resolved_context and resolved_context.project_root:
+        effective_project_root = resolved_context.project_root
+    elif cwd is not None:
+        from opscloud.project_utils import find_project_root
+
+        effective_project_root = find_project_root(effective_cwd) or effective_cwd
+    else:
+        effective_project_root = settings.effective_project_root
     project_scope_root = effective_project_root or effective_cwd
 
     # 2. Create composite backend
@@ -664,65 +728,11 @@ def create_opscloud_agent(
         custom_mw = subagent_meta.get("middleware")
 
         # Build per-subagent MCP config and tools for this subagent
-        subagent_mcp_tools: list[BaseTool] = []
-        sub_mcp_server_infos: list[Any] = []
-        subagent_path_obj = Path(subagent_path) if subagent_path else None
-        bundle_dir = None
-        if subagent_path_obj:
-            if subagent_path_obj.parent.name == "agents":
-                bundle_dir = subagent_path_obj.parent.parent
-            else:
-                bundle_dir = subagent_path_obj.parent
+        from opscloud.plugins.adapters.mcp import prepare_subagent_mcp
 
-        from opscloud.plugins.adapters.mcp import subagent_mcp_configs
-
-        servers: dict[str, Any] = {}
-        mcp_files_raw = subagent_meta.get("mcp_files")
-        mcp_files: list[str | Path] | None = list(mcp_files_raw) if mcp_files_raw is not None else None
-        if bundle_dir and bundle_dir.is_dir():
-            servers.update(subagent_mcp_configs(subagent_name, bundle_dir, mcp_files, project_dir=project_scope_root))
-
-        raw_mcp_cfg = subagent_meta.get("mcp_config")
-        if raw_mcp_cfg and isinstance(raw_mcp_cfg, dict):
-            servers.update(raw_mcp_cfg.get("mcpServers") or raw_mcp_cfg)
-
-        if servers:
-            from opscloud.mcp.preload import (
-                get_cached_mcp_server_infos,
-                preload_mcp_metadata,
-            )
-            from opscloud.mcp.session_manager import (
-                MCPSessionManager,
-                build_mcp_tools_from_server_infos,
-            )
-
-            sub_mcp_manager = MCPSessionManager.get_instance(servers, purge_missing=False)
-            sub_mcp_manager.register_servers(servers)
-            try:
-                cached_infos = get_cached_mcp_server_infos()
-                cached_by_name = {info.name: info for info in cached_infos}
-                missing_configs = {k: v for k, v in servers.items() if k not in cached_by_name}
-
-                if missing_configs:
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
-
-                    if loop is not None and loop.is_running():
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            new_infos = pool.submit(asyncio.run, preload_mcp_metadata(missing_configs)).result()
-                    else:
-                        new_infos = asyncio.run(preload_mcp_metadata(missing_configs))
-                    cached_infos.extend(new_infos)
-                    cached_by_name.update({info.name: info for info in new_infos})
-
-                sub_mcp_server_infos = [cached_by_name[k] for k in servers if k in cached_by_name]
-                sub_tools = build_mcp_tools_from_server_infos(sub_mcp_server_infos, sub_mcp_manager)
-                if sub_tools:
-                    subagent_mcp_tools.extend(sub_tools)
-            except Exception as exc:
-                logger.warning("Could not initialize subagent %s MCP tools: %s", subagent_name, exc)
+        servers, subagent_mcp_tools, sub_mcp_server_infos = prepare_subagent_mcp(
+            subagent_name, subagent_meta, project_scope_root
+        )
 
         if subagent_mcp_tools:
             subagent_dict["tools"] = [*base_subagent_tools, *subagent_mcp_tools]
@@ -733,18 +743,22 @@ def create_opscloud_agent(
             has_explicit_model=bool(model_spec),
             assistant_id=assistant_id,
             subagent_name=subagent_name,
+            subagent_meta=subagent_meta,
             allowed_tools=subagent_meta.get("tools"),
             allowed_skills=subagent_meta.get("skills"),
             capabilities=subagent_meta.get("capabilities"),
             interactive=interactive,
-            shell_allow_list=allow_list if not interactive and allow_list else None,
+            auto_approve=auto_approve,
+            shell_allow_list=allow_list,
             interrupt_on=interrupt_on,
             worktree_root=effective_cwd,
             subagent_path=subagent_path if subagent_path else None,
             custom_middleware=custom_mw if isinstance(custom_mw, list) else None,
             mcp_server_info=sub_mcp_server_infos or None,
-            mcp_config=servers if not sub_mcp_server_infos else None,
+            mcp_config=servers or None,
             mcp_tools=subagent_mcp_tools or None,
+            backend=composite_backend,
+            model=subagent_dict.get("model") or active_model,
         )
         if sub_middleware:
             subagent_dict["middleware"] = sub_middleware
@@ -768,8 +782,12 @@ def create_opscloud_agent(
             assistant_id=assistant_id,
             subagent_name=gp_name,
             interactive=interactive,
+            auto_approve=auto_approve,
+            shell_allow_list=allow_list,
             interrupt_on=interrupt_on,
             worktree_root=effective_cwd,
+            backend=composite_backend,
+            model=active_model,
         )
         gp_subagent: dict[str, Any] = {
             "name": gp_name,
@@ -818,7 +836,7 @@ def create_opscloud_agent(
 
     # 10.1 ConfigurableModelMiddleware, Jev Dynamic Model Router & Model Retry
     agent_middleware.append(ConfigurableModelMiddleware())
-    agent_middleware.append(JevDynamicModelRouterMiddleware())
+    agent_middleware.append(JevDynamicModelRouterMiddleware(subagent_name=None))
     agent_middleware.append(CodeModelRetryMiddleware())
 
     # 10.2 Non-interactive guards
@@ -855,12 +873,24 @@ def create_opscloud_agent(
         )
         agent_middleware.append(ManagedMemoryGuardMiddleware(guarded_paths=memory_sources_str))
 
-    # 10.6 PluginSkillsMiddleware (dynamic live discovery across plugin install/uninstall lifecycle)
-    agent_middleware.append(
-        PluginSkillsMiddleware(
-            backend=FilesystemBackend(virtual_mode=False),
-        )
+    # 10.6 PluginSkillsMiddleware (resolved via canonical dcode-aligned get_skill_sources)
+    from opscloud.skills.sources import get_skill_sources
+
+    coord_skill_sources = get_skill_sources(
+        assistant_id=assistant_id,
+        project_root=project_scope_root,
+        project_context=project_context,
+        include_subagent_skills=False,
+        store=config_store or store,
     )
+    if coord_skill_sources:
+        agent_middleware.append(
+            PluginSkillsMiddleware(
+                backend=composite_backend,
+                sources=coord_skill_sources,
+                project_root=project_scope_root,
+            )
+        )
 
     # 10.7 CodeInterpreterMiddleware (if enabled)
     if enable_interpreter:
@@ -944,10 +974,15 @@ def create_opscloud_agent(
         ]
 
     try:
-        criteria_skill_sources = skill_registry.get_sources_for_middleware(
-            project_scope_root,
+        from opscloud.skills.sources import get_skill_sources
+
+        criteria_skill_sources = get_skill_sources(
+            assistant_id=assistant_id,
+            project_root=project_scope_root,
+            project_context=project_context,
             include_subagent_skills=True,
             subagents=list(subagent_by_name.values()),
+            store=config_store or store,
         )
         criteria_backend = getattr(composite_backend, "default", composite_backend)
         criteria_agent = create_goal_criteria_agent(

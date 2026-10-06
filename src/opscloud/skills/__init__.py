@@ -40,6 +40,12 @@ from opscloud.skills.registry import (
     SkillSource,
     get_skill_registry,
 )
+from opscloud.skills.sources import (
+    CodeSkillSource,
+    DirectorySkillSource,
+    PluginSkillSource,
+    get_skill_sources,
+)
 from opscloud.skills.trust import (
     RevokeResult,
     SkillTrustStore,
@@ -68,6 +74,7 @@ __all__ = [
     "get_skill_by_name",
     "get_skill_content_by_name",
     "get_skill_registry",
+    "get_skill_sources",
     "is_skill_dir_trusted",
     "list_skills",
     "list_skills_command",

@@ -96,13 +96,13 @@ def run_mcp_command(args: argparse.Namespace | None = None) -> int:
     if server_infos:
         for srv in server_infos:
             if srv.status == "ok":
-                status_glyph = "[bold green]🟢 OK[/bold green]"
+                status_glyph = "[bold green]● OK[/bold green]"
             elif srv.status == "disabled":
-                status_glyph = "[dim]⏸ OFF[/dim]"
+                status_glyph = "[dim]○ OFF[/dim]"
             elif srv.status == "unauthenticated":
-                status_glyph = "[bold yellow]🟡 AUTH[/bold yellow]"
+                status_glyph = "[bold yellow]▲ AUTH[/bold yellow]"
             else:
-                status_glyph = "[bold red]🔴 ERR[/bold red]"
+                status_glyph = "[bold red]✗ ERR[/bold red]"
 
             cmd_or_url = srv.url or f"{srv.command} {' '.join(srv.args or [])}".strip()
             table.add_row(
@@ -116,7 +116,7 @@ def run_mcp_command(args: argparse.Namespace | None = None) -> int:
     else:
         for name, cfg in configs.items():
             enabled = cfg.get("enabled", True)
-            status_glyph = "[green]🟢 ON[/green]" if enabled else "[dim]⏸ OFF[/dim]"
+            status_glyph = "[green]● ON[/green]" if enabled else "[dim]○ OFF[/dim]"
             transport = cfg.get("transport") or ("http" if cfg.get("url") else "stdio")
             cmd_or_url = cfg.get("url") or f"{cfg.get('command', '')} {' '.join(cfg.get('args') or [])}".strip()
             source = cfg.get("source", "project")

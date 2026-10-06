@@ -81,18 +81,18 @@ class NotificationCenter(Widget):
         self._suppressed.add(severity)
 
     def compose(self):
-        yield Static("🔔 Notifications & Alerts", classes="header")
+        yield Static("Notifications & Alerts", classes="header")
         with VerticalScroll():
             if not self._notifications:
                 yield Static("No notifications.", classes="muted")
             for item in self._notifications:
-                icon = "ℹ️"
+                icon = "•"
                 if item.severity == "success":
-                    icon = "✅"
+                    icon = "✓"
                 elif item.severity == "warning":
-                    icon = "⚠️"
+                    icon = "!"
                 elif item.severity == "error":
-                    icon = "❌"
+                    icon = "✗"
 
                 content = Text(f"{icon} {item.title or 'Notification'}\n", style="bold")
                 content.append(item.message, style="dim")
