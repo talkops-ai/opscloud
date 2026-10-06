@@ -1,12 +1,13 @@
 <div align="center">
 
-<img src="docs/assets/opscloud_logo.png" alt="OpsCloud" width="120">
-
-# OpsCloud
-
-**The AI Coding & Cloud Operations Agent for Your Terminal**
-
-*Full-stack coding via Deep Agents + autonomous cloud operations across AWS, Azure, and GCP through the TalkOps DevOps Plugin Marketplace.*
+```text
+  ___  ____  ____   ____ _     ___  _   _ ____  
+ / _ \|  _ \/ ___| / ___| |   / _ \| | | |  _ \ 
+| | | | |_) \___ \| |   | |  | | | | | | | | | |
+| |_| |  __/ ___) | |___| |__| |_| | |_| | |_| |
+ \___/|_|   |____/ \____|_____\___/ \___/|____/ 
+```
+### Extensible Terminal Multi-Agent Framework for Cloud Operations & DevOps Coding
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-FF6F00.svg?style=flat-square&logo=langchain&logoColor=white)](https://langchain.com/)
@@ -16,28 +17,33 @@
 [![Textual TUI](https://img.shields.io/badge/TUI-Textual-7C3AED.svg?style=flat-square)](https://textual.textualize.io/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 
-[Quickstart](#quickstart) • [How It Works](#what-is-opscloud) • [Plugin Marketplace](#cloud-operations-via-the-plugin-marketplace) • [Approval Modes](#safety--human-in-the-loop-governance) • [Jev System One](#jev-system-one-fast-classification--routing) • [Documentation](#documentation)
+[Quickstart](#quickstart) • [Architecture](#architecture-at-a-glance) • [Plugin Marketplace](#pillar-2-cloud-operations-via-plugin-marketplace) • [Approval Modes](#approval-modes--governance) • [Jev System One](#jev-system-one-fast-classification--routing) • [Documentation](#documentation)
 
 </div>
 
 ---
 
-## Terminal Interface
+## Demo Walkthrough
 
-<p align="center">
-  <img src="docs/assets/demo.gif" alt="OpsCloud Terminal Interface" width="100%">
-</p>
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                         ▶ OpsCloud Terminal Demo                       │
+│                                                                        │
+│                [ Video Demo Placeholder — Recording Coming Soon ]       │
+│                                                                        │
+│   Hands-on DevOps coding, Jev <70ms dynamic routing, and multi-agent   │
+│   cloud operations across AWS, Azure, and GCP via plugin marketplace.  │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## What is OpsCloud?
 
-OpsCloud brings two essential engineering capabilities together into a single terminal agent that anyone on your team can use:
+OpsCloud is an extensible, terminal-based multi-agent framework that unifies platform engineering coding and multi-cloud operations with strict human-in-the-loop governance:
 
-1. **A Hands-On Coding Agent**: Powered by the main Deep Agent and its built-in platform skills. OpsCloud reads your codebase, writes new features, fixes bugs, generates Infrastructure as Code (Terraform, OpenTofu, CDK), authors Kubernetes manifests, and builds CI/CD pipelines. It follows a safe, responsible principle: **produce reviewable diffs and plans, never blind unreviewed deployments**.
-2. **Autonomous Cloud Operations**: Instead of locking you into a monolithic set of tools, OpsCloud connects directly to the **TalkOps DevOps Plugin Marketplace** ([`talkops-ai/devops-plugins`](https://github.com/talkops-ai/devops-plugins)). With a single command, you can install specialized AI agents (like SRE, FinOps, Cloud Security, and Database engineers) or domain skill packs across AWS, Azure, GCP, and Kubernetes to inspect live environments, diagnose incidents, and optimize cloud infrastructure.
-
-Whether you are writing code or troubleshooting live cloud systems, OpsCloud gives you an intelligent terminal assistant that plans carefully, uses tools safely, and always keeps you in control.
+1. **Native Platform & DevOps Coding (Main Agent)**: Built directly into the root Deep Agent. Inspects your codebase, authors production-grade Infrastructure as Code (Terraform, OpenTofu, CDK), generates Kubernetes manifests, writes CI/CD pipelines, and validates dry-runs. **Strict rule: produce reviewable diffs and plans, never blind unreviewed deployments**.
+2. **Cloud Operations via Specialist Subagents (Plugin Marketplace)**: Extensible multi-agent framework connected directly to the **TalkOps DevOps Plugin Marketplace** ([`talkops-ai/devops-plugins`](https://github.com/talkops-ai/devops-plugins)). Spawns specialized domain subagents (SRE, FinOps, Cloud Security, Database) and domain skill packs across AWS, Azure, GCP, and Kubernetes for live audits, triage, and infrastructure optimization.
 
 ---
 
@@ -45,46 +51,77 @@ Whether you are writing code or troubleshooting live cloud systems, OpsCloud giv
 
 ### 1. Installation
 
-Install OpsCloud using the automated installation script:
-
 ```bash
+# Automated install (macOS & Linux)
 curl -LsSf https://opscloud.talkops.ai/install.sh | bash
 ```
 
 > [!NOTE]
 > On Windows, run OpsCloud inside **[WSL (Windows Subsystem for Linux)](https://learn.microsoft.com/en-us/windows/wsl/install)** for complete terminal, shell, and TUI compatibility.
 
-### 2. Launch and Authentication
-
-Start the interactive terminal UI:
+### 2. Launch & Authenticate
 
 ```bash
+# Start interactive TUI
 opscloud
-```
 
-Configure your LLM provider credentials interactively with `/auth`:
-
-```text
+# Inside the session, configure credentials interactively:
 /auth
 ```
 
-Supported providers include Anthropic, AWS Bedrock, OpenAI, Google Gemini, Azure OpenAI, Mistral, Ollama, and 15+ others. Credentials can also be exported in your shell:
+Supports 22+ providers (Anthropic, AWS Bedrock, OpenAI, Gemini, Azure, Ollama, DeepSeek, TypeSafe Jev). Credentials can also be exported in your shell:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-# or: export AWS_REGION="us-east-1"
+# or: export AWS_PROFILE="production" AWS_REGION="us-west-2"
 # or: export OPENAI_API_KEY="sk-..."
+# or: export TYPESAFE_API_KEY="jev-..."
 ```
 
 ### 3. Run a Task
 
-Type any coding or cloud objective directly into the prompt:
-
 ```text
-Audit unused EBS volumes and idle NAT Gateways across us-east-1 and us-west-2, calculate monthly cost impact, and draft Terraform deletion diffs
+Audit unattached EBS volumes and idle NAT Gateways across us-east-1 and us-west-2, calculate monthly cost impact, and draft Terraform deletion diffs
 ```
 
-OpsCloud inspects existing infrastructure, plans the execution, offloads raw cloud telemetry to the filesystem, and presents structured findings with actionable remediation steps.
+OpsCloud routes the task, delegates to domain specialists, offloads telemetry to the filesystem, and returns structured findings with copy-pasteable remediation commands.
+
+---
+
+## Architecture at a Glance
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   OPSCLOUD ORCHESTRATOR                                │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│  Input Prompt / Stdin ──> Unicode & Shell AST Scanner ──> Dynamic Approval Gate         │
+│                                                                                         │
+│  [Jev System One Router (<70ms)] ──> Selects Model Tier (Fast / Standard / Powerful)   │
+│                                                                                         │
+│  Ordered Middleware Pipeline (17+ Stages):                                              │
+│    ConfigurableModel ──> JevRouter ──> CodeModelRetry ──> MCPContext ──> MemoryGuard    │
+│    ──> PluginSkills ──> LocalContext ──> ShellAllowList ──> HITLApproval (Manual/Auto/  │
+│    Smart) ──> ServerHooks ──> GoalCriteria ──> ContextCompaction ──> RubricEvaluator    │
+│                                                                                         │
+│  Delegation & Isolation:                                                                │
+│    ┌───────────────────┬───────────────────┬───────────────────┬───────────────────┐    │
+│    ▼                   ▼                   ▼                   ▼                   ▼    │
+│  [Project Agents]    [Plugin Agents]     [User Agents]      [Async Agents]   [Sandboxes]│
+│  (.opscloud/agents) (devops-plugins)    (~/.opscloud/agents) (config.toml)  (Modal/Day) │
+│    └───────────────────┴───────────────────┴───────────────────┴───────────────────┘    │
+│                                           │                                             │
+│                                           ▼                                             │
+│                       SubagentMemoryStore (Context Sandboxed)                           │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Core Architecture Highlights
+
+- **System Prompts**: Composed dynamically with model identity injection, cloud provider awareness (AWS, Azure, GCP, Multi-Cloud), filesystem discipline (`edit_file` over sed/awk), and strict artifact vs. chat separation.
+- **Middleware Pipeline**: Strict 17-stage LangGraph execution pipeline handling model retries, stalling recovery, headless MCP tiering, live cost tracking, shell allowlists, lifecycle hooks, and context compaction.
+- **Jev System One Integration**: Sub-70ms dynamic model routing, <100ms tool-call safety classification, and <200ms parallel rubric acceptance testing.
+- **Sandboxes**: Transparent execution in ephemeral cloud sandboxes (Modal, Daytona, LangSmith, AgentCore, Runloop, Docker) with bi-directional workspace sync.
+- **Config & Secret Hierarchy**: Pure filesystem-backed persistence (`~/.opscloud/` and `.opscloud/`) with zero database dependencies.
 
 ---
 
@@ -92,49 +129,31 @@ OpsCloud inspects existing infrastructure, plans the execution, offloads raw clo
 
 ### Pillar 1: Built-in Coding Agent (Deep Agent + Platform Skills)
 
-OpsCloud acts as an expert software and DevOps engineer directly in your terminal:
+- **Infrastructure as Code (IaC)**: Production-grade Terraform (HCL), OpenTofu, Terragrunt, AWS CDK (TypeScript/Python), CloudFormation, and Pulumi with state locking, modular design, and dry-run validation.
+- **Containers & Kubernetes**: Manifests (Deployments, StatefulSets, CRDs), Helm charts, Kustomize overlays, and Dockerfiles with non-root security contexts and resource boundaries.
+- **CI/CD & GitOps Automation**: GitHub Actions, GitLab CI/CD, ArgoCD ApplicationSets, and Tekton pipelines with pinned actions and secret masking.
+- **Platform Tooling**: Idempotent Bash scripts, Python platform CLI utilities (boto3, click, typer), and Makefiles.
+- **Policy & Observability**: OPA/Rego policies, Kyverno rules, Prometheus alert rules, Datadog/CloudWatch monitors, and Grafana dashboard JSON models.
 
-- **Infrastructure as Code (IaC)**: Authors and refactors production-grade Terraform (HCL), OpenTofu, Terragrunt, AWS CDK (TypeScript and Python), CloudFormation, and Pulumi. Enforces modular architecture, state locking, provider version pinning, and dry-run validation.
-- **Containers & Kubernetes**: Generates and patches Kubernetes manifests (Deployments, StatefulSets, Ingress, NetworkPolicies, CRDs), Helm charts, Kustomize overlays, Dockerfiles, and compose configurations with non-root security contexts and resource limits.
-- **CI/CD & GitOps Automation**: Builds and fixes GitHub Actions workflows, GitLab CI/CD pipelines, ArgoCD Application manifests, and Tekton pipelines with pinned actions and secret masking.
-- **Platform Tooling & Automation**: Writes robust bash scripts, Python platform utilities (boto3, click, typer), Makefiles, and operational CLI tools.
-- **Policy as Code & Observability**: Authors OPA/Rego policies, Kyverno rules, Prometheus alert specifications, Datadog/CloudWatch monitor definitions, and Grafana dashboard JSON models.
+### Pillar 2: Cloud Operations via Plugin Marketplace
 
-### Pillar 2: Cloud Operations via the Plugin Marketplace
+OpsCloud connects directly to the **TalkOps DevOps Plugin Marketplace** ([`talkops-ai/devops-plugins`](https://github.com/talkops-ai/devops-plugins)):
 
-OpsCloud connects directly to the **TalkOps DevOps Plugin Marketplace** ([`talkops-ai/devops-plugins`](https://github.com/talkops-ai/devops-plugins)). The marketplace provides three types of plugins:
-
-#### 1. Agent Plugins (Specialist Subagents)
-Self-contained autonomous subagents that the root orchestrator delegates to automatically based on task intent. Each agent includes its own system prompt, isolated memory store, and dedicated MCP tools:
-- **`aws-finops-agent`**: Audits cloud spend, identifies idle resources, checks savings plans, and writes cost-optimization diffs.
-- **`aws-sre-agent`**: Investigates CloudWatch alarms, traces distributed errors with X-Ray, analyzes logs, and pinpoints root causes.
-- **`aws-iac-engineer`**: Architects, validates, and deploys CDK, CloudFormation, and Terraform infrastructure.
-- **`aws-cloud-security-engineer`**: Audits IAM policies, inspects Security Hub/GuardDuty findings, and remediates vulnerabilities.
-- **`aws-database-engineer`**: Manages migrations, tunes queries, and provisions Aurora, DynamoDB, and RDS instances.
-- **`aws-platform-engineer`**: Manages EKS clusters, ECS services, VPC networking, and edge routing.
-
-#### 2. Vertical Plugins (Domain Skill Bundles)
-Domain packs that attach directly to the main agent to provide immediate expertise and MCP connectors without spawning a separate subagent (e.g. `aws-networking`, `aws-containers`, `aws-cost-optimization`, `aws-observability`, `aws-security-identity`).
-
-#### 3. Partner-Built Plugins
-Official vendor-maintained skills, such as HashiCorp's official Terraform skill collection.
-
-#### Managing Plugins
-
-Add the marketplace and install plugins with simple CLI commands:
+- **Agent Plugins (Specialist Subagents)**: Domain subagents with isolated memory and dedicated MCP tools:
+  - `aws-finops-agent`: Audits spend, uncovers idle infrastructure, analyzes Savings Plans.
+  - `aws-sre-agent`: Investigates CloudWatch alarms, traces distributed errors with X-Ray, isolates root causes.
+  - `aws-iac-engineer`: Architects and validates CDK, CloudFormation, and Terraform modules.
+  - `aws-cloud-security-engineer`: Audits IAM policies, inspects Security Hub/GuardDuty findings.
+  - `aws-database-engineer`: Tunes queries, provisions Aurora, DynamoDB, RDS instances.
+  - `aws-platform-engineer`: Manages EKS clusters, ECS services, VPC topologies.
+- **Vertical Plugins (Domain Skill Bundles)**: Injects skills directly into the orchestrator (`aws-networking`, `aws-containers`, `aws-cost-optimization`, `aws-observability`).
+- **Partner Plugins**: Official third-party skills (e.g., HashiCorp official Terraform skill collection).
 
 ```bash
-# Add the TalkOps marketplace
+# Manage plugins via CLI
 opscloud plugin marketplace add talkops-ai/devops-plugins
-
-# Install specialist agents
 opscloud plugin install aws-sre-agent
 opscloud plugin install aws-finops-agent
-
-# Install vertical domain skill packs
-opscloud plugin install aws-networking
-
-# List installed and available plugins
 opscloud plugin list
 ```
 
@@ -142,145 +161,101 @@ opscloud plugin list
 
 ## Dynamic Subagent Architecture
 
-OpsCloud does not rely on rigid, hardcoded subagents bundled in the binary. Instead, subagents are discovered dynamically from four sources:
+OpsCloud does not hardcode subagents into the binary. Domain subagents are discovered dynamically:
 
-1. **Agent Plugins**: Installed from the plugin marketplace, bundling domain prompts, scoped skills, and isolated MCP servers.
-2. **Project Definitions**: Placed in `.opscloud/agents/` or `.agents/` inside your Git repository.
-3. **User Definitions**: Configured in `~/.opscloud/agents/` or `~/.agents/` on your local workstation.
-4. **Async Remote Subagents**: Background agents declared in `config.toml` under `[async_subagents]`.
+1. **Agent Plugins**: Installed via the marketplace, bundling domain prompts, scoped skills, and isolated MCP servers.
+2. **Project Definitions**: Committed in `.opscloud/agents/` or `.agents/`.
+3. **User Definitions**: Stored in `~/.opscloud/agents/` or `~/.agents/`.
+4. **Async Remote Subagents**: Declared in `config.toml` under `[async_subagents]`.
 
-```
-                    ┌───────────────────────────────┐
-                    │    Root Orchestration Agent    │
-                    │   (Context, Router & State)   │
-                    └───────────────┬───────────────┘
-                                    │
-        ┌──────────────┬────────────┼────────────┬──────────────┐
-        ▼              ▼            ▼            ▼              ▼
-  ┌───────────┐  ┌───────────┐┌───────────┐┌───────────┐  ┌───────────┐
-  │  Project  │  │  Plugin   ││   User    ││   Async   │  │ Dynamic   │
-  │ Subagent  │  │ Subagent  ││ Subagent  ││  Remote   │  │ Fan-Out   │
-  └─────┬─────┘  └─────┬─────┘└─────┬─────┘└─────┬─────┘  └─────┬─────┘
-        │              │            │            │              │
-        └──────────────┴────────────┼────────────┴──────────────┘
-                                    ▼
-                      ┌───────────────────────────┐
-                      │    SubagentMemoryStore    │
-                      │ (Isolated Memory & State) │
-                      └───────────────────────────┘
-```
-
-### Key Subagent Capabilities
-- **SubagentMemoryStore**: Subagents run within an isolated memory sandbox. Heavy cloud searches, compiler logs, and lint iterations stay inside the subagent so your main conversation thread remains clean and focused.
-- **Dual-Level Context Compaction**: `CLICompactionMiddleware` runs on both the root orchestrator and individual subagents. When conversation history grows large, earlier context is summarized and offloaded to disk while keeping execution active.
-- **Live TUI Subagent Panel**: The Textual interface includes a dedicated dock showing running subagents, active tools, turn timing, and cumulative token costs.
-- **System Tool Whitelist**: Tools like `compact_conversation` and `ask_user` remain accessible to subagents regardless of tool filtering rules.
+### Key Isolation Features
+- **SubagentMemoryStore**: Heavy exploration, large CLI dumps, and lint iterations remain sandboxed inside the subagent's execution branch; only clean, structured deliverables return to the orchestrator.
+- **Dual-Level Context Compaction**: `CLICompactionMiddleware` independently compacts both orchestrator and subagent histories when context budgets approach thresholds.
+- **System Tool Whitelist**: Critical tools (`compact_conversation`, `ask_user`) remain available regardless of subagent tool filtering.
 
 ---
 
-## Safety & Human-in-the-Loop Governance
+## Approval Modes & Governance
 
-OpsCloud enforces strict human-in-the-loop controls to prevent accidental modifications to production environments.
+OpsCloud enforces human-in-the-loop safety to protect cloud environments:
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        OpsCloud Security Architecture                  │
-├────────────────────────────────────────────────────────────────────────┤
-│  User Request ──> Unicode & Shell Scanner ──> Approval Mode Evaluator  │
-│                                                │                       │
-│            ┌───────────────────┬───────────────┴────────────────┐      │
-│            ▼                   ▼                                ▼      │
-│     [Manual Mode]         [Auto Mode]                     [Smart Mode] │
-│   Prompts human for    Classic LLM classifier          TypeSafe AI Jev │
-│   every mutating tool  evaluates actions               System One gate │
-│   confirmation         via primary model               (<100ms audit)  │
-│            │                   │                                │      │
-│            └───────────────────┴───────────────┬────────────────┘      │
-│                                                ▼                       │
-│                           Headless MCP Guard (4 Security Tiers)        │
-│                           [READ_ONLY | MUTATING_SAFE | PRIVILEGED]     │
-│                                                │                       │
-│                                                ▼                       │
-│                           "Produce Diffs, Not Deployments" (IaC Gate)  │
-│                                                │                       │
-│                                                ▼                       │
-│                           Workspace & Cloud Execution                  │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### Approval Modes
-
-OpsCloud supports three approval modes:
-
-| Mode | Identifier | CLI Flag | Description |
+| Mode | Flag | Safety Engine | Best For |
 |---|---|---|---|
-| **Manual** | `manual` | Default | Prompts for confirmation before every mutating or risky action. Presents `[Approve]`, `[Reject]`, `[Edit Command]`, and `[Always Allow]` options. Safe default for production environments. |
-| **Auto** | `auto` | `-y`, `--auto-approve` | Classic classifier mode. Uses the primary LLM reasoning model to evaluate action safety. Default for non-interactive/headless executions (`-p` / `--prompt`). |
-| **Smart** | `smart` | `--smart` | Evaluates safety via the **TypeSafe AI Jev System One** classifier in <100ms. Calculates calibrated mutation probabilities and blast radius without LLM generation latency. |
+| **Manual** *(default)* | Default | Prompts human before every mutating action | Production clusters, live cloud accounts |
+| **Auto** | `-y`, `--auto-approve` | Evaluates safety via primary LLM reasoning | Non-interactive headless scripts (`-p`) |
+| **Smart** | `--smart` | **TypeSafe AI Jev System One** (<100ms classifier) | Interactive developer workflows with sub-second gating |
 
-Cycle approval modes at runtime inside the interactive TUI using **`Shift+Tab`**:
-
+Toggle modes dynamically at runtime inside the TUI with **`Shift+Tab`**:
 ```text
 Manual ──> Auto ──> Smart ──> Manual
 ```
 
-### Multi-Layer Security Checks
-- **Shell AST Scanner**: Parses shell commands prior to execution to detect dangerous patterns and enforce allowlists (`-S recommended`, `-S all`, or custom CSV).
-- **Unicode Security Scanner**: Screens input and source files for Trojan Source attacks, bidirectional text overrides, and homoglyphs.
-- **SSRF Guard**: Blocks outbound requests to cloud metadata endpoints (`169.254.169.254`), localhost, and private RFC-1918 subnets.
-- **Headless MCP Guard**: Categorizes MCP tools into security tiers (`READ_ONLY`, `MUTATING_SAFE`, `MUTATING_DESTRUCTIVE`, `PRIVILEGED`) to enforce minimum privilege during unattended execution.
+### Defense-in-Depth Scanners
+- **Shell AST Scanner**: Validates shell commands against allowlists (`-S recommended`, `-S all`, or CSV).
+- **Unicode Security Scanner**: Detects Trojan Source, bidirectional text overrides, and homoglyphs.
+- **SSRF Guard**: Blocks outbound calls to cloud metadata (`169.254.169.254`) and private RFC-1918 subnets.
+- **Headless MCP Guard**: Categorizes MCP tools into 4 tiers (`READ_ONLY`, `MUTATING_SAFE`, `MUTATING_DESTRUCTIVE`, `PRIVILEGED`).
 
 ---
 
 ## Jev System One: Fast Classification & Routing
 
-OpsCloud integrates TypeSafe AI Jev System One as an ultra-fast semantic classification and routing layer across three core functions:
+OpsCloud deeply integrates TypeSafe AI Jev System One:
 
-### 1. Smart Approval Mode (<100ms Safety Gate)
-In Smart mode, `JevSecurityClassifier` evaluates proposed tool calls before execution. Rather than waiting for a multi-second LLM inference call, Jev scores:
-- `mutating_probability`: Likelihood that the command will alter files, cloud state, or infrastructure.
-- `blast_radius`: Extent of affected infrastructure (single resource vs. cluster/vpc-wide).
-- `risk_level`: Calibrated tier (0 = Safe, 1 = Controlled/Reversible, 2 = Critical).
-- `requires_human_interrupt`: Deterministic decision whether to pause for operator approval.
-
-### 2. Dynamic Model Router Middleware (<70ms)
-When running in Smart mode, `JevDynamicModelRouterMiddleware` evaluates incoming prompt complexity in under 70ms and dynamically selects the optimal model tier:
-- **Fast Tier**: Read-only inspections, syntax linting, git status, and straightforward file edits.
-- **Standard Tier**: General DevOps coding, manifest authoring, and Terraform module creation.
-- **Powerful Tier**: Multi-file refactoring, distributed architecture changes, and deep incident root-cause analysis.
-
-### 3. Jev Rubric Evaluation & Compiler
-The rubric evaluation framework (`JevHybridRubricGrader` and `JevCriteriaCompiler`) provides a two-tier verification mechanism:
-- **Tier 1 (Jev System One Fast-Pass)**: Evaluates acceptance criteria against task evidence in parallel in under 200ms.
-- **Tier 2 (Frontier LLM Fallback)**: If criteria fail, invokes a frontier model specifically to diagnose remediation steps and feed them back to the working agent.
+1. **Smart Approval Gate (<100ms)**: Scores `mutating_probability`, `blast_radius`, and `risk_level` (0=Safe, 1=Controlled, 2=Critical) to emit sub-second interrupt verdicts.
+2. **Dynamic Model Router (<70ms)**: Classifies prompt complexity in <70ms and routes to the optimal pool tier:
+   - **Fast Tier** (Haiku / Flash / GPT-4o-mini): File reads, linting, git status.
+   - **Standard Tier** (Sonnet / GPT-4o): General coding, Kubernetes manifests, Terraform modules.
+   - **Powerful Tier** (Claude 3.7 Thinking / o1 / DeepSeek R1): Multi-file refactoring, distributed architecture, incident root cause.
+3. **Hybrid Rubric Grader**:
+   - **Tier 1 (Jev System One Fast-Pass)**: Evaluates acceptance criteria against task evidence in parallel in <200ms.
+   - **Tier 2 (Frontier LLM Fallback)**: Diagnoses failed criteria and generates remediation advice for the worker agent.
 
 ---
 
-## CI/CD Rubric Grading Loop
+## Configuration & Credential Resolution
 
-For automated verification in CI/CD pipelines, OpsCloud supports closed-loop rubric grading:
+### Configuration Precedence Order
+1. CLI Flags (`-M`, `--smart`, `-S`)
+2. `OPSCLOUD_*` prefixed environment variables
+3. Standard environment variables (`OPENAI_API_KEY`, `AWS_REGION`)
+4. Project-level `.opscloud/config.toml`
+5. User-level `~/.opscloud/config.toml`
+6. Built-in defaults
+
+### Credential Loading Order
+1. `OPSCLOUD_{KEY}` shell environment variable
+2. Standard environment variable (`ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY`, etc.)
+3. Nearest project `.env` (walked up from current working directory)
+4. User global `~/.opscloud/.env` (saved with `0600` permissions via `/auth`)
+5. Cloud native provider chain (AWS IAM/SSO/boto3 session, GCP ADC, Azure Managed Identity)
+
+---
+
+## CI/CD Rubric Closed-Loop Verification
+
+Enforce quality gates in CI/CD pipelines with automated rubric grading:
 
 ```bash
 opscloud -p "Create an AWS EKS Cluster Autoscaler Helm values configuration" \
-  --rubric "1. AWS IAM role ARN is referenced via serviceAccount annotation.
+  --rubric "1. AWS IAM role ARN referenced in serviceAccount annotations.
 2. Balance-similar-node-groups flag is enabled.
-3. Expander strategy is set to least-waste.
+3. Expander strategy set to least-waste.
 4. Scale-down-utilization-threshold is configured.
-5. Resource requests and limits are explicitly defined." \
-  --rubric-model "anthropic:claude-3-5-sonnet-20241022" \
+5. Resource requests and limits explicitly defined." \
+  --rubric-model "anthropic:claude-3-5-sonnet-latest" \
   --rubric-max-iterations 3 \
   --smart
 ```
 
-```
+```text
 ┌────────────────────────────────────────────────────────┐
 │                   Rubric Evaluation Loop               │
 ├────────────────────────────────────────────────────────┤
-│ 1. Worker Agent creates code/manifests in workspace    │
+│ 1. Worker Agent drafts code/manifests in workspace     │
 │ 2. Grader evaluates work tree against rubric criteria  │
 │ 3. If PASS ──> Exit 0, emit JSON verification report   │
-│ 4. If FAIL ──> Grader injects actionable remediation   │
-│    deficiency report into Worker Agent context         │
+│ 4. If FAIL ──> Grader feeds back remediation guidance   │
 │ 5. Worker iterates on fixes and re-submits to Grader   │
 │ 6. Repeats until PASS or max iterations reached        │
 └────────────────────────────────────────────────────────┘
@@ -290,37 +265,14 @@ opscloud -p "Create an AWS EKS Cluster Autoscaler Helm values configuration" \
 
 ## Remote Cloud Sandboxes
 
-For isolating untrusted workloads or heavy builds, OpsCloud supports execution within ephemeral cloud sandboxes via `--sandbox`:
+Run heavy or untrusted workloads in isolated cloud containers via `--sandbox`:
 
 ```bash
+# Launch inside an ephemeral cloud sandbox
 opscloud --sandbox modal "Compile and test the cross-platform platform binary"
 ```
 
-Supported sandbox providers include Modal, Daytona, LangSmith, Runloop, AgentCore, and local Docker containers. Workspace files synchronize bi-directionally, returning diffs and build artifacts upon completion.
-
----
-
-## Documentation
-
-Comprehensive documentation is available in [`docs/opscloud-docs/`](docs/opscloud-docs/):
-
-| Guide | Description |
-|---|---|
-| **[Overview](docs/opscloud-docs/overview.md)** | Core capabilities, execution engines, architecture, and environment configuration |
-| **[Quickstart](docs/opscloud-docs/quickstart.md)** | Step-by-step setup, interactive TUI controls, credential setup, and first steps |
-| **[CLI Reference](docs/opscloud-docs/cli-reference.md)** | Command-line options, subcommands, flags, and slash commands |
-| **[Configuration](docs/opscloud-docs/Configuration.md)** | Configuration hierarchy, directory layouts, and runtime environment options |
-| **[config.toml Reference](docs/opscloud-docs/config.toml.md)** | Full configuration specification: model pools, UI, permissions, and compaction |
-| **[Provider Credentials](docs/opscloud-docs/credentials.md)** | Credential setup for 22+ providers via `/auth` and environment variables |
-| **[Approval Modes & Security](docs/opscloud-docs/approval-mode.md)** | Manual, Auto, and Smart modes, Jev System One classifier, and AST scanners |
-| **[Subagents](docs/opscloud-docs/subagents.md)** | Dynamic subagent discovery, isolated memory stores, and context compaction |
-| **[Memory & Skills](docs/opscloud-docs/memory-and-skills.md)** | Workspace memory persistence, skill hierarchy, and convention learning |
-| **[MCP Tools](docs/opscloud-docs/mcp-tools.md)** | Model Context Protocol configuration, security tiers, and TUI inspector |
-| **[Plugins & Marketplaces](docs/opscloud-docs/plugins.md)** | Community and private enterprise plugin architecture and discovery |
-| **[Lifecycle Hooks](docs/opscloud-docs/hooks.md)** | Deterministic pre/post-tool execution scripts via `hooks.json` |
-| **[Model Providers & Router](docs/opscloud-docs/model-providers.md)** | Model providers, Jev dynamic model routing (<70ms), and reasoning effort |
-| **[Goals & Rubrics](docs/opscloud-docs/goal-and-rubrics.md)** | Interactive goal tracking and autonomous CI/CD rubric grading loops |
-| **[Remote Sandboxes](docs/opscloud-docs/remote-sandboxes.md)** | Cloud sandbox execution with Modal, Daytona, and Docker |
+Supported providers: **Modal**, **Daytona**, **LangSmith**, **AgentCore**, **Runloop**, **Vercel**, and **Docker**. Workspace files synchronize bi-directionally, excluding build caches (`.git`, `.venv`, `.terraform`, `node_modules`).
 
 ---
 
@@ -335,10 +287,9 @@ opscloud auth list | set <provider> | remove <provider>
 opscloud config show | list | get <key> | set <key> <value>
 opscloud pool show | set <tier> <model> | reset
 opscloud plugin list | install <id> | uninstall <id> | marketplace add <url>
-opscloud skills list | info <name> | find <query> | create <name>
-opscloud mcp list | tools | test <server>
+opscloud skills list | info <name> | find <query>
+opscloud mcp list | tools
 opscloud threads list | delete <id>
-opscloud agents list | reset --agent <name>
 opscloud doctor
 
 # Key Flags
@@ -353,11 +304,35 @@ opscloud doctor
 -S, --shell-allow-list LIST      # Shell allowlist (recommended, all, or custom CSV)
 --effort LEVEL                   # Reasoning effort (off, low, medium, high)
 --goal TEXT                      # Interactive goal with acceptance criteria
---rubric TEXT|@PATH              # Autonomous rubric grading loop
+--rubric TEXT|@PATH              # Automated rubric grading loop
 --rubric-model MODEL             # Grader model for rubric evaluation
 --rubric-max-iterations N        # Max grading iterations
 --sandbox [TYPE]                 # Ephemeral cloud sandbox provider
 ```
+
+---
+
+## Documentation Hub
+
+Complete technical documentation is available in [`docs/opscloud-docs/`](docs/opscloud-docs/):
+
+| Guide | Description |
+|---|---|
+| **[Overview](docs/opscloud-docs/overview.md)** | Core capabilities, dual-engine architecture, and environment configuration |
+| **[Quickstart](docs/opscloud-docs/quickstart.md)** | Step-by-step setup, TUI controls, slash commands, and first steps |
+| **[CLI Reference](docs/opscloud-docs/cli-reference.md)** | Complete CLI flags, subcommands, and non-interactive scripting options |
+| **[Configuration](docs/opscloud-docs/Configuration.md)** | Configuration precedence, directory layouts, and runtime environment options |
+| **[config.toml Reference](docs/opscloud-docs/config.toml.md)** | Full specification for model pools, UI, permissions, and compaction |
+| **[Provider Credentials](docs/opscloud-docs/credentials.md)** | Credential setup for 22+ providers via `/auth` and environment variables |
+| **[Approval Modes & Security](docs/opscloud-docs/approval-mode.md)** | Manual, Auto, Smart modes, Jev System One classifier, and AST scanners |
+| **[Subagents](docs/opscloud-docs/subagents.md)** | Dynamic subagent discovery, isolated memory stores, and context compaction |
+| **[Plugins & Marketplaces](docs/opscloud-docs/plugins.md)** | Community and private enterprise plugin architecture and discovery |
+| **[Model Providers & Router](docs/opscloud-docs/model-providers.md)** | 22+ model providers, Jev dynamic routing (<70ms), and reasoning effort |
+| **[Remote Sandboxes](docs/opscloud-docs/remote-sandboxes.md)** | Cloud sandbox execution with Modal, Daytona, LangSmith, and Docker |
+| **[Goals & Rubrics](docs/opscloud-docs/goal-and-rubrics.md)** | Interactive goal tracking and automated CI/CD rubric grading loops |
+| **[Lifecycle Hooks](docs/opscloud-docs/hooks.md)** | Deterministic pre/post-tool execution scripts via `hooks.json` |
+| **[MCP Tools](docs/opscloud-docs/mcp-tools.md)** | Model Context Protocol setup, security tiers, and TUI inspector |
+| **[Memory & Skills](docs/opscloud-docs/memory-and-skills.md)** | Workspace memory persistence, skill hierarchy, and convention learning |
 
 ---
 

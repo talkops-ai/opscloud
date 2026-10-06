@@ -1,10 +1,12 @@
-# Provider credentials
+# Provider Credentials
 
-> Set up API keys for model providers, web search, and tracing
+> Set up API keys for model providers, TypeSafe Jev routing, web search, and tracing
 
-OpsCloud needs credentials for each model provider you wish to use. The easiest way is the interactive `/auth` credential manager inside a session. For automated CI/CD and scripts, set environment variables instead.
+OpsCloud needs credentials for each model provider you wish to use. The easiest method is the interactive `/auth` credential manager inside a session. For automated CI/CD and scripts, export environment variables in your shell or CI configuration.
 
-## Use `/auth` (recommended)
+---
+
+## Use `/auth` (Recommended)
 
 Open the credential manager from any interactive TUI session:
 
@@ -12,29 +14,30 @@ Open the credential manager from any interactive TUI session:
 /auth
 ```
 
-The credential manager displays all available providers and whether credentials are configured. Select a provider to add or update its key. Keys are saved to `~/.opscloud/.env` with strict `0600` read/write permissions and persist across sessions.
-
-Each row displays the provider name with an informative status label:
+The credential manager displays all available providers and their current status:
 
 | Label | Meaning |
 |---|---|
-| `[stored]` | Key saved securely in `~/.opscloud/.env` |
-| `[env: VARNAME]` | Key currently loaded from a shell environment variable |
+| `[stored]` | Key saved with `0600` permissions in `~/.opscloud/.env` |
+| `[env: VARNAME]` | Key loaded from active shell environment variable |
 | `[missing]` | No key detected — select the row to input credentials |
 
-You can also specify a custom **base URL** for private API gateways, enterprise proxies, or VPC endpoints. Leave it blank to use the provider's default endpoint.
+Select a provider to enter your API key. Keys are written to `~/.opscloud/.env` with strict `0600` user-only permissions and persist across sessions.
+
+You can also specify a custom **base URL** for private API gateways, enterprise proxies, or VPC endpoints. Leave it blank to use the provider's standard endpoint.
 
 ---
 
-## Supported providers
+## Supported Providers & Credentials
 
 OpsCloud supports 22+ providers out of the box:
 
 | Provider | API Key Variable | Base URL Variable | Highlights |
 |---|---|---|---|
-| **Anthropic** | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | Claude 3.5/3.7, Extended Thinking, Vision |
-| **OpenAI** | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | GPT-4o, o1, o3-mini Reasoning |
-| **Google GenAI** | `GOOGLE_API_KEY` | `GOOGLE_GEMINI_BASE_URL` | Gemini 2.0 / 2.5 Flash & Pro, Flash Thinking |
+| **Anthropic** | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | Claude 3.5 Sonnet, Claude 3.7 Sonnet Thinking, Vision |
+| **OpenAI** | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | GPT-4o, GPT-4o-mini, o1, o3-mini Reasoning |
+| **TypeSafe AI (Jev)** | `TYPESAFE_API_KEY` / `JEV_API_KEY` | — | Jev System One router (<70ms), safety gate (<100ms), rubric grader |
+| **Google GenAI** | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `GOOGLE_GEMINI_BASE_URL` | Gemini 2.0 / 2.5 Flash & Pro, Flash Thinking |
 | **Google Vertex AI** | `GOOGLE_CLOUD_PROJECT` | ADC | Workload Identity / ADC enterprise endpoints |
 | **AWS Bedrock** | `AWS_PROFILE` / IAM | `AWS_REGION` | Native IAM role and Bedrock model support |
 | **Azure OpenAI** | `AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_ENDPOINT` | Azure enterprise private deployments |
@@ -46,90 +49,76 @@ OpsCloud supports 22+ providers out of the box:
 | **Mistral AI** | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` | Mistral Large, Codestral, Pixtral |
 | **NVIDIA NIM** | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` | Accelerated NIM enterprise endpoints |
 | **Perplexity** | `PPLX_API_KEY` | `PERPLEXITY_BASE_URL` | Search-augmented Sonar models |
-| **Cohere** | `COHERE_API_KEY` | `CO_API_URL` | Command R / R+ |
+| **Cohere** | `COHERE_API_KEY` | `CO_API_URL` | Command R / R+ enterprise models |
 | **IBM watsonx** | `WATSONX_APIKEY` | `WATSONX_URL` | Enterprise Granite and Llama |
 | **HuggingFace** | `HUGGINGFACEHUB_API_TOKEN` | `HF_INFERENCE_ENDPOINT` | Dedicated Inference Endpoints |
 | **LiteLLM** | `LITELLM_API_KEY` | `LITELLM_BASE_URL` | Unified proxy for internal corporate gateways |
 | **xAI** | `XAI_API_KEY` | `XAI_API_BASE` | Grok 2 / Grok 3 |
 | **Baseten** | `BASETEN_API_KEY` | `BASETEN_BASE_URL` | Custom deployed container models |
-| **Ollama** | *(optional)* `OLLAMA_API_KEY` | `http://localhost:11434` | Fully local offline execution |
+| **Ollama** | *(optional)* `OLLAMA_API_KEY` | `http://localhost:11434` | Fully local offline execution (no key required) |
 
-**Authentication notes:**
-- **AWS Bedrock** authenticates using your active AWS environment (`AWS_PROFILE`, `AWS_REGION`, or ECS/EKS IAM task roles).
-- **Google Vertex AI** uses Google Cloud Application Default Credentials (ADC) — no API key needed, just configure `GOOGLE_CLOUD_PROJECT`.
-- **Ollama** runs locally on your workstation and does not require an API key.
-
----
-
-## Key resolution order
-
-When multiple sources define the same provider key, OpsCloud resolves them in the following order:
-
-1. **`OPSCLOUD_{KEY}`** — Prefixed environment variable (e.g. `OPSCLOUD_OPENAI_API_KEY`) — always wins
-2. **Standard environment variable** — e.g. `OPENAI_API_KEY`
-3. **`~/.opscloud/.env`** — Global user dotenv file
-4. **`/auth` stored credential** — Saved through the interactive manager
-
-The `OPSCLOUD_` prefix allows you to override any key from your shell without modifying files.
+### Auxiliary Tools
+- **Web Search**: [Tavily](https://tavily.com) API key via `TAVILY_API_KEY` or `/auth`.
+- **Tracing**: [LangSmith](https://smith.langchain.com) via `LANGSMITH_API_KEY` or `/auth`.
 
 ---
 
-## Manage credentials from the command line
+## How Credentials Are Picked Up (Resolution Hierarchy)
 
-Use `opscloud auth` for scripted workflows:
+OpsCloud discovers and resolves credentials in a deterministic 5-step fallback chain:
+
+```text
+┌────────────────────────────────────────────────────────┐
+│ 1. OPSCLOUD_{KEY} Shell Variable (e.g. OPSCLOUD_OPENAI_API_KEY)
+├────────────────────────────────────────────────────────┤
+│ 2. Standard Shell Variable (e.g. OPENAI_API_KEY, TYPESAFE_API_KEY)
+├────────────────────────────────────────────────────────┤
+│ 3. Project .env File (walked up from CWD to repo root) │
+├────────────────────────────────────────────────────────┤
+│ 4. User Global ~/.opscloud/.env (saved via /auth)       │
+├────────────────────────────────────────────────────────┤
+│ 5. Cloud Native Provider Chain (AWS IAM, GCP ADC, etc.)│
+└────────────────────────────────────────────────────────┘
+```
+
+1. **`OPSCLOUD_{KEY}`**: Overrides everything without modifying local files or shell profiles.
+2. **Standard Environment Variables**: Standard names recognized across SDKs (`ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY`).
+3. **Project `.env`**: Loaded from the working directory walking up to the Git repository root. Blocked system variables (`PATH`, `SHELL`, `PYTHONPATH`) cannot be overwritten.
+4. **User Global `.env` (`~/.opscloud/.env`)**: Persisted credential store written by `/auth`.
+5. **Cloud Native Provider Chains**:
+   - **AWS Bedrock**: Uses standard AWS SDK resolution: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `~/.aws/credentials`, `~/.aws/config`, ECS/EKS IAM task roles, or EC2 instance metadata.
+   - **Google Vertex AI**: Uses Google Cloud Application Default Credentials (ADC) or `GOOGLE_APPLICATION_CREDENTIALS` service account files.
+   - **Azure OpenAI**: Uses `AZURE_OPENAI_API_KEY` or Azure CLI token / Managed Identity.
+
+---
+
+## Manage Credentials via CLI
+
+Manage keys scriptably using `opscloud auth`:
 
 ```bash
-# List configured credentials and sources
+# List configured credentials and their active sources
 opscloud auth list
 
-# Set a credential
+# Set a credential interactively
 opscloud auth set openai
+opscloud auth set typesafe
 
-# Remove a stored credential
+# Remove a stored credential from ~/.opscloud/.env
 opscloud auth remove openai
 ```
 
 ---
 
-## Environment variables for CI/CD
+## Headless CI/CD Pipelines
 
-For headless CI/CD pipelines, export credentials directly:
-
-```bash
-export OPENAI_API_KEY="sk-..."
-opscloud -n "Validate the Terraform modules" --quiet -y
-```
-
-Or maintain a `~/.opscloud/.env` file:
-
-```env
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-TAVILY_API_KEY=tvly-...
-LANGSMITH_API_KEY=ls-...
-```
-
-OpsCloud strictly blocks sensitive system environment variables (`PATH`, `HOME`, `PYTHONPATH`, `SHELL`, `TMPDIR`) from being modified via `.env` files to prevent environment hijacking.
-
----
-
-## Web search credentials
-
-OpsCloud uses [Tavily](https://tavily.com) for real-time web searches (querying CVEs, official cloud documentation, and library releases). Configure via `/auth` or:
+For headless automation or CI/CD runners, export variables directly in your pipeline environment:
 
 ```bash
-export TAVILY_API_KEY="tvly-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+export TYPESAFE_API_KEY="jev-..."
+export AWS_REGION="us-east-1"
+
+# Run unattended with Auto approval mode
+opscloud -p "Validate Terraform syntax and plan in staging" --quiet -y
 ```
-
----
-
-## LangSmith tracing credentials
-
-Enable execution tracing and subagent debugging via `/auth` or:
-
-```bash
-export LANGSMITH_API_KEY="ls-..."
-export LANGSMITH_PROJECT="opscloud-production"  # optional, defaults to "opscloud"
-```
-
-Tracing initializes automatically on launch when a LangSmith API key is present.

@@ -29,7 +29,7 @@ Inside the interactive TUI, type:
 /auth
 ```
 
-Select your provider (Anthropic, OpenAI, Google, AWS Bedrock, etc.) and enter your API key. Keys are encrypted and saved to `~/.opscloud/.env`. See [Credentials](./credentials.md) for alternative setup methods.
+Select your provider (Anthropic, OpenAI, Google, AWS Bedrock, TypeSafe Jev, etc.) and enter your API key. Keys are saved to `~/.opscloud/.env` with strict `0600` permissions. See [Credentials](./credentials.md) for alternative setup methods.
 
 > [!TIP]
 > For web search capabilities, OpsCloud uses [Tavily](https://tavily.com). Add your key via `/auth` or export `TAVILY_API_KEY="tvly-..."`.
@@ -122,10 +122,10 @@ Or switch dynamically inside the TUI with `/agents`. See [Subagents](./subagents
 
 ## Non-interactive / headless mode
 
-Run single tasks headlessly from terminal scripts or CI/CD pipelines using `-n`:
+Run single tasks headlessly from terminal scripts or CI/CD pipelines using `-p` (or `-n`):
 
 ```bash
-opscloud -n "Audit and validate all Terraform modules in this repository"
+opscloud -p "Audit and validate all Terraform modules in this repository"
 ```
 
 ### Pipe input
@@ -133,8 +133,8 @@ opscloud -n "Audit and validate all Terraform modules in this repository"
 Pipe logs, error traces, or manifests directly into OpsCloud:
 
 ```bash
-cat pod-spec.yaml | opscloud -n "Review this pod spec for Pod Security Standard violations"
-git diff | opscloud -n "Generate conventional commit message and release notes"
+cat pod-spec.yaml | opscloud -p "Review this pod spec for Pod Security Standard violations"
+git diff | opscloud -p "Generate conventional commit message and release notes"
 ```
 
 ### Output control flags

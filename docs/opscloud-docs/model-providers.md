@@ -1,12 +1,12 @@
-# Model providers & reasoning router
+# Model Providers & Reasoning Router
 
 > 22+ supported LLM providers, Jev dynamic model routing (<70ms), and unified reasoning effort
 
-OpsCloud is engineered for multi-model flexibility. It supports 22+ LLM providers, features the ultra-low latency **Jev TypeSafe Dynamic Model Router (<70ms)**, provides unified reasoning effort controls across models, and runs fully offline with Ollama.
+OpsCloud is engineered for multi-model flexibility. It supports 22+ LLM providers, features the ultra-low latency **TypeSafe AI Jev Dynamic Model Router (<70ms)**, provides unified reasoning effort controls across models, and runs fully offline with Ollama.
 
 ---
 
-## Model format
+## Model Format
 
 Models are specified using the canonical `provider:model-name` format:
 
@@ -15,6 +15,7 @@ anthropic:claude-3-7-sonnet-20250219
 openai:gpt-4o
 google_genai:gemini-2.5-pro
 deepseek:deepseek-reasoner
+bedrock:anthropic.claude-3-5-sonnet-20241022-v2:0
 ollama:llama3.3
 ```
 
@@ -23,16 +24,17 @@ Set the model via:
 - **Persistent default:** `opscloud --default-model openai:gpt-4o`
 - **Interactive session:** Type `/model` to open the picker, or `/model <specifier>`
 - **Configuration file:** Set `[model].default` in `~/.opscloud/config.toml`
-- **Subagent override:** Specify `model: provider:model-name` in the subagent's `AGENTS.md` frontmatter
+- **Subagent override:** Specify `model: provider:model-name` in the subagent's frontmatter
 
 ---
 
-## Supported providers
+## Supported Providers
 
 | Provider | Identifier | Required Auth | Highlights |
 |---|---|---|---|
 | **Anthropic** | `anthropic` | `ANTHROPIC_API_KEY` | Claude 3.5 Sonnet, Claude 3.7 Sonnet Thinking, Vision |
 | **OpenAI** | `openai` | `OPENAI_API_KEY` | GPT-4o, GPT-4o-mini, o1, o3-mini Reasoning |
+| **TypeSafe AI (Jev)** | `typesafe` / `dynamic` | `TYPESAFE_API_KEY` | Dynamic model router (<70ms), System One safety gate (<100ms) |
 | **Google GenAI** | `google_genai` | `GOOGLE_API_KEY` | Gemini 2.0 / 2.5 Flash & Pro, Flash Thinking |
 | **Google Vertex AI** | `google_vertexai`| ADC (`GOOGLE_CLOUD_PROJECT`) | Enterprise Google Cloud endpoints with IAM auth |
 | **AWS Bedrock** | `bedrock` | `AWS_PROFILE` / IAM | Anthropic Claude & Amazon Nova via AWS IAM credentials |
@@ -57,23 +59,28 @@ Set the model via:
 
 ## Jev TypeSafe Dynamic Model Router (<70ms)
 
-OpsCloud includes the **Jev TypeSafe Dynamic Model Router**, which classifies incoming user prompts and workspace context in under 70ms and routes them to the most cost-effective tier:
+When running in Smart mode, OpsCloud utilizes the **Jev TypeSafe Dynamic Model Router**. It classifies incoming prompts and operational context in under 70ms and routes them to the optimal model tier:
 
-- **Fast Tier**: Lightweight models for file reads, directory navigation, git status, and quick fixes.
-- **Standard Tier**: Highly capable models for standard coding, test writing, and Terraform/Kubernetes manifest authoring.
-- **Powerful Tier**: State-of-the-art models for architectural refactoring, complex cross-file bugs, and deep incident root-cause analysis.
+- **Fast Tier** (e.g. Claude Haiku, GPT-4o-mini, Gemini Flash): Read-only inspections, syntax linting, git status checks, and simple file edits.
+- **Standard Tier** (e.g. Claude Sonnet, GPT-4o, Gemini Pro): General DevOps coding, Kubernetes manifests, and Terraform module creation.
+- **Powerful Tier** (e.g. Claude 3.7 Thinking, OpenAI o1/o3, DeepSeek R1): Multi-file architectural refactoring, distributed system changes, and deep incident root-cause analysis.
 
-### Managing router pools
-
-Inspect or configure pools via the CLI:
+### Manage Router Pools via CLI
 
 ```bash
+# View active pool tiers and assigned models
 opscloud pool show
+
+# Override a specific tier
 opscloud pool set fast anthropic:claude-3-5-haiku-latest
+opscloud pool set standard anthropic:claude-3-5-sonnet-latest
+opscloud pool set powerful anthropic:claude-3-7-sonnet-20250219
+
+# Reset to provider defaults
 opscloud pool reset
 ```
 
-Or configure pools in `~/.opscloud/config.toml`:
+### Configure Pools in `config.toml`
 
 ```toml
 [agent_pool]
@@ -86,51 +93,26 @@ standard_effort = "low"
 powerful_effort = "high"
 ```
 
-Inside an interactive session, use `/pool` to switch tiers, or toggle `/fast` for rapid turnaround.
+Inside an interactive session, use `/pool` to switch tiers, or toggle `/fast` for rapid execution.
 
 ---
 
-## Unified reasoning effort controls
+## Unified Reasoning Effort Controls
 
 OpsCloud provides a unified reasoning abstraction across providers that support extended thinking (Claude 3.7 Sonnet Thinking, OpenAI o1/o3-mini, Gemini 2.0 Flash Thinking, DeepSeek R1).
 
 Control reasoning effort interactively:
 
 ```text
-/effort off
-/effort low
-/effort medium
-/effort high
+/effort off       # Standard execution (no extended thinking)
+/effort low       # Fast reasoning for straightforward operational tasks
+/effort medium    # Balanced thinking for multi-step DevOps workflows
+/effort high      # Deep reasoning for distributed architecture and subtle debugging
 ```
 
-Or configure the default in `~/.opscloud/config.toml`:
+Or set the default in `~/.opscloud/config.toml`:
 
 ```toml
 [model]
 reasoning_effort = "medium"
-```
-
-In the TUI, reasoning tokens stream live into a collapsible thinking panel, allowing you to inspect the model's intermediate logic before final code generation.
-
----
-
-## Local execution with Ollama
-
-Run OpsCloud completely offline on your workstation:
-
-```bash
-# Pull your desired model
-ollama pull llama3.3
-
-# Launch OpsCloud pointing to Ollama
-opscloud -M ollama:llama3.3
-```
-
-In `~/.opscloud/config.toml`:
-
-```toml
-[providers.ollama]
-enabled = true
-base_url = "http://localhost:11434"
-models = ["llama3.3", "qwen2.5-coder:32b"]
 ```

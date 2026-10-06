@@ -189,10 +189,11 @@ These files are machine-managed. Do not edit them manually.
 | Setting type | Resolution order (first wins) |
 |---|---|
 | **General options** | CLI flag → `OPSCLOUD_*` env → `config.toml` (project > user) → default |
-| **Provider API keys** | `OPSCLOUD_{KEY}` env → canonical env → `~/.opscloud/.env` → `/auth` stored |
+| **Provider API keys** | `OPSCLOUD_{KEY}` env → canonical env → Project `.env` → `~/.opscloud/.env` → Cloud IAM/ADC |
 | **Provider base URLs** | Stored base URL → env var → `config.toml` → default endpoint |
 | **Skills** | Project `.opscloud/skills/` → User `~/.opscloud/skills/` → Plugins → Built-in |
 | **Memory** | Project `.opscloud/memory/` → User `~/.opscloud/memory/` |
-| **Subagents** | Project `.opscloud/agents/` → User `~/.opscloud/agents/` → Built-in subagents |
+| **Subagents** | Project `.opscloud/agents/` → User `~/.opscloud/agents/` → Agent Plugins → Async Remote |
 | **MCP servers** | `--mcp-config` → Project `.mcp.json` → Global `~/.opscloud/.mcp.json` |
 | **Hooks** | Project `.opscloud/hooks.json` + Global `~/.opscloud/hooks.json` (merged) |
+

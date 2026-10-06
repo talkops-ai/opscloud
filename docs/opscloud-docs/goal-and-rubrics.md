@@ -1,19 +1,19 @@
-# Goals and rubrics
+# Goals and Rubrics
 
-> Set goals interactively or grade work automatically in CI/CD
+> Set goals interactively or grade work automatically in CI/CD pipelines
 
-OpsCloud provides two mechanisms to enforce quality and track progress:
+OpsCloud provides two complementary mechanisms to enforce quality and track progress:
 
 - **Goals** — For interactive collaborative sessions. OpsCloud breaks high-level objectives into verifiable acceptance criteria and tracks them in real-time in the TUI.
 - **Rubrics** — For automated CI/CD pipelines. A dedicated grader model evaluates the agent's deliverables against your specification and loops on fixes until all criteria pass.
 
 ---
 
-## Goals (interactive mode)
+## Goals (Interactive Mode)
 
-Goals work best in interactive sessions when working alongside OpsCloud on multi-step tasks.
+Goals work best in interactive sessions when collaborating with OpsCloud on multi-step operational tasks.
 
-### Set a goal
+### Set a Goal
 
 At launch:
 
@@ -27,7 +27,7 @@ Or inside an active session:
 /goal Implement AWS KMS state encryption and cross-account IAM roles for OpenTofu
 ```
 
-### How goals work
+### How Goals Work
 
 1. OpsCloud inspects your workspace and generates an interactive checklist of acceptance criteria.
 2. The TUI goal widget tracks criteria status live: `[pending]`, `[passed]`, `[failed]`.
@@ -35,14 +35,14 @@ Or inside an active session:
 
 ---
 
-## Rubrics (autonomous CI/CD mode)
+## Rubrics (Automated CI/CD Mode)
 
-Rubrics provide autonomous quality assurance for non-interactive (`-n`) and CI/CD workflows. The working agent generates code and manifests, a dedicated grader model evaluates the work tree against the rubric, and if any criteria fail, the grader feeds a specific deficiency report back to the agent for self-correction.
+Rubrics provide automated quality assurance for non-interactive (`-p` / `-n`) and CI/CD workflows. The working agent generates code and manifests, a dedicated grader evaluates the work tree against the rubric, and if any criteria fail, the grader feeds an actionable deficiency report back to the agent for self-correction.
 
-### Specify an inline rubric
+### Specify an Inline Rubric
 
 ```bash
-opscloud -n "Author a Terraform module for an AWS RDS Aurora Postgres cluster" \
+opscloud -p "Author a Terraform module for an AWS RDS Aurora Postgres cluster" \
   --rubric "1. Multi-AZ deployment is enabled.
 2. Storage is encrypted with AWS KMS customer-managed key.
 3. Automated backups are retained for 14 days.
@@ -53,12 +53,12 @@ opscloud -n "Author a Terraform module for an AWS RDS Aurora Postgres cluster" \
   -y
 ```
 
-### Load rubrics from a specification file
+### Load Rubrics from a Specification File
 
-For complex architectural standards, load criteria from a markdown file using `@path`:
+For complex architectural standards, load criteria from a file using `@path`:
 
 ```bash
-opscloud -n "Refactor VPC networking" --rubric @specs/vpc-rubric.md -y
+opscloud -p "Refactor VPC networking" --rubric @specs/vpc-rubric.md -y
 ```
 
 **`specs/vpc-rubric.md`:**
@@ -76,13 +76,13 @@ opscloud -n "Refactor VPC networking" --rubric @specs/vpc-rubric.md -y
 
 ## The Grader Evaluation Cycle
 
-```
+```text
 ┌────────────────────────────────────────────────────────┐
 │                   Rubric Evaluation Loop               │
 ├────────────────────────────────────────────────────────┤
 │ 1. Worker Agent creates code/manifests in workspace    │
-│ 2. Grader Model evaluates work tree against rubric     │
-│ 3. If PASS ──> Return 0, emit JSON report & exit       │
+│ 2. Grader evaluates work tree against rubric criteria  │
+│ 3. If PASS ──> Exit 0, emit JSON report & continue     │
 │ 4. If FAIL ──> Grader feeds back specific deficiency   │
 │    report into Worker Agent context                    │
 │ 5. Worker iterates on fixes and re-submits to Grader   │
@@ -94,34 +94,69 @@ Using a separate grader model (e.g. evaluating an Anthropic worker agent with an
 
 ---
 
-## Rubric command-line options
+## Jev Hybrid Rubric Grading (Two-Tier Evaluation)
 
-| Flag | What it does |
+When running with `--smart` or when `TYPESAFE_API_KEY` is configured, OpsCloud activates `JevHybridRubricGrader` & `JevCriteriaCompiler`:
+
+```text
+               ┌──────────────────────────────────────────────────┐
+               │         Evidence Compaction & Extraction         │
+               └────────────────────────┬─────────────────────────┘
+                                        │
+                                        ▼
+               ┌──────────────────────────────────────────────────┐
+               │    Tier 1: Jev System One Fast-Pass (<200ms)    │
+               │   Evaluates parallel Noul criteria probabilities │
+               └────────┬────────────────────────────────┬────────┘
+                        │                                │
+                 [All Passed]                     [Criteria Failed]
+                        │                                │
+                        ▼                                ▼
+               ┌─────────────────┐             ┌──────────────────┐
+               │     Exit 0      │             │ Tier 2: Frontier │
+               │ Verified Passed │             │ LLM Remediation  │
+               └─────────────────┘             │ Diagnostic Advice│
+                                               └────────┬─────────┘
+                                                        │
+                                                        ▼
+                                               [Worker Agent Fixes]
+```
+
+1. **Tier 1 (Jev System One Fast-Pass)**: Evaluates acceptance criteria against structured task evidence in parallel in `<200ms`. If all criteria pass, execution exits immediately without token overhead.
+2. **Tier 2 (Frontier LLM Fallback)**: If any criteria fail, OpsCloud invokes the configured `--rubric-model` specifically to synthesize precise remediation steps, feeding them back to the worker agent for the next iteration.
+
+---
+
+## Rubric Command-Line Options
+
+| Flag | Description |
 |---|---|
 | `--rubric TEXT\|@PATH` | Acceptance criteria (inline text or `@path` to a file) |
 | `--rubric-model MODEL` | Dedicated grader model specifier (e.g. `--rubric-model openai:gpt-4o`) |
 | `--rubric-max-iterations N` | Maximum fix-and-recheck iterations (default: 3) |
+| `--smart` | Enable Jev System One fast-pass evaluation (<200ms) |
 
 ---
 
-## Goals vs. rubrics comparison
+## Goals vs. Rubrics Comparison
 
 | Feature | Goals | Rubrics |
 |---|---|---|
 | **Primary Use Case** | Interactive terminal sessions | Autonomous CI/CD pipelines |
 | **Criteria Source** | Auto-generated from your prompt | Explicitly defined by you |
 | **Execution Loop** | Human guides the agent with real-time feedback | Autonomous grader evaluation loop |
-| **Grader Model** | Same model | Dedicated grader model (optional) |
+| **Grader Model** | Same model | Dedicated grader model |
+| **Jev Fast-Pass** | N/A | Supported via `JevHybridRubricGrader` |
 | **CLI Flag** | `--goal TEXT` | `--rubric TEXT\|@PATH` |
 
 ---
 
-## CI/CD integration examples
+## CI/CD Integration Examples
 
-### GitHub Actions: Kubernetes manifest compliance
+### GitHub Actions: Kubernetes Manifest Compliance
 
 ```bash
-opscloud -n "Audit and fix deployment.yaml" \
+opscloud -p "Audit and fix deployment.yaml" \
   --rubric "1. Non-root securityContext is enforced.
 2. Read-only root filesystem is enabled.
 3. Liveness and readiness probes have timeout thresholds.
@@ -132,10 +167,10 @@ opscloud -n "Audit and fix deployment.yaml" \
   -y
 ```
 
-### Jenkins: Automated Terraform refactoring
+### Automated Terraform Refactoring
 
 ```bash
-opscloud -n "Refactor database module to support read replicas" \
+opscloud -p "Refactor database module to support read replicas" \
   --rubric @specs/db-replica-rubric.md \
   --rubric-model "anthropic:claude-3-7-sonnet-20250219" \
   --max-turns 15 \
