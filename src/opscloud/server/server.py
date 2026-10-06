@@ -132,6 +132,8 @@ class ServerProcess:
         server_log_level = getattr(self.config, "server_log_level", "WARNING") or "WARNING"
         # Silence noisy startup/profiler heartbeats in LangGraph API by defaulting LOG_LEVEL to WARNING
         env.setdefault("LOG_LEVEL", server_log_level)
+        # Prevent blockbuster from raising BlockingError during model/SDK execution in ASGI server
+        env["LANGGRAPH_ALLOW_BLOCKING"] = "true"
 
         cmd = [
             sys.executable,
@@ -144,6 +146,7 @@ class ServerProcess:
             str(self.port),
             "--no-browser",
             "--no-reload",
+            "--allow-blocking",
             "--config",
             str(self.runtime_dir / "langgraph.json"),
             "--server-log-level",
