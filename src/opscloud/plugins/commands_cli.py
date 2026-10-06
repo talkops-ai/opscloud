@@ -13,6 +13,8 @@ from opscloud.plugins.discovery import (
     add_marketplace_source,
     install_plugin,
     list_available_plugins,
+    refresh_all_marketplaces,
+    refresh_marketplace,
     remove_marketplace,
     set_installed_plugin_enabled,
     uninstall_plugin,
@@ -84,6 +86,13 @@ def setup_plugin_parser(
     if add_output_args is not None:
         add_output_args(list_parser)
 
+    search_parser = plugin_sub.add_parser("search", help="Search available plugins")
+    search_parser.add_argument(
+        "query", help="Search query (matches name, description, category, or keywords)"
+    )
+    if add_output_args is not None:
+        add_output_args(search_parser)
+
     install_parser = plugin_sub.add_parser("install", help="Install a plugin")
     install_parser.add_argument("plugin_id")
     install_parser.add_argument(
@@ -118,6 +127,18 @@ def setup_plugin_parser(
         help="Scope to disable in",
     )
 
+    refresh_parser = plugin_sub.add_parser(
+        "refresh", aliases=["update"], help="Refresh marketplace(s) to fetch latest plugins"
+    )
+    refresh_parser.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="Optional marketplace name to refresh (omit to refresh all)",
+    )
+    if add_output_args is not None:
+        add_output_args(refresh_parser)
+
     marketplace_parser = plugin_sub.add_parser(
         "marketplace", help="Manage plugin marketplaces"
     )
@@ -129,6 +150,17 @@ def setup_plugin_parser(
         add_output_args(marketplace_list)
     marketplace_add = marketplace_sub.add_parser("add", help="Add a marketplace")
     marketplace_add.add_argument("source")
+    marketplace_refresh = marketplace_sub.add_parser(
+        "refresh", aliases=["update"], help="Refresh marketplace(s) to fetch latest plugins"
+    )
+    marketplace_refresh.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="Optional marketplace name to refresh (omit to refresh all)",
+    )
+    if add_output_args is not None:
+        add_output_args(marketplace_refresh)
     marketplace_remove = marketplace_sub.add_parser(
         "remove", help="Remove a marketplace and uninstall its plugins"
     )
@@ -158,7 +190,7 @@ def execute_plugin_command(args: argparse.Namespace) -> str | None:
     output_format = getattr(args, "output_format", "text")
     command = getattr(args, "plugin_command", None)
     if command is None:
-        text = "Usage: opscloud plugin {list,install,uninstall,enable,disable,marketplace}"
+        text = "Usage: opscloud plugin {list,search,install,uninstall,enable,disable,refresh,marketplace}"
         print(text)
         return text
     if command in {"list", "ls"}:
@@ -171,12 +203,136 @@ def execute_plugin_command(args: argparse.Namespace) -> str | None:
             return None
         if not rows:
             text = "No plugin marketplaces configured."
+            print(text)
+            return text
+
+        from opscloud.plugins.store import load_all_enabled_plugin_ids, load_installed_plugins
+
+        installed_ids = load_installed_plugins()
+        enabled_ids = load_all_enabled_plugin_ids(project_root=project_root)
+
+        lines: list[str] = []
+        lines.append("Installed Plugins:")
+        if not installed_ids:
+            lines.append("  (none installed)")
         else:
-            lines = []
+            for pid in sorted(installed_ids):
+                status = "enabled" if pid in enabled_ids else "disabled"
+                lines.append(f"  • {pid} [{status}]")
+        lines.append("")
+
+        records = load_marketplace_records(project_root=project_root)
+        found_any_marketplace = False
+        for name, record in sorted(records.items()):
+            try:
+                from opscloud.plugins.marketplace import load_marketplace_location
+
+                marketplace = load_marketplace_location(Path(record.install_location))
+            except Exception:
+                continue
+
+            found_any_marketplace = True
+            from opscloud.config.plugins import is_default_marketplace
+
+            mp_label = f"Available in {name}"
+            if getattr(record, "is_default", False) or is_default_marketplace(name):
+                mp_label += " (Default Marketplace)"
+            lines.append(f"{mp_label}:")
+
+            # Group plugins dynamically by category
+            categories: dict[str, list[Any]] = {}
+            for p in marketplace.plugins:
+                categories.setdefault(p.category_label, []).append(p)
+
+            for cat_label, cat_plugins in categories.items():
+                lines.append(f"  {cat_label}:")
+                for p in cat_plugins:
+                    desc = p.description or ""
+                    short_desc = desc if len(desc) <= 60 else f"{desc[:57]}..."
+                    lines.append(f"    {p.name:<28} v{p.version or '0.1.0':<7} {short_desc}")
+                lines.append("")
+
+        if not found_any_marketplace:
+            simple_lines = []
             for row in rows:
                 status = "enabled" if row["enabled"] else "disabled"
-                lines.append(f"{status} {row['id']} {row['description']}".rstrip())
-            text = "\n".join(lines)
+                simple_lines.append(f"{status} {row['id']} {row['description']}".rstrip())
+            text = "\n".join(simple_lines)
+            print(text)
+            return text
+
+        text = "\n".join(lines).rstrip()
+        print(text)
+        return text
+    if command == "search":
+        query = (getattr(args, "query", "") or "").strip().lower()
+        if not query:
+            text = "Please provide a search query: opscloud plugin search <query>"
+            print(text)
+            return text
+
+        from opscloud.plugins.store import load_all_enabled_plugin_ids, load_installed_plugins
+
+        records = load_marketplace_records(project_root=_resolve_project_root("project"))
+        installed = load_installed_plugins()
+        enabled = load_all_enabled_plugin_ids()
+        matches: list[dict[str, Any]] = []
+
+        for mp_name, record in sorted(records.items()):
+            try:
+                from opscloud.plugins.marketplace import load_marketplace_location
+
+                marketplace = load_marketplace_location(Path(record.install_location))
+            except Exception:
+                continue
+            for plugin in marketplace.plugins:
+                keywords_str = " ".join(plugin.keywords).lower()
+                target_str = (
+                    f"{plugin.name} {plugin.display_name or ''} {plugin.description or ''} "
+                    f"{plugin.category or ''} {keywords_str}"
+                ).lower()
+                if query in target_str:
+                    plugin_id = f"{plugin.name}@{marketplace.name}"
+                    matches.append(
+                        {
+                            "id": plugin_id,
+                            "name": plugin.name,
+                            "display_name": plugin.display_name or plugin.name,
+                            "marketplace": marketplace.name,
+                            "category_label": plugin.category_label,
+                            "category": plugin.category,
+                            "version": plugin.version or "0.1.0",
+                            "description": plugin.description or "",
+                            "installed": plugin_id in installed,
+                            "enabled": plugin_id in enabled,
+                        }
+                    )
+
+        if output_format == "json":
+            import json
+
+            text = json.dumps({"query": query, "results": matches}, indent=2)
+            print(text)
+            return None
+
+        if not matches:
+            text = f"No plugins found matching '{query}'."
+            print(text)
+            return text
+
+        lines = [f"Found {len(matches)} plugin(s) matching '{query}':\n"]
+        for m in matches:
+            status = (
+                "[installed & enabled]"
+                if m["enabled"]
+                else ("[installed]" if m["installed"] else "[available]")
+            )
+            lines.append(f"  • {m['display_name']} ({m['id']}, v{m['version']}) {status}")
+            lines.append(f"    Category: {m['category_label']}")
+            if m["description"]:
+                lines.append(f"    {m['description']}")
+            lines.append("")
+        text = "\n".join(lines).rstrip()
         print(text)
         return text
     if command == "install":
@@ -280,6 +436,106 @@ def execute_plugin_command(args: argparse.Namespace) -> str | None:
             )
             print(text)
             return text
-    text = "Usage: opscloud plugin {list,install,uninstall,enable,disable,marketplace}"
+        if marketplace_command in {"refresh", "update"}:
+            target_name = getattr(args, "name", None)
+            if target_name:
+                try:
+                    marketplace = refresh_marketplace(target_name)
+                except Exception as exc:
+                    text = f"Failed to refresh marketplace {target_name}: {exc}"
+                    print(text)
+                    raise SystemExit(1) from exc
+
+                if output_format == "json":
+                    import json
+
+                    text = json.dumps(
+                        {
+                            "name": marketplace.name,
+                            "plugin_count": len(marketplace.plugins),
+                            "status": "refreshed",
+                        },
+                        indent=2,
+                    )
+                    print(text)
+                    return None
+
+                text = f"Refreshed marketplace '{marketplace.name}' ({len(marketplace.plugins)} plugin(s) available)."
+                print(text)
+                return text
+
+            refreshed = refresh_all_marketplaces()
+            if output_format == "json":
+                import json
+
+                rows = [
+                    {
+                        "name": name,
+                        "plugin_count": len(mp.plugins),
+                        "status": "refreshed",
+                    }
+                    for name, mp in refreshed.items()
+                ]
+                text = json.dumps({"marketplaces": rows}, indent=2)
+                print(text)
+                return None
+
+            lines = [f"Refreshed {len(refreshed)} marketplace(s):"]
+            for name, mp in refreshed.items():
+                lines.append(f"  • {name}: {len(mp.plugins)} plugin(s) available")
+            text = "\n".join(lines)
+            print(text)
+            return text
+    if command in {"refresh", "update"}:
+        target_name = getattr(args, "name", None)
+        if target_name:
+            try:
+                marketplace = refresh_marketplace(target_name)
+            except Exception as exc:
+                text = f"Failed to refresh marketplace {target_name}: {exc}"
+                print(text)
+                raise SystemExit(1) from exc
+
+            if output_format == "json":
+                import json
+
+                text = json.dumps(
+                    {
+                        "name": marketplace.name,
+                        "plugin_count": len(marketplace.plugins),
+                        "status": "refreshed",
+                    },
+                    indent=2,
+                )
+                print(text)
+                return None
+
+            text = f"Refreshed marketplace '{marketplace.name}' ({len(marketplace.plugins)} plugin(s) available)."
+            print(text)
+            return text
+
+        refreshed = refresh_all_marketplaces()
+        if output_format == "json":
+            import json
+
+            rows = [
+                {
+                    "name": name,
+                    "plugin_count": len(mp.plugins),
+                    "status": "refreshed",
+                }
+                for name, mp in refreshed.items()
+            ]
+            text = json.dumps({"marketplaces": rows}, indent=2)
+            print(text)
+            return None
+
+        lines = [f"Refreshed {len(refreshed)} marketplace(s):"]
+        for name, mp in refreshed.items():
+            lines.append(f"  • {name}: {len(mp.plugins)} plugin(s) available")
+        text = "\n".join(lines)
+        print(text)
+        return text
+    text = "Usage: opscloud plugin {list,search,install,uninstall,enable,disable,refresh,marketplace}"
     print(text)
     return text

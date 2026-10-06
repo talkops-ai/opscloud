@@ -31,7 +31,6 @@ from opscloud.plugins.marketplace import (
 from opscloud.plugins.models import (
     ComponentInventory,
     PluginInstance,
-    PluginMarketplace,
 )
 
 from opscloud.utils.logger import get_logger

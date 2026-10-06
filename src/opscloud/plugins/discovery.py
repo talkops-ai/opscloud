@@ -9,6 +9,10 @@ from typing import Any
 
 from opscloud.utils.logger import get_logger
 
+from opscloud.config.plugins import (
+    get_default_marketplace_names,
+    get_primary_default_marketplace_name,
+)
 from opscloud.plugins.manifest import (
     PluginManifestError,
     build_inventory,
@@ -22,6 +26,7 @@ from opscloud.plugins.marketplace import (
     materialize_plugin_source,
     parse_marketplace_source,
     redact_urls_in_text,
+    refresh_marketplace_catalog,
 )
 from opscloud.plugins.models import (
     InstallScope,
@@ -48,7 +53,6 @@ from opscloud.plugins.store import (
     plugin_mutation_lock,
     remove_marketplace_record,
     save_marketplace_record,
-    set_plugin_enabled,
     set_plugin_enabled_for_scope,
     uninstall_plugin as uninstall_plugin_record,
 )
@@ -123,8 +127,88 @@ def remove_marketplace(name: str) -> bool:
     return removed
 
 
+@plugin_mutation_lock()
+def refresh_marketplace(
+    name: str, *, project_root: Path | None = None
+) -> PluginMarketplace:
+    """Refresh a marketplace from its remote source and update local cache and records."""
+    records = load_marketplace_records(project_root=project_root)
+    record = records.get(name)
+    if record is None:
+        msg = f"Marketplace {name!r} is not configured"
+        raise MarketplaceError(msg)
+
+    marketplace = refresh_marketplace_catalog(record)
+    save_marketplace_record(
+        MarketplaceRecord(
+            name=marketplace.name,
+            source_type=record.source_type,
+            source=record.source,
+            install_location=record.install_location,
+            ref=record.ref,
+            plugin_count=len(marketplace.plugins),
+            is_default=record.is_default,
+        )
+    )
+    return marketplace
+
+
+@plugin_mutation_lock()
+def refresh_all_marketplaces(
+    *, project_root: Path | None = None
+) -> dict[str, PluginMarketplace]:
+    """Refresh all configured marketplaces."""
+    records = load_marketplace_records(project_root=project_root)
+    results: dict[str, PluginMarketplace] = {}
+    for name in records:
+        try:
+            results[name] = refresh_marketplace(name, project_root=project_root)
+        except Exception as exc:
+            logger.warning("Failed to refresh marketplace %s: %s", name, exc)
+    return results
+
+
+def _normalize_plugin_id(plugin_id: str) -> str:
+    """Normalize plugin id, resolving across available marketplaces or defaulting to the primary default marketplace."""
+    if "@" in plugin_id:
+        return plugin_id
+
+    records = load_marketplace_records()
+    for name, rec in records.items():
+        try:
+            mp = load_marketplace_location(Path(rec.install_location))
+            if any(p.name == plugin_id for p in mp.plugins):
+                return f"{plugin_id}@{name}"
+        except Exception:
+            continue
+
+    return f"{plugin_id}@{get_primary_default_marketplace_name()}"
+
+
+def _resolve_installed_plugin_id(plugin_id: str) -> str:
+    """Resolve plugin id against currently installed plugins."""
+    if "@" in plugin_id:
+        return plugin_id
+
+    installed = load_installed_plugins()
+    prefix = f"{plugin_id}@"
+    matches = [pid for pid in installed if pid.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        default_names = get_default_marketplace_names()
+        for m in matches:
+            mp_part = m.split("@", 1)[1]
+            if mp_part in default_names:
+                return m
+        return matches[0]
+
+    return f"{plugin_id}@{get_primary_default_marketplace_name()}"
+
+
 def _require_installed_plugin(plugin_id: str) -> None:
-    if plugin_id not in load_installed_plugins(strict=True):
+    canonical_id = _resolve_installed_plugin_id(plugin_id)
+    if canonical_id not in load_installed_plugins(strict=True):
         msg = f"Plugin {plugin_id!r} is not installed"
         raise MarketplaceError(msg)
 
@@ -138,16 +222,17 @@ def set_installed_plugin_enabled(
     project_root: Path | None = None,
 ) -> None:
     """Set the enabled state of an installed plugin at the given scope."""
+    canonical_id = _resolve_installed_plugin_id(plugin_id)
     if scope != "project":
         try:
-            _require_installed_plugin(plugin_id)
+            _require_installed_plugin(canonical_id)
         except MarketplaceError:
             pass
     set_plugin_enabled_for_scope(
-        plugin_id, enabled, scope=scope, project_root=project_root
+        canonical_id, enabled, scope=scope, project_root=project_root
     )
     if enabled:
-        ensure_plugin_data_dir(plugin_id)
+        ensure_plugin_data_dir(canonical_id)
 
 
 @plugin_mutation_lock()
@@ -158,20 +243,22 @@ def uninstall_plugin(
     project_root: Path | None = None,
 ) -> None:
     """Uninstall a plugin (disable, clear records, delete orphaned cache)."""
+    canonical_id = _resolve_installed_plugin_id(plugin_id)
     effective_scope = scope or ("project" if project_root else "user")
     set_plugin_enabled_for_scope(
-        plugin_id, False, scope=effective_scope, project_root=project_root
+        canonical_id, False, scope=effective_scope, project_root=project_root
     )
     uninstall_plugin_record(
-        plugin_id, scope=scope, project_root=project_root
+        canonical_id, scope=scope, project_root=project_root
     )
 
 
 def _resolve_marketplace_and_entry(
     plugin_id: str,
 ) -> tuple[PluginMarketplace, MarketplacePluginEntry]:
+    canonical_id = _normalize_plugin_id(plugin_id)
     try:
-        plugin_name, marketplace_name = split_plugin_id(plugin_id)
+        plugin_name, marketplace_name = split_plugin_id(canonical_id)
     except ValueError as exc:
         raise MarketplaceError(str(exc)) from exc
     records = load_marketplace_records()
@@ -200,16 +287,17 @@ def install_plugin(
     """Install a marketplace plugin into the versioned cache and enable it.
 
     Args:
-        plugin_id: Plugin id in ``name@marketplace`` form.
+        plugin_id: Plugin id in ``name@marketplace`` form or shorthand ``name``.
         scope: Installation scope — ``"user"``, ``"project"``, or ``"local"``.
         project_root: Required when ``scope`` is ``"project"`` or ``"local"``.
     """
     load_installed_plugins(strict=True)
-    marketplace, entry = _resolve_marketplace_and_entry(plugin_id)
+    canonical_id = _normalize_plugin_id(plugin_id)
+    marketplace, entry = _resolve_marketplace_and_entry(canonical_id)
     source_root = materialize_plugin_source(marketplace, entry)
     if source_root is None:
         msg = (
-            f"Plugin {plugin_id} has unsupported source "
+            f"Plugin {canonical_id} has unsupported source "
             f"{redact_urls_in_text(repr(entry.source))}; "
             "use a local path, GitHub repository, or Git repository source"
         )
@@ -220,33 +308,33 @@ def install_plugin(
             source_root, fallback_name=entry.name
         )
     except PluginManifestError as exc:
-        msg = f"Cannot install {plugin_id}: {exc}"
+        msg = f"Cannot install {canonical_id}: {exc}"
         raise MarketplaceError(msg) from exc
 
     for warning in manifest_warnings:
-        logger.debug("Plugin install warning for %s: %s", plugin_id, warning)
+        logger.debug("Plugin install warning for %s: %s", canonical_id, warning)
 
     version = manifest.version if manifest is not None else None
     cache_path = cache_and_register_plugin(
-        plugin_id,
+        canonical_id,
         source_root,
         version=version,
         scope=scope,
         project_root=project_root,
         validate=partial(
             _validate_plugin_copy,
-            plugin_id=plugin_id,
+            plugin_id=canonical_id,
             fallback_name=entry.name,
         ),
     )
 
     set_plugin_enabled_for_scope(
-        plugin_id, True, scope=scope, project_root=project_root
+        canonical_id, True, scope=scope, project_root=project_root
     )
-    ensure_plugin_data_dir(plugin_id)
+    ensure_plugin_data_dir(canonical_id)
 
     instance, warnings = _plugin_from_install_path(
-        plugin_id=plugin_id,
+        plugin_id=canonical_id,
         root=cache_path,
         marketplace_name=marketplace.name,
         fallback_name=entry.name,
@@ -254,9 +342,9 @@ def install_plugin(
     if instance is None:
         detail = "; ".join(warnings)
         uninstall_plugin_record(
-            plugin_id, scope=scope, project_root=project_root
+            canonical_id, scope=scope, project_root=project_root
         )
-        msg = f"Installed {plugin_id} but failed to load from cache: {detail}"
+        msg = f"Installed {canonical_id} but failed to load from cache: {detail}"
         raise MarketplaceError(msg)
     return instance
 

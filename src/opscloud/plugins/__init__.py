@@ -21,6 +21,13 @@ from opscloud.plugins.commands_cli import (
     execute_plugin_command,
     setup_plugin_parser,
 )
+from opscloud.config import (
+    DEFAULT_MARKETPLACE_CONFIGS,
+    DefaultMarketplaceConfig,
+    fetch_marketplace_manifest,
+    get_default_marketplace_config,
+    is_default_marketplace,
+)
 from opscloud.plugins.discovery import (
     add_local_marketplace,
     add_marketplace_source,
@@ -28,6 +35,8 @@ from opscloud.plugins.discovery import (
     install_plugin,
     list_available_plugins,
     list_installed_plugin_ids,
+    refresh_all_marketplaces,
+    refresh_marketplace,
     remove_marketplace,
     set_installed_plugin_enabled,
     uninstall_plugin,
@@ -128,6 +137,8 @@ def discover_plugins() -> list[OpsCloudPlugin]:
 
 __all__ = [
     "ComponentInventory",
+    "DEFAULT_MARKETPLACE_CONFIGS",
+    "DefaultMarketplaceConfig",
     "InstalledPluginEntry",
     "MarketplaceError",
     "MarketplacePluginEntry",
@@ -147,9 +158,12 @@ __all__ = [
     "discover_marketplace_plugins",
     "discover_plugins",
     "execute_plugin_command",
+    "fetch_marketplace_manifest",
     "find_manifest_path",
     "find_marketplace_manifest",
+    "get_default_marketplace_config",
     "install_plugin",
+    "is_default_marketplace",
     "list_available_plugins",
     "list_installed_plugin_ids",
     "load_all_enabled_plugin_ids",
@@ -164,6 +178,8 @@ __all__ = [
     "parse_marketplace_source",
     "plugin_skill_roots",
     "plugin_skill_sources",
+    "refresh_all_marketplaces",
+    "refresh_marketplace",
     "remove_marketplace",
     "set_installed_plugin_enabled",
     "setup_plugin_parser",

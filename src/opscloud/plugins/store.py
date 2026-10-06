@@ -233,13 +233,33 @@ def load_marketplace_records(
             logger.debug("Skipping unsupported marketplace record %r", name)
             continue
         ref = record.get("ref")
+        is_default = bool(record.get("is_default", False))
+        plugin_count = int(record.get("plugin_count", 0))
         records[name] = MarketplaceRecord(
             name=name,
             source_type=cast(MarketplaceSourceType, source_type),
             source=source,
             install_location=record.get("install_location", source),
             ref=ref if isinstance(ref, str) else None,
+            plugin_count=plugin_count,
+            is_default=is_default,
         )
+
+    # Seed default marketplaces if missing and not explicitly removed by the user
+    from opscloud.config.plugins import DEFAULT_MARKETPLACE_CONFIGS
+
+    removed_defaults = set(data.get("removed_defaults", []))
+    for default_cfg in DEFAULT_MARKETPLACE_CONFIGS:
+        if default_cfg.name not in records and default_cfg.name not in removed_defaults:
+            default_dir = ensure_marketplace_cache_dir() / default_cfg.name
+            records[default_cfg.name] = MarketplaceRecord(
+                name=default_cfg.name,
+                source_type="git",
+                source=default_cfg.repository_url,
+                install_location=str(default_dir),
+                ref=default_cfg.ref,
+                is_default=True,
+            )
 
     # Auto-detect project marketplace record if available
     target_root = project_root
@@ -291,17 +311,30 @@ def save_marketplace_record(record: MarketplaceRecord) -> None:
         marketplaces = {}
     elif not isinstance(marketplaces, dict):
         _raise_state_shape(_marketplaces_path(), "has invalid marketplaces data")
-    marketplaces[record.name] = {
+    entry_dict: dict[str, Any] = {
         "install_location": record.install_location,
         "source_type": record.source_type,
         "source": record.source,
     }
+    from opscloud.config.plugins import is_default_marketplace
+
     if record.ref:
-        marketplaces[record.name]["ref"] = record.ref
-    _atomic_write_json(
-        _marketplaces_path(),
-        {"version": _STORAGE_VERSION, "marketplaces": marketplaces},
-    )
+        entry_dict["ref"] = record.ref
+    if record.plugin_count:
+        entry_dict["plugin_count"] = record.plugin_count
+    if record.is_default or is_default_marketplace(record.name):
+        entry_dict["is_default"] = True
+    marketplaces[record.name] = entry_dict
+
+    payload: dict[str, Any] = {
+        "version": _STORAGE_VERSION,
+        "marketplaces": marketplaces,
+    }
+    removed_defaults = [d for d in data.get("removed_defaults", []) if d != record.name]
+    if removed_defaults:
+        payload["removed_defaults"] = removed_defaults
+
+    _atomic_write_json(_marketplaces_path(), payload)
 
 
 def remove_marketplace_record(name: str) -> bool:
@@ -309,16 +342,33 @@ def remove_marketplace_record(name: str) -> bool:
     data = _load_json(_marketplaces_path(), strict=True)
     marketplaces = data.get("marketplaces")
     if marketplaces is None:
-        return False
-    if not isinstance(marketplaces, dict):
+        marketplaces = {}
+    elif not isinstance(marketplaces, dict):
         _raise_state_shape(_marketplaces_path(), "has invalid marketplaces data")
-    if name not in marketplaces:
+
+    from opscloud.config.plugins import is_default_marketplace
+
+    if name not in marketplaces and not is_default_marketplace(name):
         return False
-    marketplaces.pop(name, None)
-    _atomic_write_json(
-        _marketplaces_path(),
-        {"version": _STORAGE_VERSION, "marketplaces": marketplaces},
+    removed_record = marketplaces.pop(name, None)
+    payload: dict[str, Any] = {
+        "version": _STORAGE_VERSION,
+        "marketplaces": marketplaces,
+    }
+    is_default = (
+        is_default_marketplace(name)
+        or (isinstance(removed_record, dict) and removed_record.get("is_default", False))
     )
+    if is_default:
+        existing_removed = data.get("removed_defaults", [])
+        if name not in existing_removed:
+            payload["removed_defaults"] = [*existing_removed, name]
+        else:
+            payload["removed_defaults"] = existing_removed
+    elif "removed_defaults" in data:
+        payload["removed_defaults"] = data["removed_defaults"]
+
+    _atomic_write_json(_marketplaces_path(), payload)
     return True
 
 
@@ -819,7 +869,6 @@ def uninstall_plugin(
     )
     load_installed_plugin_entries(strict=True)
 
-    all_before = load_installed_plugin_entries()
     removed = remove_installed_plugin(
         plugin_id, scope=scope, project_root=effective_root
     )

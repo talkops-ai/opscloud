@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from opscloud.commands._base import BaseCommandHandler, CommandContext, CommandResult
 from opscloud.commands._types import BypassTier, CommandCategory, SafetyLevel

@@ -1,0 +1,311 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OpsCloud — PyPI & GitHub Release Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger: Push a tag like `v0.1.0` or manual workflow_dispatch
+# Result:  Test ➔ Build ➔ Asset Verification ➔ Publish to PyPI ➔ GitHub Release
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: "📦 Release to PyPI & GitHub"
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag (e.g., v0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write        # GitHub Releases
+  id-token: write        # PyPI Trusted Publishing (OIDC)
+
+jobs:
+  # ── Step 1: Validate Version & Metadata ─────────────────────────────────────
+  meta:
+    name: "🏷️ Validate Release Tag"
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      tag: ${{ steps.parse.outputs.tag }}
+      pypi_name: ${{ steps.parse.outputs.pypi_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse tag and metadata
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag_name }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          # Strip leading 'v' if present (e.g. v0.1.0 -> 0.1.0)
+          VERSION="${TAG#v}"
+
+          PKG_NAME=$(grep '^name' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          [ -z "$PKG_NAME" ] && PKG_NAME="opscloud"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pypi_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+
+          echo "🏷️  Release Tag: ${TAG}"
+          echo "📦 Version: ${VERSION}"
+          echo "🐍 PyPI Package: ${PKG_NAME}"
+
+      - name: Validate version matches pyproject.toml
+        run: |
+          TOML_VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${{ steps.parse.outputs.version }}"
+          if [ "$TOML_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Version mismatch! pyproject.toml=${TOML_VERSION} tag=${TAG_VERSION}"
+            exit 1
+          fi
+          echo "✅ Version match: ${TAG_VERSION}"
+
+  # ── Step 2: Run Unit Tests ──────────────────────────────────────────────────
+  test:
+    name: "🧪 Run Tests"
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -m unit -v --tb=short
+
+  # ── Step 3: Build & Package Verification ────────────────────────────────────
+  build:
+    name: "🔨 Build Package"
+    needs: [meta, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify built artifacts
+        run: |
+          echo "📦 Built artifacts:"
+          ls -lh dist/
+
+          VERSION="${{ needs.meta.outputs.version }}"
+          if ! ls dist/*${VERSION}* 1>/dev/null 2>&1; then
+            echo "❌ No artifacts found with version ${VERSION}"
+            exit 1
+          fi
+
+          WHEEL=$(ls dist/*.whl | head -1)
+
+          # 1. Verify Entry Point Binary Script
+          if ! unzip -l "$WHEEL" | grep -q "opscloud/cli/main.py"; then
+            echo "❌ Critical Error: Missing opscloud/cli/main.py in wheel!"
+            exit 1
+          fi
+
+          # 2. Verify Built-in Skills
+          for skill in remember skill-creator; do
+            if ! unzip -l "$WHEEL" | grep -q "opscloud/built_in_skills/${skill}/SKILL.md"; then
+              echo "❌ Critical Error: Missing skill '${skill}' in wheel!"
+              exit 1
+            fi
+          done
+
+          # 3. Verify Prompt Templates and TUI Stylesheet
+          for asset in "opscloud/prompts/templates/system_prompt.md" "opscloud/ui/app.tcss"; do
+            if ! unzip -l "$WHEEL" | grep -q "$asset"; then
+              echo "❌ Critical Error: Missing asset '${asset}' in wheel!"
+              exit 1
+            fi
+          done
+
+          # 4. Verify Entry Point in wheel metadata
+          if ! unzip -p "$WHEEL" "*.dist-info/entry_points.txt" | grep -q "opscloud = opscloud.cli.main:cli_main"; then
+            echo "❌ Critical Error: 'opscloud' console script entry point not registered in wheel metadata!"
+            exit 1
+          fi
+
+          echo "✅ OpsCloud package integrity verified."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-opscloud
+          path: dist/
+          retention-days: 7
+
+  # ── Step 4: Publish to PyPI ─────────────────────────────────────────────────
+  publish-pypi:
+    name: "🚀 Publish to PyPI"
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/${{ needs.meta.outputs.pypi_name }}/${{ needs.meta.outputs.version }}/
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-opscloud
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          verbose: true
+          print-hash: true
+
+  # ── Step 5: Create GitHub Release ───────────────────────────────────────────
+  github-release:
+    name: "📋 Create GitHub Release"
+    needs: [meta, build, publish-pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-opscloud
+          path: dist/
+
+      - name: Generate release notes
+        id: notes
+        env:
+          PYPI_NAME: ${{ needs.meta.outputs.pypi_name }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TOML="pyproject.toml"
+          DESCRIPTION=$(grep '^description' "$TOML" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          PYTHON_REQ=$(grep 'requires-python' "$TOML" | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo ">=3.12")
+
+          # Generate artifact checksums
+          CHECKSUMS=""
+          for f in dist/*; do
+            HASH=$(sha256sum "$f" | cut -d' ' -f1)
+            FNAME=$(basename "$f")
+            CHECKSUMS="${CHECKSUMS}\n| \`${FNAME}\` | \`${HASH:0:20}…\` |"
+          done
+
+          # Changelog since previous tag
+          PREV_TAG=$(git tag --list "v*" --sort=-version:refname | grep -v "^${TAG}$" | head -1 || true)
+          CHANGELOG=""
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline "${PREV_TAG}..HEAD" 2>/dev/null | head -20 || true)
+            if [ -n "$COMMITS" ]; then
+              CHANGELOG="### 📝 Changes since \`${PREV_TAG}\`\n\n"
+              while IFS= read -r commit; do
+                [ -z "$commit" ] && continue
+                CHANGELOG="${CHANGELOG}- ${commit}\n"
+              done <<< "$COMMITS"
+            fi
+          fi
+
+          cat > /tmp/release_body.md << RELEASE_EOF
+          ## ⚡ OpsCloud ${TAG}
+
+          > ${DESCRIPTION}
+
+          ---
+
+          ### ⚡ Installation & Quickstart
+
+          \`\`\`bash
+          # Direct one-line installer
+          curl -LsSf https://raw.githubusercontent.com/talkops-ai/opscloud/main/scripts/install.sh | bash
+          \`\`\`
+
+          ---
+
+          ### 🚀 Launch OpsCloud
+
+          \`\`\`bash
+          # Interactive Terminal UI
+          opscloud
+
+          # System & Cloud Health Check
+          opscloud doctor
+
+          # Configure API credentials
+          opscloud /auth
+          \`\`\`
+
+          ---
+
+          $(echo -e "${CHANGELOG}")
+
+          ### 📋 Package Details
+
+          | Property | Value |
+          |---|---|
+          | **PyPI Package** | [\`${PYPI_NAME}\`](https://pypi.org/project/${PYPI_NAME}/${VERSION}/) |
+          | **Version** | \`${VERSION}\` |
+          | **Python Requirement** | \`${PYTHON_REQ}\` |
+          | **License** | Apache 2.0 |
+          | **CLI Binary** | \`opscloud\` |
+
+          <details>
+          <summary>🔒 Artifact Checksums (SHA-256)</summary>
+
+          | Artifact | SHA-256 |
+          |---|---|$(echo -e "${CHECKSUMS}")
+
+          </details>
+
+          ---
+
+          ### 🔗 Links & Resources
+          - 📖 [Technical Documentation](https://github.com/talkops-ai/opscloud)
+          - 📦 [PyPI Release](https://pypi.org/project/${PYPI_NAME}/${VERSION}/)
+          - 🐛 [Report an Issue](https://github.com/talkops-ai/opscloud/issues/new)
+          RELEASE_EOF
+
+          sed -i 's/^          //' /tmp/release_body.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: "OpsCloud ${{ needs.meta.outputs.tag }}"
+          body_path: /tmp/release_body.md
+          files: dist/*
+          draft: false
+          prerelease: false
+          generate_release_notes: false

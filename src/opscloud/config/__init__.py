@@ -46,6 +46,15 @@ from opscloud.config.settings import (
     settings,
     sync_aws_env_aliases,
 )
+from opscloud.config.plugins import (
+    DEFAULT_MARKETPLACE_CONFIGS,
+    DefaultMarketplaceConfig,
+    fetch_marketplace_manifest,
+    get_default_marketplace_config,
+    get_default_marketplace_names,
+    get_primary_default_marketplace_name,
+    is_default_marketplace,
+)
 from opscloud.config.store import ConfigCategory, ConfigEntry, ConfigStore, ConfigValue
 from opscloud.config.store_factory import create_config_store, create_config_store_sync
 
@@ -61,6 +70,8 @@ __all__ = [
     "ConfigValue",
     "DATA_DIR",
     "DEFAULT_AGENT_NAME",
+    "DEFAULT_MARKETPLACE_CONFIGS",
+    "DefaultMarketplaceConfig",
     "ENV_PREFIX",
     "GLOBAL_ENV_PATH",
     "OPSCLOUD_HOME",
@@ -75,16 +86,21 @@ __all__ = [
     "build_stream_config",
     "create_config_store",
     "create_config_store_sync",
+    "fetch_marketplace_manifest",
     "find_project_root",
     "get_aws_config",
     "get_aws_context",
     "get_aws_credentials_dict",
     "get_boto3_session",
     "get_config_options",
+    "get_default_marketplace_config",
+    "get_default_marketplace_names",
     "get_glyphs",
     "get_option",
     "get_option_by_db_key",
+    "get_primary_default_marketplace_name",
     "get_settings",
+    "is_default_marketplace",
     "iter_groups",
     "load_config_toml",
     "option_keys",

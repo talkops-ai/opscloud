@@ -99,7 +99,6 @@ dev = [
 
 [project.scripts]
 opscloud = "opscloud.cli.main:cli_main"
-ops = "opscloud.cli.main:cli_main"
 
 [build-system]
 requires = ["hatchling"]

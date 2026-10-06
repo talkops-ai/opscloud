@@ -13,10 +13,13 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import IO
+from typing import IO, TYPE_CHECKING
 import urllib.error
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 import urllib.request
+
+if TYPE_CHECKING:
+    from opscloud.config.plugins import DefaultMarketplaceConfig
 
 from opscloud.plugins.manifest import _resolve_component_path, _validate_name
 from opscloud.plugins.models import (
@@ -28,6 +31,7 @@ from opscloud.plugins.models import (
     LocalMarketplaceSource,
     LocalPluginSource,
     MarketplacePluginEntry,
+    MarketplaceRecord,
     MarketplaceSource,
     PluginMarketplace,
     PluginSource,
@@ -278,9 +282,14 @@ def _clone_repository_to_cache(
     git_url: str,
     *,
     cache_key: str,
+    destination: Path | None = None,
     validate: Callable[[Path], None] | None = None,
 ) -> Path:
-    cache_path = get_marketplace_cache_dir() / (f"repository-{opaque_cache_key(cache_key)}")
+    cache_path = (
+        destination.expanduser().resolve()
+        if destination is not None
+        else get_marketplace_cache_dir() / (f"repository-{opaque_cache_key(cache_key)}")
+    )
     temp_path = Path(tempfile.mkdtemp(prefix=f".{cache_path.name}.", dir=cache_path.parent))
 
     # Check for GitHub token
@@ -500,9 +509,65 @@ def _reject_url_marketplace_with_local_plugins(marketplace: PluginMarketplace, u
     raise MarketplaceError(msg)
 
 
+def load_live_default_marketplace(
+    root: Path,
+    config: DefaultMarketplaceConfig | None = None,
+) -> PluginMarketplace:
+    """Fetch the live default marketplace catalog from the remote repository and construct PluginMarketplace."""
+    from opscloud.config.plugins import (
+        fetch_marketplace_manifest,
+        get_default_marketplace_config,
+    )
+
+    if config is None:
+        config = get_default_marketplace_config(root.name)
+        if config is None:
+            msg = f"No default marketplace configuration found for {root.name}"
+            raise MarketplaceError(msg)
+
+    try:
+        raw = fetch_marketplace_manifest(config.manifest_url)
+    except Exception as exc:
+        msg = f"Failed to fetch live default marketplace manifest for '{config.name}' from {config.manifest_url}: {exc}"
+        raise MarketplaceError(msg) from exc
+
+    try:
+        name = _validate_name(raw.get("name"), allow_at=False)
+    except ValueError as exc:
+        raise MarketplaceError(str(exc)) from exc
+
+    plugins_raw = raw.get("plugins")
+    if not isinstance(plugins_raw, list):
+        msg = f"Marketplace {name} must contain a plugins array"
+        raise MarketplaceError(msg)
+
+    warnings: list[str] = []
+    plugins = tuple(
+        plugin for entry in plugins_raw if (plugin := _parse_entry(entry, warnings=warnings)) is not None
+    )
+    for warning in warnings:
+        logger.warning("%s", warning)
+
+    metadata = raw.get("metadata") or {}
+    manifest_path = root / ".claude-plugin" / "marketplace.json"
+    return PluginMarketplace(
+        name=name,
+        root=root,
+        manifest_path=manifest_path,
+        metadata=metadata,
+        plugins=plugins,
+        warnings=tuple(warnings),
+    )
+
+
 def load_marketplace_location(path: Path) -> PluginMarketplace:
-    """Load a marketplace from either a cached directory or JSON file."""
+    """Load a marketplace from either a cached directory, JSON file, or live default marketplace."""
+    from opscloud.config.plugins import get_default_marketplace_config
+
     resolved = path.expanduser().resolve()
+    default_cfg = get_default_marketplace_config(resolved.name)
+    if default_cfg is not None:
+        return load_live_default_marketplace(resolved, config=default_cfg)
     if resolved.is_file():
         return _load_marketplace_file(resolved)
     return load_marketplace(resolved)
@@ -591,6 +656,24 @@ def materialize_plugin_source(marketplace: PluginMarketplace, plugin: Marketplac
         resolved = _resolve_component_path(raw, base, f"plugins.{plugin.name}.source", warnings)
         for warning in warnings:
             logger.warning("Marketplace %s: %s", marketplace.name, warning)
+        if resolved is not None and not resolved.exists():
+            from opscloud.config.plugins import get_default_marketplace_config
+
+            cfg = get_default_marketplace_config(marketplace.name)
+            if cfg is not None:
+                repo_source = RepositoryMarketplaceSource(
+                    source_type="git",
+                    value=cfg.repository_url,
+                    ref=cfg.ref,
+                )
+                _clone_repository_to_cache(
+                    repo_source,
+                    cfg.repository_url,
+                    cache_key=f"marketplace-git-{cfg.repository_url}",
+                    destination=marketplace.root,
+                )
+                if resolved.exists():
+                    return resolved
         return resolved
 
     repository = _plugin_repository_source(plugin)
@@ -700,12 +783,24 @@ def _parse_entry(entry: object, *, warnings: list[str]) -> MarketplacePluginEntr
     author_value = entry.get("author")
     author = author_value if isinstance(author_value, (dict, str)) else None
     display_name_value = entry.get("displayName") or entry.get("display_name")
+    version_value = entry.get("version")
+    version = version_value if isinstance(version_value, str) else "0.1.0"
+    category_value = entry.get("category")
+    category = category_value if isinstance(category_value, str) else None
+    keywords_value = entry.get("keywords")
+    if isinstance(keywords_value, list):
+        keywords = tuple(str(k) for k in keywords_value if isinstance(k, (str, int)))
+    else:
+        keywords = ()
     return MarketplacePluginEntry(
         name=name,
         source=source,
         description=description_value if isinstance(description_value, str) else None,
         author=author,
         display_name=(display_name_value if isinstance(display_name_value, str) else None),
+        version=version,
+        category=category,
+        keywords=keywords,
     )
 
 
@@ -751,3 +846,48 @@ def load_marketplace(root: Path) -> PluginMarketplace:
         msg = f"No marketplace manifest found under {root}"
         raise MarketplaceError(msg)
     return _load_marketplace_from_path(root, manifest_path)
+
+
+def refresh_marketplace_catalog(record: MarketplaceRecord) -> PluginMarketplace:
+    """Refresh a marketplace catalog and its underlying repository cache.
+
+    For default marketplaces:
+      - Fetches the updated live remote catalog manifest.
+      - If the repository cache directory exists on disk, updates git clone to latest HEAD.
+    For git/github/url marketplaces:
+      - Re-materializes from the remote git/url source into cache.
+    For local directory marketplaces:
+      - Re-loads the marketplace from its filesystem location.
+
+    Returns:
+        The refreshed PluginMarketplace instance.
+    """
+    from opscloud.config.plugins import get_default_marketplace_config
+
+    cfg = get_default_marketplace_config(record.name)
+    install_path = Path(record.install_location)
+
+    if cfg is not None or record.is_default:
+        if install_path.exists():
+            repo_url = cfg.repository_url if cfg else record.source
+            ref = cfg.ref if cfg else record.ref
+            repo_source = RepositoryMarketplaceSource(
+                source_type="git",
+                value=repo_url,
+                ref=ref,
+            )
+            _clone_repository_to_cache(
+                repo_source,
+                repo_url,
+                cache_key=f"marketplace-git-{repo_url}",
+                destination=install_path,
+            )
+        return load_marketplace_location(install_path)
+
+    if record.source_type in {"git", "github", "url"}:
+        source_str = f"{record.source}#{record.ref}" if record.ref else record.source
+        source = parse_marketplace_source(source_str)
+        marketplace, _location = materialize_marketplace_source(source)
+        return marketplace
+
+    return load_marketplace_location(install_path)

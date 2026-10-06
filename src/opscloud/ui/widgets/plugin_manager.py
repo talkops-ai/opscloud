@@ -13,7 +13,6 @@ from pathlib import Path
 from collections.abc import Sequence, Set as AbstractSet
 from typing import TYPE_CHECKING, ClassVar, Literal
 
-from textual import work
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
@@ -22,7 +21,7 @@ from textual.events import Key
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Rule, Static
-from textual.widgets.option_list import Option, OptionDoesNotExist
+from textual.widgets.option_list import Option
 
 from opscloud.config.settings import get_glyphs, is_ascii_mode
 from opscloud.plugins import (
@@ -43,9 +42,8 @@ from opscloud.plugins.marketplace import (
     redact_marketplace_source,
     redact_urls_in_text,
 )
-from opscloud.plugins.models import InstallScope, LocalPluginSource, PluginInstance, PluginMarketplace, split_plugin_id
+from opscloud.plugins.models import InstallScope
 from opscloud.plugins.store import (
-    get_primary_install_entry,
     load_all_enabled_plugin_ids,
     load_installed_plugin_entries,
     load_installed_plugins,
@@ -325,6 +323,9 @@ def _marketplace_label(row: _MarketplaceRow) -> Content:
 def _marketplace_details_options() -> list[Option]:
     return [
         Option(
+            Content.styled("Refresh marketplace", "bold"), id="action:refresh-marketplace"
+        ),
+        Option(
             Content.styled("Remove marketplace", "bold"), id="action:remove-marketplace"
         ),
         Option("Back to marketplace list", id="details-back"),
@@ -472,7 +473,7 @@ def _load_manager_state(
                 plugin_id=plugin_id,
                 description=plugin.description or "",
                 enabled=is_enabled,
-                version=instance.version if instance else None,
+                version=instance.version if instance else getattr(plugin, "version", None),
                 author=author,
                 display_name=display_name,
                 skill_count=len(instance.inventory.skills) if instance else None,
@@ -743,7 +744,10 @@ class PluginManagerScreen(ModalScreen[None]):
                 return [Option("No installed plugins match your search.", id="empty", disabled=True)]
             return _plugin_options(rows, action="installed", status=None)
         if self._tab == "marketplaces":
-            options = [Option("+ Add marketplace", id="add-marketplace")]
+            options = [
+                Option("+ Add marketplace", id="add-marketplace"),
+                Option("⟳ Refresh all marketplaces", id="refresh-all-marketplaces"),
+            ]
             if self._state.marketplaces:
                 options.append(
                     Option(
@@ -899,6 +903,13 @@ class PluginManagerScreen(ModalScreen[None]):
             loaded_plugin_ids=self._loaded_plugin_ids,
             project_root=self._project_root,
         )
+        if self._selected_marketplace is not None:
+            updated_mp = next(
+                (m for m in self._state.marketplaces if m.name == self._selected_marketplace.name),
+                None,
+            )
+            if updated_mp:
+                self._selected_marketplace = updated_mp
         self._refresh_view()
 
     def check_action(
@@ -1048,6 +1059,23 @@ class PluginManagerScreen(ModalScreen[None]):
             self._error = None
             self._refresh_view()
             return
+        if option_id == "refresh-all-marketplaces":
+            self._status = "Refreshing all marketplaces..."
+            self._refresh_view()
+            try:
+                from opscloud.plugins.discovery import refresh_all_marketplaces
+
+                await asyncio.to_thread(
+                    refresh_all_marketplaces,
+                    project_root=self._project_root,
+                )
+                self._status = "All marketplaces refreshed."
+                await self._refresh_state()
+            except Exception as exc:
+                self._status = None
+                self._error = str(exc)
+                self._refresh_view()
+            return
         if option_id.startswith("marketplace:"):
             name = option_id.removeprefix("marketplace:")
             row = next((r for r in self._state.marketplaces if r.name == name), None)
@@ -1125,6 +1153,25 @@ class PluginManagerScreen(ModalScreen[None]):
                     self._mode = "list"
                     self._selected_plugin = None
                     self._status = "Plugin uninstalled."
+                    await self._refresh_state()
+                except Exception as exc:
+                    self._status = None
+                    self._error = str(exc)
+                    self._refresh_view()
+            return
+        if option_id == "action:refresh-marketplace":
+            if self._selected_marketplace:
+                self._status = f"Refreshing marketplace {self._selected_marketplace.name}..."
+                self._refresh_view()
+                try:
+                    from opscloud.plugins.discovery import refresh_marketplace
+
+                    mp = await asyncio.to_thread(
+                        refresh_marketplace,
+                        self._selected_marketplace.name,
+                        project_root=self._project_root,
+                    )
+                    self._status = f"Marketplace refreshed ({len(mp.plugins)} available)."
                     await self._refresh_state()
                 except Exception as exc:
                     self._status = None
