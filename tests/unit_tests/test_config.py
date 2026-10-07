@@ -49,6 +49,7 @@ from opscloud.config.paths import (
 )
 from opscloud.config.settings import (
     Settings,
+    _load_dotenv,
     get_glyphs,
     is_ascii_mode,
     newline_shortcut,
@@ -309,7 +310,7 @@ def test_resolve_scalar_precedence(monkeypatch):
     # Default fallback
     monkeypatch.delenv("OPSCLOUD_AWS_REGION", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
-    val, source = resolve_scalar(opt)
+    val, source = resolve_scalar(opt, toml_data={})
     assert val == "us-east-1"
     assert source == "default"
 
@@ -509,3 +510,248 @@ def test_resolve_model_context_limit():
 
     # 3. None falls back to settings
     assert resolve_model_context_limit(None) is not None
+
+
+# ── 10. Dotenv Precedence & Vertex AI Tests ────────────────
+
+
+def test_load_dotenv_global_overrides_project_env(tmp_path: Path, monkeypatch):
+    """Global ~/.opscloud/.env credentials must override generic project .env."""
+    from opscloud.config import paths
+
+    # Fake home & global env
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    global_opscloud = fake_home / ".opscloud"
+    global_opscloud.mkdir()
+    global_env_file = global_opscloud / ".env"
+    global_env_file.write_text(
+        "GOOGLE_API_KEY=AIzaSy_GLOBAL_VALID\n"
+        "GOOGLE_GENAI_USE_VERTEXAI=true\n"
+        "SHARED_KEY=from_global\n"
+    )
+
+    # Project directory with conflicting/stale project .env
+    project_dir = tmp_path / "my_project"
+    project_dir.mkdir()
+    (project_dir / "pyproject.toml").write_text("[project]\nname='test'\n")
+    (project_dir / ".env").write_text(
+        "GOOGLE_API_KEY=STALE_PROJECT_KEY\n"
+        "PROJECT_ONLY_KEY=proj_val\n"
+        "SHARED_KEY=from_project\n"
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setattr(paths, "GLOBAL_ENV_PATH", global_env_file)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+    monkeypatch.delenv("PROJECT_ONLY_KEY", raising=False)
+    monkeypatch.delenv("SHARED_KEY", raising=False)
+
+    _load_dotenv(start_path=project_dir, refresh_loaded=True)
+
+    # Global must win over generic project .env
+    assert os.environ["GOOGLE_API_KEY"] == "AIzaSy_GLOBAL_VALID"
+    assert os.environ["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+    assert os.environ["SHARED_KEY"] == "from_global"
+    # Project-only key still loaded as baseline
+    assert os.environ["PROJECT_ONLY_KEY"] == "proj_val"
+
+
+def test_load_dotenv_project_opscloud_env_overrides_global(tmp_path: Path, monkeypatch):
+    """Project-scoped {project_root}/.opscloud/.env overrides global ~/.opscloud/.env."""
+    from opscloud.config import paths
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    global_opscloud = fake_home / ".opscloud"
+    global_opscloud.mkdir()
+    (global_opscloud / ".env").write_text("SHARED_VAR=from_global\nGLOBAL_ONLY=g\n")
+
+    project_dir = tmp_path / "special_proj"
+    project_dir.mkdir()
+    (project_dir / ".git").mkdir()
+    proj_opscloud = project_dir / ".opscloud"
+    proj_opscloud.mkdir()
+    (proj_opscloud / ".env").write_text("SHARED_VAR=from_project_opscloud\n")
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setattr(paths, "GLOBAL_ENV_PATH", global_opscloud / ".env")
+    monkeypatch.delenv("SHARED_VAR", raising=False)
+    monkeypatch.delenv("GLOBAL_ONLY", raising=False)
+
+    _load_dotenv(start_path=project_dir, refresh_loaded=True)
+
+    assert os.environ["SHARED_VAR"] == "from_project_opscloud"
+    assert os.environ["GLOBAL_ONLY"] == "g"
+
+
+def test_load_dotenv_bounded_by_project_root(tmp_path: Path, monkeypatch):
+    """Walk-up stops at project root and does not traverse higher outside the repository."""
+    parent_dir = tmp_path / "outer"
+    parent_dir.mkdir()
+    # Unrelated parent .env outside repo
+    (parent_dir / ".env").write_text("OUTSIDE_KEY=should_not_load\n")
+
+    repo_dir = parent_dir / "my_repo"
+    repo_dir.mkdir()
+    (repo_dir / "pyproject.toml").write_text("[project]\nname='repo'\n")
+    sub_dir = repo_dir / "src" / "pkg"
+    sub_dir.mkdir(parents=True)
+
+    monkeypatch.delenv("OUTSIDE_KEY", raising=False)
+    _load_dotenv(start_path=sub_dir, refresh_loaded=True)
+
+    assert "OUTSIDE_KEY" not in os.environ
+
+
+def test_load_dotenv_denied_keys_filtered(tmp_path: Path, monkeypatch):
+    """Denied environment keys like PATH and HOME cannot be set by .env."""
+    project_dir = tmp_path / "denied_test"
+    project_dir.mkdir()
+    (project_dir / ".env").write_text("PATH=/dangerous/path\nHOME=/dangerous/home\nSAFE_KEY=safe\n")
+
+    orig_path = os.environ.get("PATH")
+    monkeypatch.delenv("SAFE_KEY", raising=False)
+
+    _load_dotenv(start_path=project_dir, refresh_loaded=True)
+
+    assert os.environ.get("PATH") == orig_path
+    assert os.environ.get("SAFE_KEY") == "safe"
+
+
+def test_apply_stored_credentials_vertex_ai(monkeypatch):
+    """apply_stored_credentials sets GOOGLE_GENAI_USE_VERTEXAI for vertex providers."""
+    from opscloud.model.config import apply_stored_credentials
+
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-gcp-project")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    applied = apply_stored_credentials("google_genai")
+    assert applied is True
+    assert os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") == "true"
+    assert os.environ.get("GOOGLE_CLOUD_PROJECT") == "test-gcp-project"
+
+    # Also test google_vertexai provider
+    applied_vtx = apply_stored_credentials("google_vertexai")
+    assert applied_vtx is True
+    assert os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") == "true"
+
+
+def test_load_dotenv_project_denied_security_keys(tmp_path: Path, monkeypatch):
+    """Project-level .env cannot inject operational security or trust-boundary settings."""
+    project_dir = tmp_path / "security_test"
+    project_dir.mkdir()
+    (project_dir / ".env").write_text(
+        "OPSCLOUD_APPROVAL_MODE=auto\n"
+        "APPROVAL_MODE=auto\n"
+        "OPSCLOUD_SHELL_ALLOW_LIST=rm,cat\n"
+        "SHELL_ALLOW_LIST=rm,cat\n"
+        "OPSCLOUD_READ_ONLY=false\n"
+        "READ_ONLY=false\n"
+        "OPSCLOUD_READ_PROJECT_DOTENV=false\n"
+        "READ_PROJECT_DOTENV=false\n"
+        "OPSCLOUD_CONFIG_DIR=/tmp/hijack\n"
+        "CONFIG_DIR=/tmp/hijack\n"
+        "TERM_PROGRAM=Apple_Terminal\n"
+        "PROJECT_SAFE_VAL=allowed_123\n"
+    )
+
+    for key in (
+        "OPSCLOUD_APPROVAL_MODE",
+        "APPROVAL_MODE",
+        "OPSCLOUD_SHELL_ALLOW_LIST",
+        "SHELL_ALLOW_LIST",
+        "OPSCLOUD_READ_ONLY",
+        "READ_ONLY",
+        "OPSCLOUD_READ_PROJECT_DOTENV",
+        "READ_PROJECT_DOTENV",
+        "OPSCLOUD_CONFIG_DIR",
+        "CONFIG_DIR",
+        "PROJECT_SAFE_VAL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    _load_dotenv(start_path=project_dir, refresh_loaded=True)
+
+    assert "OPSCLOUD_APPROVAL_MODE" not in os.environ
+    assert "APPROVAL_MODE" not in os.environ
+    assert "OPSCLOUD_SHELL_ALLOW_LIST" not in os.environ
+    assert "SHELL_ALLOW_LIST" not in os.environ
+    assert "OPSCLOUD_READ_ONLY" not in os.environ
+    assert "READ_ONLY" not in os.environ
+    assert "OPSCLOUD_READ_PROJECT_DOTENV" not in os.environ
+    assert "READ_PROJECT_DOTENV" not in os.environ
+    assert "OPSCLOUD_CONFIG_DIR" not in os.environ
+    assert "CONFIG_DIR" not in os.environ
+    assert os.environ.get("PROJECT_SAFE_VAL") == "allowed_123"
+
+
+def test_load_dotenv_read_project_dotenv_disabled(tmp_path: Path, monkeypatch):
+    """When read_project_dotenv is disabled, project .env is skipped while global .env is loaded."""
+    from opscloud.config.settings import resolve_read_project_dotenv
+
+    project_dir = tmp_path / "opt_out_repo"
+    project_dir.mkdir()
+    (project_dir / "pyproject.toml").write_text("[project]\nname='test'\n")
+    (project_dir / ".env").write_text("FROM_PROJECT=should_be_skipped\n")
+
+    global_env = tmp_path / "global_home_env"
+    global_env.write_text("FROM_GLOBAL=trusted_val\n")
+    monkeypatch.setattr("opscloud.config.paths.GLOBAL_ENV_PATH", global_env)
+
+    monkeypatch.delenv("FROM_PROJECT", raising=False)
+    monkeypatch.delenv("FROM_GLOBAL", raising=False)
+
+    # Opt-out via environment variable
+    monkeypatch.setenv("OPSCLOUD_READ_PROJECT_DOTENV", "false")
+    assert resolve_read_project_dotenv() is False
+
+    _load_dotenv(start_path=project_dir, refresh_loaded=True)
+
+    assert "FROM_PROJECT" not in os.environ
+    assert os.environ.get("FROM_GLOBAL") == "trusted_val"
+
+
+def test_strip_dotenv_loaded_values(tmp_path: Path, monkeypatch):
+    """_strip_dotenv_loaded_values cleans injected keys but retains modified or pre-existing values."""
+    from opscloud.config.settings import _strip_dotenv_loaded_values, _dotenv_loaded_values
+
+    project_dir = tmp_path / "strip_test"
+    project_dir.mkdir()
+    (project_dir / ".env").write_text("INJECTED_A=val_a\nINJECTED_B=val_b\n")
+
+    monkeypatch.delenv("INJECTED_A", raising=False)
+    monkeypatch.delenv("INJECTED_B", raising=False)
+
+    _load_dotenv(start_path=project_dir, refresh_loaded=True)
+    assert os.environ.get("INJECTED_A") == "val_a"
+    assert os.environ.get("INJECTED_B") == "val_b"
+
+    # User code mutates INJECTED_B
+    os.environ["INJECTED_B"] = "mutated_by_user"
+
+    # Strip injected values
+    _strip_dotenv_loaded_values(os.environ)
+
+    # INJECTED_A matches what was injected -> stripped
+    assert "INJECTED_A" not in os.environ
+    # INJECTED_B was changed -> preserved
+    assert os.environ.get("INJECTED_B") == "mutated_by_user"
+
+
+def test_apply_stored_credentials_base_url(monkeypatch):
+    """apply_stored_credentials syncs primary base URL and its aliases."""
+    from opscloud.model.config import apply_stored_credentials
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://custom.anthropic.proxy/v1")
+    monkeypatch.delenv("ANTHROPIC_API_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+
+    applied = apply_stored_credentials("anthropic")
+    assert applied is True
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://custom.anthropic.proxy/v1"
+    assert os.environ.get("ANTHROPIC_API_URL") == "https://custom.anthropic.proxy/v1"
+
+

@@ -782,3 +782,76 @@ async def test_enriched_routing_state_orchestrator_vs_subagent():
     assert "cloud_financial_management" in sub_state["agent_context"]["active_capabilities"]
     assert "cost_and_usage_analysis" in sub_state["agent_context"]["active_capabilities"]
 
+
+def test_multi_provider_agent_pool_tier_discovery(tmp_path, pool_manager):
+    """Verify that multi-provider agent pools resolve correctly across different providers and effort levels."""
+    from opscloud.config.toml_config import clear_agent_pool, load_agent_pool, save_agent_pool
+
+    tmp_config = tmp_path / "config.toml"
+    multi_pool = {
+        "fast": "openai:gpt-4o-mini",
+        "standard": "google_genai:gemini-2.5-flash",
+        "powerful": "anthropic:claude-sonnet-4-6",
+    }
+    assert save_agent_pool(multi_pool, provider="multi", config_path=tmp_config) is True
+
+    loaded = load_agent_pool(tmp_config)
+    assert loaded is not None
+    assert loaded["fast"] == "openai:gpt-4o-mini"
+    assert loaded["standard"] == "google_genai:gemini-2.5-flash"
+    assert loaded["powerful"] == "anthropic:claude-sonnet-4-6"
+    assert loaded["provider"] == "multi"
+
+    with patch("opscloud.config.toml_config.load_agent_pool", return_value=loaded):
+        # 1. Resolves multi-provider pool regardless of passed provider
+        for prov in ("google_genai", "openai", "anthropic", None):
+            tiers = pool_manager.discover_tiers(provider=prov)
+            assert tiers[0][0] == "openai:gpt-4o-mini"
+            assert tiers[1][0] == "google_genai:gemini-2.5-flash"
+            assert tiers[2][0] == "anthropic:claude-sonnet-4-6"
+            assert tiers[0][1] == "off"
+            assert tiers[1][1] in ("off", "medium")
+            assert tiers[2][1] in ("high", "max")
+
+        # 2. Resolves multi-provider pool with base_spec
+        tiers_base = pool_manager.discover_tiers(base_spec="google_genai:gemini-2.5-flash")
+        assert tiers_base[0][0] == "openai:gpt-4o-mini"
+        assert tiers_base[1][0] == "google_genai:gemini-2.5-flash"
+        assert tiers_base[2][0] == "anthropic:claude-sonnet-4-6"
+
+        # 3. Model choices criteria reflect distinct providers
+        choices = pool_manager.get_model_choices(provider="google_genai")
+        assert "gpt-4o-mini" in choices["fast"].criteria
+        assert "gemini-2.5-flash" in choices["standard"].criteria
+        assert "claude-sonnet-4-6" in choices["powerful"].criteria
+
+
+def test_pool_manager_validate_pool(pool_manager):
+    """Verify validation of pool configurations and credential warning detection."""
+    # 1. Valid multi-provider pool
+    is_valid, warnings = pool_manager.validate_pool({
+        "fast": "openai:gpt-4o-mini",
+        "standard": "google_genai:gemini-2.5-flash",
+        "powerful": "anthropic:claude-sonnet-4-6",
+    })
+    assert is_valid is True
+    # warnings may be empty or contain missing credential notices depending on env
+    assert isinstance(warnings, list)
+
+    # 2. Incomplete pool (missing tier)
+    is_valid_incomplete, errs = pool_manager.validate_pool({
+        "fast": "openai:gpt-4o-mini",
+        "standard": "",
+    })
+    assert is_valid_incomplete is False
+    assert any("standard" in e for e in errs)
+
+    # 3. Unrecognized provider
+    is_valid_unknown, warn_unknown = pool_manager.validate_pool({
+        "fast": "invalid_provider:model-x",
+        "standard": "google_genai:gemini-2.5-flash",
+        "powerful": "anthropic:claude-sonnet-4-5",
+    })
+    assert is_valid_unknown is True
+    assert any("invalid_provider" in w for w in warn_unknown)
+

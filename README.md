@@ -1,12 +1,9 @@
 <div align="center">
 
-```text
-  ___  ____  ____   ____ _     ___  _   _ ____  
- / _ \|  _ \/ ___| / ___| |   / _ \| | | |  _ \ 
-| | | | |_) \___ \| |   | |  | | | | | | | | | |
-| |_| |  __/ ___) | |___| |__| |_| | |_| | |_| |
- \___/|_|   |____/ \____|_____\___/ \___/|____/ 
-```
+<a href="https://github.com/talkops-ai/opscloud">
+  <img src="assets/opscloud-banner.gif" alt="OpsCloud" width="800" />
+</a>
+
 ### Extensible Terminal Multi-Agent Framework for Cloud Operations & DevOps Coding
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)

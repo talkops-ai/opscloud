@@ -1,10 +1,10 @@
 """Reasoning effort support and provider-native thinking configuration.
 
-Translates standard `reasoning_effort` ('low', 'medium', 'high', 'max')
+Translates standard `reasoning_effort` ('low', 'medium', 'high', 'xhigh', 'max')
 into provider-native request shapes:
-- Google GenAI (Gemini): `include_thoughts=True`, `thinking_level="HIGH"`, `thinking_budget=8192`
-- Anthropic (Claude): `thinking={"type": "enabled", "budget_tokens": 8192}`
-- OpenAI: `reasoning={"effort": "high"}`
+- Google GenAI (Gemini): `include_thoughts=True`, `thinking_level="HIGH"`, `reasoning_effort="high"`
+- Anthropic (Claude): `output_config={"effort": ...}` and adaptive thinking (gated on model support)
+- OpenAI: `reasoning={"effort": "high"}` or `reasoning_effort="high"`
 """
 
 from __future__ import annotations
@@ -126,11 +126,14 @@ def _str_or_none(value: object) -> str | None:
     return None
 
 
+_LEGACY_ANTHROPIC_THINKING = {"type": "adaptive", "display": "summarized"}
+
+
 def _effort_paths(provider: str) -> tuple[tuple[str, ...], ...]:
     if provider in ("openai", "openai_codex", "azure_openai"):
         return (("reasoning", "effort"), ("reasoning_effort",))
     if provider == "anthropic":
-        return (("effort",), ("reasoning_effort",), ("output_config", "effort"), ("thinking",))
+        return (("effort",), ("reasoning_effort",), ("output_config", "effort"))
     if provider in ("google_genai", "google", "google_vertexai"):
         return (("thinking_level",), ("reasoning_effort",), ("thinking_config", "thinking_level"), ("include_thoughts",))
     return (("reasoning_effort",),)
@@ -167,13 +170,6 @@ def current_effort_from_model_params(model_spec: str | None, model_params: dict[
         output_config = model_params.get("output_config")
         if isinstance(output_config, Mapping) and "effort" in output_config:
             return _str_or_none(output_config["effort"])
-        thinking = model_params.get("thinking")
-        if isinstance(thinking, Mapping):
-            budget = thinking.get("budget_tokens")
-            if budget:
-                budget_map = {1024: "low", 2048: "low", 4096: "medium", 8192: "high", 16384: "max"}
-                if budget in budget_map:
-                    return budget_map[budget]
     elif provider in {"google_genai", "google", "google_vertexai"}:
         if model_params.get("thinking_budget") == 0 or model_params.get("include_thoughts") is False:
             return "off"
@@ -221,7 +217,12 @@ def without_effort_model_params(model_spec: str | None, existing: dict[str, Any]
     elif provider == "anthropic":
         cleaned.pop("effort", None)
         _remove_nested_key(cleaned, "output_config", "effort")
-        cleaned.pop("thinking", None)
+        thinking = cleaned.get("thinking")
+        if thinking == _LEGACY_ANTHROPIC_THINKING or (
+            isinstance(thinking, Mapping)
+            and ("budget_tokens" in thinking or thinking.get("type") in ("adaptive", "enabled"))
+        ):
+            cleaned.pop("thinking", None)
     elif provider in ("google_genai", "google", "google_vertexai"):
         cleaned.pop("thinking_level", None)
         cleaned.pop("thinking_budget", None)
@@ -258,14 +259,9 @@ def with_effort_model_params(model_spec: str | None, existing: dict[str, Any] | 
         updated["reasoning_effort"] = valid_level
         updated["include_thoughts"] = True
     elif provider == "anthropic":
+        # Do not inject fixed budget_tokens thinking: LangChain ChatAnthropic translates reasoning_effort
+        # natively to output_config.effort and adaptive thinking on supported models (e.g. claude-opus-5).
         updated["reasoning_effort"] = effort
-        budget = {
-            "low": 1024,
-            "medium": 4096,
-            "high": 8192,
-            "max": 16384,
-        }.get(eff_lower, 4096)
-        updated["thinking"] = {"type": "enabled", "budget_tokens": budget}
     elif provider in ("openai", "openai_codex", "azure_openai"):
         updated["reasoning_effort"] = effort
     elif provider == "fireworks":

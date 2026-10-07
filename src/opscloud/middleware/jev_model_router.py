@@ -918,7 +918,8 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         if final_effort in ("off", "none", "clear", "0", "reset") or not supported_efforts_for_model(selected_spec):
             merged_settings = without_effort_model_params(selected_spec, request.model_settings or {}) or {}
         else:
-            merged_settings = {**(request.model_settings or {}), **native_settings}
+            base_settings = without_effort_model_params(selected_spec, request.model_settings or {}) or {}
+            merged_settings = {**base_settings, **native_settings}
         updated_request = request.override(
             model=selected_model or chat_model,
             model_settings=merged_settings,
@@ -1001,7 +1002,8 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         if final_effort in ("off", "none", "clear", "0", "reset") or not supported_efforts_for_model(selected_spec):
             merged_settings = without_effort_model_params(selected_spec, request.model_settings or {}) or {}
         else:
-            merged_settings = {**(request.model_settings or {}), **native_settings}
+            base_settings = without_effort_model_params(selected_spec, request.model_settings or {}) or {}
+            merged_settings = {**base_settings, **native_settings}
         updated_request = request.override(
             model=selected_model or chat_model,
             model_settings=merged_settings,

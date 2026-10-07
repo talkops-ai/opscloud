@@ -296,14 +296,21 @@ class ModelConfig:
             Resolved base URL string or None.
         """
         provider_config = self.providers.get(provider)
-        if not provider_config:
-            return None
-        base_url_env = provider_config.get("base_url_env")
-        if base_url_env:
-            val = resolve_env_var(base_url_env)
+        if provider_config:
+            base_url_env = provider_config.get("base_url_env")
+            if base_url_env:
+                val = resolve_env_var(base_url_env)
+                if val:
+                    return val
+            if provider_config.get("base_url"):
+                return provider_config.get("base_url")
+
+        for env_name in PROVIDER_BASE_URL_ENV.get(provider, ()):
+            val = resolve_env_var(env_name)
             if val:
                 return val
-        return provider_config.get("base_url")
+
+        return None
 
     def get_base_url_env(self, provider: str) -> str | None:
         """Get the configured base URL environment variable name for a provider.
@@ -424,6 +431,8 @@ PROVIDER_SETTINGS_FIELD_MAP: dict[str, str] = {
 PROVIDER_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "google_genai": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "google": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "google_vertexai": ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"),
+    "google_anthropic_vertex": ("GOOGLE_CLOUD_PROJECT", "GOOGLE_API_KEY"),
     "mistralai": ("MISTRAL_API_KEY", "MISTRALAI_API_KEY"),
     "mistral": ("MISTRAL_API_KEY", "MISTRALAI_API_KEY"),
     "fireworks": ("FIREWORKS_API_KEY", "FIREWORKS_AI_API_KEY"),
@@ -587,11 +596,29 @@ def apply_stored_credentials(provider: str | None = None) -> bool:
                 os.environ[alias] = str(val)
         applied = True
 
-    if provider in ("google_genai", "google"):
+    # Reconcile provider endpoint / base URLs across canonical key and aliases
+    base_urls = PROVIDER_BASE_URL_ENV.get(provider, ())
+    if base_urls:
+        primary_base_url_var = base_urls[0]
+        stored_base_url = resolve_env_var(primary_base_url_var)
+        if not stored_base_url and len(base_urls) > 1:
+            for alias in base_urls[1:]:
+                stored_base_url = resolve_env_var(alias)
+                if stored_base_url:
+                    break
+        if stored_base_url:
+            os.environ[primary_base_url_var] = str(stored_base_url)
+            for alias in base_urls[1:]:
+                os.environ[alias] = str(stored_base_url)
+
+    if provider in ("google_genai", "google", "google_vertexai", "google_anthropic_vertex"):
         use_vertex = resolve_env_var("GOOGLE_GENAI_USE_VERTEXAI") or str(
             getattr(settings, "google_genai_use_vertexai", False)
         )
-        if use_vertex.strip().lower() in ("true", "1", "yes"):
+        if (
+            provider in ("google_vertexai", "google_anthropic_vertex")
+            or use_vertex.strip().lower() in ("true", "1", "yes")
+        ):
             os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
             applied = True
         proj = resolve_env_var("GOOGLE_CLOUD_PROJECT") or getattr(settings, "google_cloud_project", None)
@@ -769,6 +796,18 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     },
     "anthropic:claude-opus-5": {
         "name": "Claude Opus 5",
+        "max_input_tokens": 200_000,
+        "max_output_tokens": 64_000,
+        "text_inputs": True,
+        "image_inputs": True,
+        "reasoning_output": True,
+        "reasoning_effort_levels": ["low", "medium", "high", "xhigh", "max"],
+        "reasoning_effort_default": "high",
+        "tool_calling": True,
+        "structured_output": True,
+    },
+    "anthropic:claude-opus-5-5": {
+        "name": "Claude Opus 5.5",
         "max_input_tokens": 200_000,
         "max_output_tokens": 64_000,
         "text_inputs": True,
@@ -2880,6 +2919,7 @@ _PROVIDER_DEPENDENCIES: dict[str, tuple[str, str]] = {
     "nvidia": ("langchain_nvidia_ai_endpoints", "nvidia"),
     "ollama": ("langchain_ollama", "ollama"),
     "openai": ("langchain_openai", "openai"),
+    "openai_codex": ("langchain_openai", "openai"),
     "openrouter": ("langchain_openrouter", "openrouter"),
     "perplexity": ("langchain_perplexity", "perplexity"),
     "together": ("langchain_together", "together"),

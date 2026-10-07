@@ -117,6 +117,11 @@ class ServerProcess:
         """Start the langgraph server process synchronously and wait for it to become healthy."""
         generate_langgraph_json(self.runtime_dir)
 
+        # Ensure parent settings bootstrap has loaded environment before copying os.environ
+        from opscloud.config.settings import _ensure_bootstrap
+
+        _ensure_bootstrap()
+
         env = os.environ.copy()
         env.update(self.config.to_env())
 

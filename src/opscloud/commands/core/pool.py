@@ -53,7 +53,12 @@ class PoolHandler(BaseCommandHandler):
             tiers = pool_mgr.discover_tiers()
 
             is_custom = user_pool is not None
-            source_label = "Custom (`config.toml [agent_pool]`)" if is_custom else "Automatic Dynamic Discovery"
+            if is_custom:
+                provs = {t[0].split(":", 1)[0] for t in tiers.values() if ":" in t[0]}
+                multi_badge = " [Multi-Provider]" if len(provs) > 1 else f" [{next(iter(provs))}]"
+                source_label = f"Custom (`config.toml [agent_pool]`){multi_badge}"
+            else:
+                source_label = "Automatic Dynamic Discovery"
 
             msg = (
                 f"**Agent Model Pool Status** ({source_label}):\n"
@@ -78,10 +83,30 @@ class PoolHandler(BaseCommandHandler):
             if updates:
                 current = load_agent_pool() or {}
                 merged = {**current, **updates}
-                save_agent_pool(merged)
+
+                from opscloud.model.config import detect_provider
+                provs = set()
+                for v in merged.values():
+                    if ":" in v:
+                        provs.add(v.split(":", 1)[0])
+                    else:
+                        inferred = detect_provider(v)
+                        if inferred:
+                            provs.add(inferred)
+
+                provider_to_save = next(iter(provs)) if len(provs) == 1 else ("multi" if len(provs) > 1 else None)
+                save_agent_pool(merged, provider=provider_to_save)
+
+                from opscloud.model.config import has_provider_credentials
+                warnings = []
+                for p in provs:
+                    if has_provider_credentials(p) is False:
+                        warnings.append(f"⚠️ Notice: Credentials for provider '{p}' are not configured.")
+                warn_msg = ("\n\n" + "\n".join(warnings)) if warnings else ""
+
                 return CommandResult(
                     success=True,
-                    message=f"**Agent Model Pool Updated:** `{merged}` saved to `config.toml [agent_pool]`.",
+                    message=f"**Agent Model Pool Updated:** `{merged}` saved to `config.toml [agent_pool]`.{warn_msg}",
                 )
             return CommandResult(
                 success=False,

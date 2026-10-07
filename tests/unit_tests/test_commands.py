@@ -323,6 +323,38 @@ async def test_pool_selector_save_and_reset_actions():
         assert load_agent_pool() is None
 
 
+async def test_pool_selector_dismiss_idempotency():
+    """Verify PoolSelectorScreen dismissal is idempotent and avoids ScreenStackError on double dismiss."""
+    from textual.app import App
+    from opscloud.ui.widgets.pool_selector import PoolSelectorScreen
+
+    dismissed_results = []
+
+    class TestApp(App[None]):
+        def on_mount(self) -> None:
+            self.push_screen(
+                PoolSelectorScreen(active_provider="google_genai"),
+                lambda res: dismissed_results.append(res),
+            )
+
+    test_app = TestApp()
+    async with test_app.run_test() as pilot:
+        screen = test_app.screen
+        assert isinstance(screen, PoolSelectorScreen)
+
+        # 1st dismiss
+        screen.dismiss(None)
+        await pilot.pause()
+        assert screen._dismissed is True
+        assert len(dismissed_results) == 1
+
+        # 2nd dismiss (simulating double click or rapid repeat)
+        screen.dismiss(None)
+        await pilot.pause()
+        assert len(dismissed_results) == 1
+
+
+
 @pytest.mark.asyncio
 async def test_goal_command_conversational_amendment_when_active():
     from opscloud.commands.power.goal import GoalHandler, get_goal_state
@@ -490,6 +522,118 @@ async def test_context_command_no_emojis_and_complete_metrics():
     assert "2 skills" in msg
     assert "**Tools:** fetch_url, bash, edit_file" in msg
     assert "**Skills:** skill-creator, cloud-doctor" in msg
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_pool_command_set_and_status():
+    from opscloud.commands._base import CommandContext
+    from opscloud.commands.core.pool import PoolHandler
+    from opscloud.config.toml_config import clear_agent_pool, load_agent_pool
+
+    clear_agent_pool()
+    handler = PoolHandler()
+
+    # 1. Set multi-provider pool
+    ctx_set = CommandContext(
+        app=None,
+        raw_command="/pool set fast=openai:gpt-4o-mini standard=google_genai:gemini-2.5-flash powerful=anthropic:claude-sonnet-4-5",
+        args="set fast=openai:gpt-4o-mini standard=google_genai:gemini-2.5-flash powerful=anthropic:claude-sonnet-4-5",
+    )
+    res_set = await handler.execute(ctx_set)
+    assert res_set.success is True
+    assert "Agent Model Pool Updated" in res_set.message
+
+    saved = load_agent_pool()
+    assert saved is not None
+    assert saved["fast"] == "openai:gpt-4o-mini"
+    assert saved["standard"] == "google_genai:gemini-2.5-flash"
+    assert saved["powerful"] == "anthropic:claude-sonnet-4-5"
+    assert saved.get("provider") == "multi"
+
+    # 2. Status inspection detects multi-provider badge
+    ctx_status = CommandContext(app=None, raw_command="/pool status", args="status")
+    res_status = await handler.execute(ctx_status)
+    assert res_status.success is True
+    assert "Multi-Provider" in res_status.message
+    assert "openai:gpt-4o-mini" in res_status.message
+    assert "google_genai:gemini-2.5-flash" in res_status.message
+    assert "anthropic:claude-sonnet-4-5" in res_status.message
+
+    clear_agent_pool()
+
+
+@pytest.mark.asyncio
+async def test_pool_selector_screen_multi_provider_ui():
+    from textual.app import App
+    from textual.widgets import Select
+    from opscloud.ui.widgets.pool_selector import PoolSelectorScreen
+    from opscloud.config.toml_config import clear_agent_pool, load_agent_pool
+
+    clear_agent_pool()
+
+    saved_result = None
+
+    def on_dismiss(res):
+        nonlocal saved_result
+        saved_result = res
+
+    class TestApp(App[None]):
+        def on_mount(self) -> None:
+            self.push_screen(PoolSelectorScreen(active_provider="google_genai"), on_dismiss)
+
+    test_app = TestApp()
+    async with test_app.run_test(size=(120, 50)) as pilot:
+        screen = test_app.screen
+        assert isinstance(screen, PoolSelectorScreen)
+
+        # 1. Verify individual provider selectors exist
+        p_fast = screen.query_one("#select-provider-fast", Select)
+        p_std = screen.query_one("#select-provider-standard", Select)
+        p_pow = screen.query_one("#select-provider-powerful", Select)
+        assert p_fast is not None
+        assert p_std is not None
+        assert p_pow is not None
+
+        # 2. Change Fast provider to openai
+        p_fast.value = "openai"
+        await pilot.pause()
+
+        # Fast model selector options are now OpenAI models
+        s_fast = screen.query_one("#select-fast", Select)
+        assert any("openai" in opt[1] for opt in s_fast._options)
+        s_fast.value = "openai:gpt-4o-mini"
+
+        # 3. Change Powerful provider to anthropic
+        p_pow.value = "anthropic"
+        await pilot.pause()
+
+        s_pow = screen.query_one("#select-powerful", Select)
+        assert any("anthropic" in opt[1] for opt in s_pow._options)
+        s_pow.value = "anthropic:claude-sonnet-4-5"
+
+        # 4. Standard remains google_genai
+        s_std = screen.query_one("#select-standard", Select)
+        assert any("google_genai" in opt[1] for opt in s_std._options)
+        s_std.value = "google_genai:gemini-2.5-flash"
+
+        # 5. Save multi-provider pool
+        await pilot.click("#btn-save")
+        await pilot.pause()
+
+        assert saved_result is not None
+        assert saved_result["fast"] == "openai:gpt-4o-mini"
+        assert saved_result["standard"] == "google_genai:gemini-2.5-flash"
+        assert saved_result["powerful"] == "anthropic:claude-sonnet-4-5"
+        assert saved_result["provider"] == "multi"
+
+        persisted = load_agent_pool()
+        assert persisted is not None
+        assert persisted["fast"] == "openai:gpt-4o-mini"
+        assert persisted["standard"] == "google_genai:gemini-2.5-flash"
+        assert persisted["powerful"] == "anthropic:claude-sonnet-4-5"
+        assert persisted["provider"] == "multi"
+
+    clear_agent_pool()
 
 
 

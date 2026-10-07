@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from opscloud.utils.logger import get_logger
+import asyncio
 from typing import Any, ClassVar
 
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Click
+from textual.fuzzy import Matcher
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
@@ -28,6 +29,7 @@ from opscloud.model.config import (
     load_recent_models,
     save_default_model,
 )
+from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -70,13 +72,6 @@ class ModelOption(Static):
             provider=provider,
         )
 
-    class Hovered(Message):
-        """Posted when a model option is hovered with the mouse."""
-
-        def __init__(self, index: int) -> None:
-            super().__init__()
-            self.index = index
-
     class Clicked(Message):
         """Posted when a model option is clicked."""
 
@@ -92,9 +87,6 @@ class ModelOption(Static):
             self.provider = provider
             self.index = index
             self.effort = effort
-
-    def on_enter(self) -> None:
-        self.post_message(self.Hovered(self.index))
 
     def on_click(self, event: Click) -> None:
         event.stop()
@@ -130,13 +122,14 @@ class ModelOption(Static):
         self.update(self.render_label_text(show_specs))
 
 
-
 class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, str] | None]):
     """Full-screen modal for interactive model selection."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("up", "move_up", "Up", show=False, priority=True),
         Binding("down", "move_down", "Down", show=False, priority=True),
+        Binding("pageup", "page_up", "Page Up", show=False, priority=True),
+        Binding("pagedown", "page_down", "Page Down", show=False, priority=True),
         Binding("tab", "tab_complete", "Tab complete", show=False, priority=True),
         Binding("enter", "select", "Select", show=False, priority=True),
         Binding("ctrl+s", "set_default", "Set default", show=False, priority=True),
@@ -276,6 +269,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         self._recent_specs = load_recent_models()
         self.pending_install_extra: str | None = None
         self._dismissed: bool = False
+        self._loaded: bool = False
+        self._rebuild_counter: int = 0
 
     # ── Compose ──────────────────────────────────────────
 
@@ -305,19 +300,73 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             yield Static("", classes="model-detail-footer", id="model-detail-footer", markup=True)
 
             yield Static(
-                "↑/↓ navigate • Tab autocomplete • Enter select • Ctrl+S set default • Ctrl+R recommended • Ctrl+N IDs",
+                "↑/↓ navigate • PgUp/PgDn page • Tab autocomplete • Enter select • Ctrl+S default • Ctrl+R recommended • Ctrl+N IDs",
                 classes="model-selector-help",
             )
 
     def on_mount(self) -> None:
-        raw_models = get_available_models_list()
-        self._all_models = [("auto", "Autonomous Tier Routing (TypeSafe Jev System 1)", "dynamic")] + raw_models
-        self._apply_filter()
-        self._rebuild_options()
         try:
             self.query_one("#model-filter", Input).focus()
         except NoMatches:
             pass
+        self.call_after_refresh(self._fit_model_list)
+
+        try:
+            has_app = self.app is not None
+        except Exception:
+            has_app = False
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if has_app and loop and loop.is_running():
+            self.run_worker(self._async_load_models(), exclusive=True)
+        else:
+            self._sync_load_models()
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._fit_model_list)
+
+    def _fit_model_list(self) -> None:
+        try:
+            container = self.query_one(Vertical)
+            body = self.query_one(".model-list", VerticalScroll)
+        except NoMatches:
+            return
+        non_body_height = max(0, container.region.height - body.region.height)
+        available_height = self.size.height - non_body_height
+        max_height = max(1, min(16, available_height))
+        current = body.styles.max_height
+        if current is not None and current.cells == max_height:
+            return
+        body.styles.max_height = max_height
+
+    def _load_model_data(self) -> list[tuple[str, str, str]]:
+        raw_models = get_available_models_list()
+        return [("auto", "Autonomous Tier Routing (TypeSafe Jev System 1)", "dynamic")] + raw_models
+
+    async def _async_load_models(self) -> None:
+        try:
+            raw_models = await asyncio.to_thread(self._load_model_data)
+        except Exception:
+            logger.exception("Failed to load model data in background")
+            raw_models = [("auto", "Autonomous Tier Routing (TypeSafe Jev System 1)", "dynamic")]
+        if getattr(self, "_dismissed", False):
+            return
+        self._all_models = raw_models
+        self._loaded = True
+        self._apply_filter()
+        await self._rebuild_options()
+        self._update_info()
+
+    def _sync_load_models(self) -> None:
+        self._all_models = self._load_model_data()
+        self._loaded = True
+        self._apply_filter()
+        self._rebuild_options_sync()
+        self._update_info()
 
     # ── Info Line ────────────────────────────────────────
 
@@ -339,10 +388,25 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
     def _apply_filter(self) -> None:
         query = self._filter_text.strip().lower()
         if query:
-            self._filtered_models = [
-                m for m in self._all_models
-                if query in m[0].lower() or query in m[1].lower() or query in m[2].lower()
-            ]
+            tokens = query.split()
+            try:
+                matchers = [Matcher(tok, case_sensitive=False) for tok in tokens]
+                scored: list[tuple[float, tuple[str, str, str]]] = []
+                for item in self._all_models:
+                    spec, name, prov = item
+                    prov_display = get_provider_display_name(prov)
+                    haystack = f"{spec} {name} {prov} {prov_display}".lower()
+                    scores = [m.match(haystack) for m in matchers]
+                    if all(s > 0 for s in scores) or all(tok in haystack for tok in tokens):
+                        score = min(scores) if scores and all(s > 0 for s in scores) else 0.5
+                        scored.append((score, item))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                self._filtered_models = [item for _, item in scored]
+            except Exception:
+                self._filtered_models = [
+                    m for m in self._all_models
+                    if all(t in f"{m[0]} {m[1]} {m[2]}".lower() for t in tokens)
+                ]
         elif self._recommended_only:
             self._filtered_models = [
                 m for m in self._all_models if m[0] in RECOMMENDED_SPECS
@@ -357,25 +421,35 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         if event.input.id == "model-filter":
             self._filter_text = event.value
             self._selected_index = 0
-            self._apply_filter()
-            self._rebuild_options()
             self._update_info()
+            if not self._loaded:
+                return
+            self._apply_filter()
+            self._schedule_rebuild()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_select()
+
+    def _schedule_rebuild(self) -> None:
+        self._rebuild_counter += 1
+        gen = self._rebuild_counter
+        self.call_after_refresh(self._debounced_rebuild, gen)
+
+    async def _debounced_rebuild(self, gen: int) -> None:
+        if gen != self._rebuild_counter:
+            return
+        await self._rebuild_options()
 
     # ── Rebuild Options ──────────────────────────────────
 
-    def _rebuild_options(self) -> None:
-        if not self._options_container:
-            return
-
-        self._options_container.remove_children()
+    def _build_widgets(self) -> list[Static]:
+        """Construct all Static widgets and update _option_widgets and _flat_order."""
         self._option_widgets.clear()
-
         if not self._filtered_models:
-            self._options_container.mount(
-                Static("No models match your filter.", classes="model-option")
-            )
-            self._update_detail_footer(None)
-            return
+            self._flat_order = []
+            if not self._loaded:
+                return [Static("Loading models...", classes="model-option")]
+            return [Static("No models match your filter.", classes="model-option")]
 
         has_filter = bool(self._filter_text.strip())
 
@@ -392,15 +466,23 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         for spec, name, prov in self._filtered_models:
             groups.setdefault(prov, []).append((spec, name, prov))
 
-        # Sort provider groups: dynamic router first, active provider second,
-        # then configured providers, followed by unconfigured providers.
+        # Pre-resolve provider auth & installation upfront (Root Cause 4)
+        all_provs = set(groups.keys()) | {prov for _, _, prov in recent_matches}
+        auth_statuses: dict[str, ProviderAuthStatus] = {
+            p: get_provider_auth_status(p) for p in all_provs
+        }
+        pkg_installed_statuses: dict[str, bool] = {
+            p: is_provider_package_installed(p) for p in all_provs
+        }
+
+        # Sort provider groups
         def _provider_sort_key(prov: str) -> tuple[int, int, str]:
             if prov == "dynamic":
                 return (0, 0, prov)
             if self._current_provider and prov == self._current_provider:
                 return (1, 0, prov)
-            auth = get_provider_auth_status(prov)
-            is_authed = auth.as_legacy_bool() is True
+            auth = auth_statuses.get(prov)
+            is_authed = auth.as_legacy_bool() is True if auth else False
             tier = 2 if is_authed else 3
             p_idx = (
                 DEFAULT_PROVIDER_PRIORITY.index(prov)
@@ -420,15 +502,12 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         if self._selected_index >= len(flat_order):
             self._selected_index = max(0, len(flat_order) - 1)
 
+        widgets: list[Static] = []
         current_flat_index = 0
-
-        # Effort is managed separately via /config or /effort — show one entry per model
-        def get_model_efforts(_spec: str) -> list[str | None]:
-            return [None]
 
         # 1. Render Pinned Recent Section
         if recent_matches:
-            self._options_container.mount(
+            widgets.append(
                 Static(
                     f"[bold]{_RECENT_SECTION_LABEL}[/bold]",
                     classes="model-provider-header",
@@ -436,45 +515,44 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
                 )
             )
             for spec, name, prov in recent_matches:
-                for eff in get_model_efforts(spec):
-                    auth = get_provider_auth_status(prov)
-                    is_selected = current_flat_index == self._selected_index
-                    is_current = spec == self._current_spec
-                    is_default = (spec == self._default_spec) and not eff
-                    prov_tag = get_provider_display_name(prov)
+                auth = auth_statuses.get(prov)
+                is_selected = current_flat_index == self._selected_index
+                is_current = spec == self._current_spec
+                is_default = spec == self._default_spec
+                prov_tag = get_provider_display_name(prov)
 
-                    label = self._format_row_label(
-                        display_name=name,
-                        spec=spec if self._show_specs else spec,
-                        selected=is_selected,
-                        is_current=is_current,
-                        is_default=is_default,
-                        provider_tag=prov_tag,
-                    )
-                    classes = "model-option"
-                    if is_selected:
-                        classes += " model-option-selected"
-                    if is_current:
-                        classes += " model-option-current"
+                label = self._format_row_label(
+                    display_name=name,
+                    spec=spec,
+                    selected=is_selected,
+                    is_current=is_current,
+                    is_default=is_default,
+                    provider_tag=prov_tag,
+                )
+                classes = "model-option"
+                if is_selected:
+                    classes += " model-option-selected"
+                if is_current:
+                    classes += " model-option-current"
 
-                    opt = ModelOption(
-                        label,
-                        spec,
-                        prov,
-                        current_flat_index,
-                        display_name=name,
-                        is_selected=is_selected,
-                        is_current=is_current,
-                        is_default=is_default,
-                        provider_tag=prov_tag,
-                        effort=eff,
-                        auth_status=auth,
-                        classes=classes,
-                        show_provider=True,
-                    )
-                    self._options_container.mount(opt)
-                    self._option_widgets.append(opt)
-                    current_flat_index += 1
+                opt = ModelOption(
+                    label,
+                    spec,
+                    prov,
+                    current_flat_index,
+                    display_name=name,
+                    is_selected=is_selected,
+                    is_current=is_current,
+                    is_default=is_default,
+                    provider_tag=prov_tag,
+                    effort=None,
+                    auth_status=auth,
+                    classes=classes,
+                    show_provider=True,
+                )
+                widgets.append(opt)
+                self._option_widgets.append(opt)
+                current_flat_index += 1
 
         # 2. Render Provider-Grouped Sections
         for prov in sorted_provs:
@@ -483,17 +561,17 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
                 header_text = "[bold]TypeSafe Jev (System 1)[/bold]"
             else:
                 header_name = get_provider_display_name(prov)
-                auth = get_provider_auth_status(prov)
-                pkg_installed = is_provider_package_installed(prov)
+                auth = auth_statuses.get(prov)
+                pkg_installed = pkg_installed_statuses.get(prov, False)
 
                 if not pkg_installed:
                     header_text = f"[bold]{header_name}[/bold] [dim](not installed)[/dim]"
-                elif not auth.as_legacy_bool():
+                elif not auth or not auth.as_legacy_bool():
                     header_text = f"[bold]{header_name}[/bold] [dim](missing credentials)[/dim]"
                 else:
                     header_text = f"[bold]{header_name}[/bold]"
 
-            self._options_container.mount(
+            widgets.append(
                 Static(
                     header_text,
                     classes="model-provider-header",
@@ -502,49 +580,88 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             )
 
             for spec, name, _ in items:
-                for eff in get_model_efforts(spec):
-                    auth = get_provider_auth_status(prov)
-                    is_selected = current_flat_index == self._selected_index
-                    is_current = spec == self._current_spec
-                    is_default = (spec == self._default_spec) and not eff
+                auth = auth_statuses.get(prov)
+                is_selected = current_flat_index == self._selected_index
+                is_current = spec == self._current_spec
+                is_default = spec == self._default_spec
 
-                    label = self._format_row_label(
-                        display_name=name,
-                        spec=spec if self._show_specs else spec,
-                        selected=is_selected,
-                        is_current=is_current,
-                        is_default=is_default,
-                        provider_tag=None,
-                    )
-                    classes = "model-option"
-                    if is_selected:
-                        classes += " model-option-selected"
-                    if is_current:
-                        classes += " model-option-current"
+                label = self._format_row_label(
+                    display_name=name,
+                    spec=spec,
+                    selected=is_selected,
+                    is_current=is_current,
+                    is_default=is_default,
+                    provider_tag=None,
+                )
+                classes = "model-option"
+                if is_selected:
+                    classes += " model-option-selected"
+                if is_current:
+                    classes += " model-option-current"
 
-                    opt = ModelOption(
-                        label,
-                        spec,
-                        prov,
-                        current_flat_index,
-                        display_name=name,
-                        is_selected=is_selected,
-                        is_current=is_current,
-                        is_default=is_default,
-                        provider_tag=None,
-                        effort=eff,
-                        auth_status=auth,
-                        classes=classes,
-                        show_provider=False,
-                    )
-                    self._options_container.mount(opt)
-                    self._option_widgets.append(opt)
-                    current_flat_index += 1
+                opt = ModelOption(
+                    label,
+                    spec,
+                    prov,
+                    current_flat_index,
+                    display_name=name,
+                    is_selected=is_selected,
+                    is_current=is_current,
+                    is_default=is_default,
+                    provider_tag=None,
+                    effort=None,
+                    auth_status=auth,
+                    classes=classes,
+                    show_provider=False,
+                )
+                widgets.append(opt)
+                self._option_widgets.append(opt)
+                current_flat_index += 1
 
-        self._update_detail_footer(
-            flat_order[self._selected_index] if flat_order and self._selected_index < len(flat_order) else None
-        )
-        self._scroll_to_selected()
+        return widgets
+
+    async def _rebuild_options(self) -> None:
+        if not self._options_container:
+            return
+
+        self._rebuild_counter += 1
+        gen = self._rebuild_counter
+
+        widgets = self._build_widgets()
+        await self._options_container.remove_children()
+
+        if gen != self._rebuild_counter:
+            return
+
+        if widgets:
+            await self._options_container.mount(*widgets)
+
+        if not self._filtered_models:
+            self._update_detail_footer(None)
+        else:
+            self._update_detail_footer(
+                self._flat_order[self._selected_index]
+                if self._flat_order and self._selected_index < len(self._flat_order)
+                else None
+            )
+            self._scroll_to_selected()
+
+    def _rebuild_options_sync(self) -> None:
+        if not self._options_container:
+            return
+        widgets = self._build_widgets()
+        self._options_container.remove_children()
+        if widgets:
+            self._options_container.mount(*widgets)
+        if not self._filtered_models:
+            self._update_detail_footer(None)
+        else:
+            self._update_detail_footer(
+                self._flat_order[self._selected_index]
+                if self._flat_order and self._selected_index < len(self._flat_order)
+                else None
+            )
+            self._scroll_to_selected()
 
     def _format_row_label(
         self,
@@ -626,18 +743,15 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         cap_parts = []
         for key, tag in capabilities:
             if prof.get(key):
-                cap_parts.append(f"[green]{tag}[/green]")
+                mod_parts_cap = f"[green]{tag}[/green]"
             else:
-                cap_parts.append(f"[dim]{tag}[/dim]")
+                mod_parts_cap = f"[dim]{tag}[/dim]"
+            cap_parts.append(mod_parts_cap)
         line3 = f"Capabilities: {' '.join(cap_parts)}"
 
         footer.update(f"{line1}\n{line2}\n{line3}")
 
     # ── Selection Movement ───────────────────────────────
-
-    def on_model_option_hovered(self, event: ModelOption.Hovered) -> None:
-        if event.index != self._selected_index:
-            self._set_selected_index(event.index, scroll=False)
 
     def _set_selected_index(self, new_index: int, scroll: bool = False) -> None:
         if not self._option_widgets:
@@ -666,7 +780,9 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
     def _move_selection(self, delta: int) -> None:
         if not self._option_widgets:
             return
-        self._set_selected_index(self._selected_index + delta, scroll=True)
+        count = len(self._option_widgets)
+        new_index = (self._selected_index + delta) % count
+        self._set_selected_index(new_index, scroll=True)
 
     def _scroll_to_selected(self) -> None:
         if not self._option_widgets or self._selected_index >= len(self._option_widgets):
@@ -681,12 +797,20 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
                     widget.scroll_visible(animate=False)
                 except Exception:
                     pass
+        elif self._selected_index == len(self._option_widgets) - 1:
+            try:
+                scroll = self.query_one(".model-list", VerticalScroll)
+                scroll.scroll_end(animate=False)
+            except Exception:
+                try:
+                    widget.scroll_visible(animate=False)
+                except Exception:
+                    pass
         else:
             try:
                 widget.scroll_visible(animate=False)
             except Exception:
                 pass
-
 
     # ── Actions ──────────────────────────────────────────
 
@@ -695,6 +819,42 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
 
     def action_move_down(self) -> None:
         self._move_selection(1)
+
+    def _visible_page_size(self) -> int:
+        default_page_size = 10
+        try:
+            scroll = self.query_one(".model-list", VerticalScroll)
+            height = scroll.size.height
+        except Exception:
+            return default_page_size
+        if height <= 0:
+            return default_page_size
+        total_models = len(self._option_widgets)
+        if total_models == 0:
+            return default_page_size
+        num_headers = len(self.query(".model-provider-header"))
+        header_rows = max(0, num_headers * 2 - 1) if num_headers else 0
+        total_rows = total_models + header_rows
+        return max(1, int(height * total_models / total_rows))
+
+    def action_page_up(self) -> None:
+        if not self._option_widgets:
+            return
+        page = self._visible_page_size()
+        target = max(0, self._selected_index - page)
+        delta = target - self._selected_index
+        if delta != 0:
+            self._move_selection(delta)
+
+    def action_page_down(self) -> None:
+        if not self._option_widgets:
+            return
+        count = len(self._option_widgets)
+        page = self._visible_page_size()
+        target = min(count - 1, self._selected_index + page)
+        delta = target - self._selected_index
+        if delta != 0:
+            self._move_selection(delta)
 
     def action_select(self) -> None:
         if getattr(self, "_dismissed", False):
@@ -717,10 +877,10 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         if getattr(self, "_dismissed", False):
             return
         from opscloud.model.config import (
+            get_credential_env_var,
+            get_provider_auth_status,
             is_provider_package_installed,
             provider_install_extra,
-            get_provider_auth_status,
-            get_credential_env_var,
         )
 
         extra = provider_install_extra(provider)
@@ -741,7 +901,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             if result is AuthResult.SAVED:
                 self.dismiss((model_spec, provider, effort))
             else:
-                self._rebuild_options()
+                self._schedule_rebuild()
 
         self.app.push_screen(
             AuthPromptScreen(
@@ -752,7 +912,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             _on_auth_done,
         )
 
-        self.pending_install_extra: str | None = None
+        self.pending_install_extra = None
 
     def _prompt_install_provider(
         self, model_spec: str, provider: str, extra: str, effort: str | None = None
@@ -764,7 +924,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
                 self.pending_install_extra = extra
                 self.dismiss((model_spec, provider, effort))
             else:
-                self._rebuild_options()
+                self._schedule_rebuild()
 
         self.app.push_screen(
             InstallProviderConfirmScreen(provider, extra, model_spec),
@@ -845,14 +1005,13 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         self._recommended_only = not self._recommended_only
         self._selected_index = 0
         self._apply_filter()
-        self._rebuild_options()
+        self._schedule_rebuild()
         self._update_info()
 
     def action_toggle_names(self) -> None:
         self._show_specs = not self._show_specs
         for opt in self._option_widgets:
             opt.update(opt.render_label_text(self._show_specs))
-
 
     def on_model_option_clicked(self, event: ModelOption.Clicked) -> None:
         if getattr(self, "_dismissed", False):

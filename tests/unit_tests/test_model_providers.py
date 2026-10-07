@@ -9,7 +9,8 @@ from opscloud.model.config import (
     get_provider_display_name,
     resolve_model_spec,
 )
-from opscloud.model.factory import create_model
+from opscloud.exceptions import ModelConfigError
+from opscloud.model.factory import clear_model_cache, create_model
 from opscloud.model.reasoning import (
     default_effort_for_model,
     is_effort_supported_for_model,
@@ -105,8 +106,14 @@ def test_format_token_counts():
     assert format_token_count(500) == "500"
 
 
-def test_create_model_missing_credentials(monkeypatch):
-    # Ensure credential env var is unset
+def test_create_model_missing_credentials(monkeypatch, tmp_path):
+    from opscloud.config import paths
+    from opscloud.config.settings import reset_settings_for_testing
+    from opscloud.model.factory import clear_model_cache
+
+    clear_model_cache()
+    reset_settings_for_testing()
+    monkeypatch.setattr(paths, "GLOBAL_ENV_PATH", tmp_path / "nonexistent_env")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPSCLOUD_ANTHROPIC_API_KEY", raising=False)
 
@@ -398,12 +405,17 @@ def test_model_selector_smooth_navigation_and_jev_system1():
     assert not opt0.is_selected
     assert opt1.is_selected
 
-    # Hovering over option 0: updates selection back to 0 without rebuilding DOM
-    hover_event = ModelOption.Hovered(index=0)
-    screen.on_model_option_hovered(hover_event)
+    # Moving down wraps around to 0 smoothly
+    screen._move_selection(1)
     assert screen._selected_index == 0
     assert opt0.is_selected
     assert not opt1.is_selected
+
+    # Moving up from 0 wraps around to 1
+    screen._move_selection(-1)
+    assert screen._selected_index == 1
+    assert not opt0.is_selected
+    assert opt1.is_selected
 
 
 async def test_model_selector_dismiss_idempotency_and_auth_check(monkeypatch: pytest.MonkeyPatch):
@@ -514,3 +526,68 @@ def test_gemini_3_8_flash_spec_and_reasoning_profiles():
         assert is_effort_supported_for_model(spec, "high") is True
         assert default_effort_for_model(spec) == "medium"
         assert set(supported_efforts_for_model(spec)) == {"low", "medium", "high"}
+
+
+def test_claude_on_google_vertexai_raises_actionable_error():
+    """Requesting a Claude model under google_vertexai instructs the user to use google_anthropic_vertex."""
+    clear_model_cache()
+    with pytest.raises(ModelConfigError) as exc_info:
+        create_model("google_vertexai:claude-3-5-sonnet-v2@20241022")
+    assert "google_anthropic_vertex" in str(exc_info.value)
+    assert "google_vertexai" in str(exc_info.value)
+
+
+async def test_model_selector_batch_mount_navigation_and_fuzzy_search():
+    """Verify batch mount, wrap-around keyboard navigation, fuzzy search, and page navigation."""
+    from opscloud.ui.app import OpsCloudApp
+    from opscloud.ui.widgets.model_selector import ModelSelectorScreen
+    from textual.widgets import Input
+
+    app = OpsCloudApp()
+    async with app.run_test(headless=True) as pilot:
+        screen = ModelSelectorScreen()
+        app.push_screen(screen)
+        await pilot.pause()
+
+        # Input should be focused immediately
+        inp = screen.query_one("#model-filter", Input)
+        assert inp.has_focus
+
+        # Verify models are loaded and options mounted in batch
+        assert screen._loaded is True
+        assert len(screen._option_widgets) > 0
+        total_widgets = len(screen._option_widgets)
+
+        # Initial selection should be at index 0
+        assert screen._selected_index == 0
+
+        # Up arrow from 0 should wrap around to the last item
+        screen.action_move_up()
+        assert screen._selected_index == total_widgets - 1
+
+        # Down arrow from last item should wrap around to 0
+        screen.action_move_down()
+        assert screen._selected_index == 0
+
+        # Page down moves by page
+        screen.action_page_down()
+        assert screen._selected_index > 0
+
+        # Page up moves back towards 0
+        screen.action_page_up()
+        assert screen._selected_index == 0
+
+        # Test fuzzy filtering
+        inp.value = "gemini 3.8"
+        await pilot.pause()
+        filtered_specs = [opt.model_spec for opt in screen._option_widgets]
+        assert any("gemini-3.8-flash" in s for s in filtered_specs)
+
+        # Tab completion
+        screen.action_tab_complete()
+        assert inp.value == screen._option_widgets[screen._selected_index].model_spec
+
+        # Resize refit
+        screen._fit_model_list()
+
+

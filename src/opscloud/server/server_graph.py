@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 import os
+from pathlib import Path
 import sys
 from typing import Any, NamedTuple
 
@@ -47,6 +48,12 @@ async def _make_graphs() -> ServerRuntime:
     from opscloud.project_utils import get_server_project_context
 
     project_context = get_server_project_context()
+    effective_cwd = project_context.user_cwd if project_context else (Path(config.cwd) if config.cwd else None)
+
+    # Ensure environment is loaded with effective user cwd context asynchronously
+    from opscloud.config.settings import _load_dotenv
+
+    await asyncio.to_thread(_load_dotenv, start_path=effective_cwd, refresh_loaded=True)
 
     if config.aws_profile:
         os.environ["AWS_PROFILE"] = config.aws_profile

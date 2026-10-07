@@ -10,6 +10,7 @@ It can be hydrated from:
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 import contextlib
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -32,11 +33,16 @@ from opscloud.config.paths import (
     DEFAULT_AGENT_NAME,
     DOTENV_DENIED_ENV_KEYS,
     ENV_PREFIX,
+    GLOBAL_ENV_PATH,
+    PROJECT_DOTENV_DENIED_ENV_KEYS,
     RELOADABLE_FIELDS,
     find_project_root,
 )
 
 logger = get_logger(__name__)
+
+# Snapshot of environment keys present at import time from shell/calling process
+_INITIAL_SHELL_ENV: frozenset[str] = frozenset(os.environ.keys())
 
 
 # ── Bootstrap State ──────────────────────────────────────
@@ -153,13 +159,74 @@ def _resolve_env_var_from(env: dict[str, str], name: str) -> str | None:
 
 # ── Dotenv Loading ───────────────────────────────────────
 
+# Tracks values injected by _load_dotenv into os.environ (mapping key -> value)
+_dotenv_loaded_values: dict[str, str] = {}
+
+
+def _strip_dotenv_loaded_values(env: MutableMapping[str, str]) -> None:
+    """Remove values this loader injected, keeping any modified since.
+
+    Callers that build a child environment or reload the stack have to start
+    from the shell's own values rather than from a previous application.
+    """
+    for key, value in list(_dotenv_loaded_values.items()):
+        if env.get(key) == value:
+            env.pop(key, None)
+
+
+def resolve_read_project_dotenv() -> bool:
+    """Determine whether project-level .env files should be loaded.
+
+    Checked in order of trust:
+    1. Shell/process environment: OPSCLOUD_READ_PROJECT_DOTENV or READ_PROJECT_DOTENV
+    2. User config: ~/.opscloud/config.toml [startup] read_project_dotenv
+    3. User global env: ~/.opscloud/.env READ_PROJECT_DOTENV or OPSCLOUD_READ_PROJECT_DOTENV
+    Defaults to True.
+    """
+    for key in ("OPSCLOUD_READ_PROJECT_DOTENV", "READ_PROJECT_DOTENV"):
+        val = os.environ.get(key)
+        if val is not None and val.strip() != "":
+            return val.strip().lower() not in ("0", "false", "no", "off")
+
+    try:
+        toml_data = load_config_toml(CONFIG_PATH)
+        startup_sec = toml_data.get("startup")
+        if isinstance(startup_sec, dict) and "read_project_dotenv" in startup_sec:
+            raw = startup_sec["read_project_dotenv"]
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        pass
+
+    if GLOBAL_ENV_PATH.is_file():
+        try:
+            from dotenv import dotenv_values
+
+            global_vals = dotenv_values(GLOBAL_ENV_PATH)
+            for key in ("OPSCLOUD_READ_PROJECT_DOTENV", "READ_PROJECT_DOTENV"):
+                val = global_vals.get(key)
+                if val is not None and str(val).strip() != "":
+                    return str(val).strip().lower() not in ("0", "false", "no", "off")
+        except Exception:
+            pass
+
+    return True
+
 
 def _load_dotenv(*, start_path: Path | None = None, refresh_loaded: bool = False) -> None:
-    """Load .env files: project-level (walk-up), then global ~/.opscloud/.env."""
+    """Load .env files with documented precedence:
+    Shell exports > project .opscloud/.env > ~/.opscloud/.env > project .env.
+    """
     try:
         from dotenv import dotenv_values
     except ImportError:
         return
+
+    if refresh_loaded:
+        _strip_dotenv_loaded_values(os.environ)
+        _dotenv_loaded_values.clear()
 
     effective_start = start_path
     if effective_start is None:
@@ -173,36 +240,88 @@ def _load_dotenv(*, start_path: Path | None = None, refresh_loaded: bool = False
             pass
 
     search = (effective_start or Path.cwd()).expanduser().resolve()
+    home = Path.home().resolve()
+
+    # Determine project root if inside a recognized project repository
+    root = find_project_root(search)
+
+    should_read_project = resolve_read_project_dotenv()
+
+    # Walk up to find nearest generic project .env, strictly bounded by project root
     project_env: Path | None = None
-    for parent in [search, *search.parents]:
-        candidate = parent / ".env"
-        if candidate.is_file():
-            project_env = candidate
-            break
+    if should_read_project:
+        if root is not None:
+            # Check from search directory up to root (inclusive), avoiding home directory
+            current = search
+            while True:
+                if current != home:
+                    candidate = current / ".env"
+                    if candidate.is_file():
+                        project_env = candidate
+                        break
+                if current == root or current == current.parent:
+                    break
+                current = current.parent
+        else:
+            # Not in a recognizable project root: check search folder directly if not home
+            if search != home:
+                candidate = search / ".env"
+                if candidate.is_file():
+                    project_env = candidate
+    else:
+        logger.debug("Skipping project .env: read_project_dotenv is disabled")
 
     loaded_vals: dict[str, str | None] = {}
 
-    # 1. Global ~/.opscloud/.env
+    # 1. Project/CWD .env (lowest precedence baseline, filtered by PROJECT_DOTENV_DENIED_ENV_KEYS)
+    if project_env:
+        with contextlib.suppress(Exception):
+            p_vals = dotenv_values(project_env)
+            for k, v in p_vals.items():
+                if k.upper() in PROJECT_DOTENV_DENIED_ENV_KEYS:
+                    logger.warning("Denied key in project .env: %s", k)
+                    continue
+                loaded_vals[k] = v
+
+    # 2. Global ~/.opscloud/.env (user-level credentials, overwrites project .env)
     global_env = paths.GLOBAL_ENV_PATH
     if global_env.is_file():
         with contextlib.suppress(Exception):
             loaded_vals.update(dotenv_values(global_env))
 
-    # 2. Project/CWD .env (higher priority, overwrites global)
-    if project_env:
-        with contextlib.suppress(Exception):
-            loaded_vals.update(dotenv_values(project_env))
+    # 3. Project-scoped OpsCloud .env (e.g. {project_root}/.opscloud/.env)
+    # Allows repo authors to supply OpsCloud-specific configuration for that repository
+    if root is not None:
+        project_opscloud_env = paths.project_opscloud_dir(root) / ".env"
+        if project_opscloud_env.is_file():
+            with contextlib.suppress(Exception):
+                po_vals = dotenv_values(project_opscloud_env)
+                for k, v in po_vals.items():
+                    if k.upper() in PROJECT_DOTENV_DENIED_ENV_KEYS:
+                        logger.warning("Denied key in project .opscloud/.env: %s", k)
+                        continue
+                    loaded_vals[k] = v
 
-    # Filter out denied keys
+    # Filter out system-level denied keys from any dotenv
     for key in DOTENV_DENIED_ENV_KEYS:
         if key in loaded_vals:
             logger.warning("Denied .env key in dotenv file: %s", key)
             loaded_vals.pop(key, None)
 
-    # Apply to os.environ
+    # Apply to os.environ:
+    # Outer shell exports take ultimate precedence.
     for k, v in loaded_vals.items():
-        if v is not None and (refresh_loaded or k not in os.environ):
-            os.environ[k] = v
+        if v is not None:
+            if refresh_loaded:
+                # On refresh, update unless key was originally in initial shell exports
+                if k not in _INITIAL_SHELL_ENV:
+                    os.environ[k] = v
+                    _dotenv_loaded_values[k] = v
+            else:
+                # On initial load, only set if not already in os.environ
+                if k not in os.environ:
+                    os.environ[k] = v
+                    _dotenv_loaded_values[k] = v
 
 
 def parse_shell_allow_list(val: str | list[str] | None) -> list[str] | None:
@@ -236,6 +355,7 @@ class Settings:
     # ── Security & Approvals ──────────────────────────────
     approval_mode: str = "manual"
     shell_allow_list: list[str] | None = None
+    read_project_dotenv: bool = True
 
     # ── Execution Sandbox ─────────────────────────────────
     sandbox_provider: str = "local"
@@ -618,6 +738,7 @@ def reset_settings_for_testing() -> None:
     with _settings_lock:
         _settings = None
         _bootstrap_state.done = False
+        _dotenv_loaded_values.clear()
 
 
 async def reload_from_store(store: Any) -> Settings:

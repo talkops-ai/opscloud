@@ -9,10 +9,19 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 import importlib
+import importlib.util
 import json
 import os
+import re
 import threading
 from typing import Any, cast
+
+# Avoid duplicate protobuf descriptor registration between google-genai, google-cloud-aiplatform, and fireworks-ai
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+try:
+    import google.longrunning.operations_proto_pb2  # noqa: F401
+except ImportError:
+    pass
 
 from langchain_core.language_models import BaseChatModel
 
@@ -115,7 +124,33 @@ def _get_provider_kwargs(provider: str, *, model_name: str | None = None) -> dic
 
     base_url = config.get_base_url(provider)
     if base_url:
-        result["base_url"] = base_url
+        if provider == "azure_openai":
+            result["azure_endpoint"] = base_url
+            api_version = (
+                resolve_env_var("AZURE_OPENAI_API_VERSION")
+                or resolve_env_var("OPENAI_API_VERSION")
+                or "2024-08-01-preview"
+            )
+            result.setdefault("api_version", api_version)
+        elif provider == "perplexity":
+            # ChatPerplexity does not accept base_url directly in kwargs
+            pass
+        elif provider == "anthropic":
+            anthropic_base = base_url[:-3] if base_url.endswith("/v1") else base_url
+            result["anthropic_api_url"] = anthropic_base
+            result["base_url"] = anthropic_base
+        else:
+            result["base_url"] = base_url
+            if provider == "mistralai":
+                result["endpoint"] = base_url
+            elif provider == "deepseek":
+                result["api_base"] = base_url
+            elif provider == "groq":
+                result["groq_api_base"] = base_url
+            elif provider == "fireworks":
+                result["fireworks_api_base"] = base_url
+            elif provider == "xai":
+                result["xai_api_base"] = base_url
 
     settings = get_settings()
     env_var = get_credential_env_var(provider)
@@ -144,18 +179,33 @@ def _get_provider_kwargs(provider: str, *, model_name: str | None = None) -> dic
             "bedrock": "aws_access_key_id",
             "azure_openai": "azure_openai_api_key",
             "typesafe": "typesafe_api_key",
+            "ibm": "watsonx_apikey",
         }
         field = field_map.get(provider)
         if field and hasattr(settings, field):
             api_key = getattr(settings, field)
 
-    if not api_key and provider in ("google_genai", "google"):
+    if not api_key and provider in ("google_genai", "google", "google_vertexai"):
         api_key = resolve_env_var("GEMINI_API_KEY") or getattr(settings, "google_api_key", None)
 
     if api_key:
-        result["api_key"] = api_key
+        if provider not in (
+            "google_vertexai",
+            "google_anthropic_vertex",
+            "bedrock",
+            "bedrock_converse",
+            "anthropic_bedrock",
+        ):
+            result["api_key"] = api_key
         if provider in ("google_genai", "google"):
             result["google_api_key"] = api_key
+        elif provider == "huggingface":
+            result["huggingfacehub_api_token"] = api_key
+        elif provider == "ibm":
+            result["apikey"] = api_key
+        elif provider == "anthropic":
+            result["anthropic_api_key"] = api_key
+            result.setdefault("default_headers", {})["Authorization"] = f"Bearer {api_key}"
         if env_var:
             os.environ[env_var] = str(api_key)
 
@@ -170,15 +220,31 @@ def _get_provider_kwargs(provider: str, *, model_name: str | None = None) -> dic
         result.update(aws_kwargs)
         result.pop("api_key", None)
 
+    # IBM watsonx handling
+    if provider == "ibm":
+        project_id = resolve_env_var("WATSONX_PROJECT_ID") or getattr(settings, "watsonx_project_id", None)
+        if project_id:
+            result["project_id"] = project_id
+        space_id = resolve_env_var("WATSONX_SPACE_ID") or getattr(settings, "watsonx_space_id", None)
+        if space_id:
+            result["space_id"] = space_id
+        watsonx_url = (
+            config.get_base_url("ibm")
+            or resolve_env_var("WATSONX_URL")
+            or getattr(settings, "watsonx_url", None)
+        )
+        if watsonx_url:
+            result["url"] = watsonx_url
+
     # Vertex AI handling
     if provider in ("google_genai", "google"):
         use_vertex_env = resolve_env_var("GOOGLE_GENAI_USE_VERTEXAI") or str(
             getattr(settings, "google_genai_use_vertexai", False)
         )
         is_vertex = use_vertex_env.strip().lower() in ("true", "1", "yes")
-        result["vertexai"] = is_vertex
-        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true" if is_vertex else "false"
-
+        if is_vertex:
+            result["vertexai"] = True
+            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
         project_env = resolve_env_var("GOOGLE_CLOUD_PROJECT") or getattr(settings, "google_cloud_project", None)
         if project_env:
             result["project"] = project_env
@@ -187,6 +253,30 @@ def _get_provider_kwargs(provider: str, *, model_name: str | None = None) -> dic
         if location_env:
             result["location"] = location_env
             os.environ["GOOGLE_CLOUD_LOCATION"] = str(location_env)
+    elif provider in ("google_vertexai", "google_anthropic_vertex"):
+        project_env = resolve_env_var("GOOGLE_CLOUD_PROJECT") or getattr(settings, "google_cloud_project", None)
+        if project_env:
+            result["project"] = project_env
+            os.environ["GOOGLE_CLOUD_PROJECT"] = str(project_env)
+        location_env = resolve_env_var("GOOGLE_CLOUD_LOCATION") or getattr(settings, "google_cloud_location", None)
+        if location_env:
+            result["location"] = location_env
+            os.environ["GOOGLE_CLOUD_LOCATION"] = str(location_env)
+
+    # Ollama bearer token injection for remote / hosted Ollama instances (matches dcode)
+    if provider == "ollama":
+        result.pop("api_key", None)
+        ollama_key = resolve_env_var("OLLAMA_API_KEY")
+        if ollama_key:
+            client_kwargs = result.get("client_kwargs")
+            if isinstance(client_kwargs, dict) or client_kwargs is None:
+                client_kwargs = dict(client_kwargs) if client_kwargs else {}
+                headers = client_kwargs.get("headers")
+                headers = dict(headers) if isinstance(headers, dict) else {}
+                if not any(isinstance(k, str) and k.lower() == "authorization" for k in headers):
+                    headers["Authorization"] = f"Bearer {ollama_key}"
+                    client_kwargs["headers"] = headers
+                    result["client_kwargs"] = client_kwargs
 
     # Reasoning effort injection
     from opscloud.model.reasoning import is_effort_supported_for_model, with_effort_model_params
@@ -277,14 +367,38 @@ def _create_model_via_init(
 
     init_kwargs = dict(kwargs)
 
+    target_provider = provider
+    if provider in ("openai_codex", "typesafe"):
+        target_provider = "openai"
+
+    if target_provider == "huggingface":
+        try:
+            from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+
+            hf_kwargs = dict(init_kwargs)
+            token = hf_kwargs.pop("huggingfacehub_api_token", None) or hf_kwargs.pop("api_key", None)
+            endpoint_url = hf_kwargs.pop("endpoint_url", None) or hf_kwargs.pop("base_url", None)
+            ep_args: dict[str, Any] = {}
+            if token:
+                ep_args["huggingfacehub_api_token"] = token
+            if endpoint_url:
+                ep_args["endpoint_url"] = endpoint_url
+            else:
+                ep_args["repo_id"] = model_name
+            endpoint = HuggingFaceEndpoint(**ep_args, **hf_kwargs)
+            return ChatHuggingFace(llm=endpoint)
+        except Exception as hf_err:
+            logger.debug("HuggingFaceEndpoint initialization skipped (%s); trying standard init", hf_err)
+
     try:
-        if provider:
-            return init_chat_model(model_name, model_provider=provider, **init_kwargs)
+        if target_provider:
+            return init_chat_model(model_name, model_provider=target_provider, **init_kwargs)
         return init_chat_model(model_name, **init_kwargs)
     except ImportError as e:
         package_map = {
             "anthropic": "langchain-anthropic",
             "openai": "langchain-openai",
+            "openai_codex": "langchain-openai",
             "azure_openai": "langchain-openai",
             "google_genai": "langchain-google-genai",
             "google_vertexai": "langchain-google-vertexai",
@@ -306,9 +420,20 @@ def _create_model_via_init(
             "huggingface": "langchain-huggingface",
             "baseten": "langchain-baseten",
             "ibm": "langchain-ibm",
+            "litellm": "langchain-litellm",
+            "meta": "langchain-meta",
             "typesafe": "langchain-typesafe",
         }
         package = package_map.get(provider, f"langchain-{provider}")
+        module_name = package.replace("-", "_")
+        try:
+            spec_found = importlib.util.find_spec(module_name) is not None
+        except (ImportError, ValueError):
+            spec_found = False
+        if spec_found:
+            raise ModelConfigError(
+                f"Provider package '{package}' is installed but failed to import for provider '{provider}': {e}"
+            ) from e
         raise MissingProviderPackageError(
             f"Missing package for '{provider}'. Install: pip install {package}",
             provider=provider,
@@ -368,6 +493,11 @@ def create_model(
         model_name = model_spec
         provider = inferred_provider or ""
 
+    if provider == "google_vertexai" and model_name and model_name.lower().startswith("claude-"):
+        raise ModelConfigError(
+            f"Claude model '{model_name}' on Google Vertex AI requires provider 'google_anthropic_vertex' instead of 'google_vertexai' (e.g. google_anthropic_vertex:{model_name})."
+        )
+
     if provider:
         apply_stored_credentials(provider)
 
@@ -413,6 +543,14 @@ def create_model(
         reasoning_override,
     )
 
+    if provider == "anthropic":
+        # Ensure fixed-budget 'enabled' thinking is never sent for Claude 5+ models
+        thinking = kwargs.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            match = re.match(r"^claude-[a-z]+-(\d+)", model_name.lower())
+            if match is not None and int(match.group(1)) >= 5:
+                kwargs.pop("thinking", None)
+
     # Sanitize provider-native models that disallow non-literal reasoning_effort strings (e.g. 'off')
     if kwargs.get("reasoning_effort") in ("off", "none", "clear", "0", "reset"):
         kwargs.pop("reasoning_effort", None)
@@ -424,9 +562,6 @@ def create_model(
             kwargs.pop("thinking_level", None)
             kwargs.pop("thinking_budget", None)
             kwargs.pop("include_thoughts", None)
-    elif provider == "anthropic":
-        if not kwargs.get("reasoning_effort"):
-            kwargs.pop("thinking", None)
 
     config = ModelConfig.load()
     class_path = config.get_class_path(provider) if provider else None

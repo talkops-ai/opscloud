@@ -166,6 +166,27 @@ DOTENV_DENIED_ENV_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
+PROJECT_DOTENV_DENIED_ENV_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "OPSCLOUD_APPROVAL_MODE",
+        "APPROVAL_MODE",
+        "OPSCLOUD_SHELL_ALLOW_LIST",
+        "SHELL_ALLOW_LIST",
+        "OPSCLOUD_READ_ONLY",
+        "READ_ONLY",
+        "OPSCLOUD_CONFIG_DIR",
+        "CONFIG_DIR",
+        "OPSCLOUD_READ_PROJECT_DOTENV",
+        "READ_PROJECT_DOTENV",
+        "OPSCLOUD_SERVER_DB_PATH",
+        "OPSCODE_APPROVAL_MODE",
+        "OPSCODE_SHELL_ALLOW_LIST",
+        "OPSCODE_READ_ONLY",
+        "OPSCODE_CONFIG_DIR",
+        "TERM_PROGRAM",
+    }
+)
+
 RELOADABLE_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "model_name",
@@ -176,6 +197,7 @@ RELOADABLE_FIELDS: Final[frozenset[str]] = frozenset(
         "aws_profile",
         "shell_allow_list",
         "theme",
+        "read_project_dotenv",
     }
 )
 

@@ -269,16 +269,13 @@ class AutoUpdateHandler(BaseCommandHandler):
 
 
 def _reload_dotenv() -> None:
-    """Re-read .env files into os.environ."""
+    """Re-read .env files into os.environ using unified settings loader."""
     try:
-        from dotenv import load_dotenv
+        from opscloud.config.settings import _load_dotenv
 
-        load_dotenv(override=True)
-        project_env = Path.cwd() / ".env"
-        if project_env.is_file():
-            load_dotenv(project_env, override=True)
-    except ImportError:
-        pass
+        _load_dotenv(refresh_loaded=True)
+    except Exception as exc:
+        logger.debug("Failed to reload dotenv: %s", exc)
 
 
 def _check_pypi_version(*, prerelease: bool = False) -> str | None:

@@ -200,6 +200,93 @@ def test_cloud_selector_screen_init():
     assert screen._current_profile == "dev-profile"
 
 
+def test_cloud_option_in_place_selection():
+    """Verify CloudProfileOption supports in-place selection without rebuilding DOM."""
+    from opscloud.config.cloud_profiles import AWSProfileInfo
+    from opscloud.ui.widgets.cloud_selector import CloudProfileOption
+
+    prof = AWSProfileInfo(name="staging-us-east-1", region="us-east-1", account_id="123456789012")
+    opt = CloudProfileOption(
+        label="  staging-us-east-1",
+        profile_info=prof,
+        index=0,
+        is_selected=False,
+    )
+    assert not opt.is_selected
+    assert "cloud-option-selected" not in opt.classes
+
+    # Toggle selected True in-place
+    opt.set_selected(True)
+    assert opt.is_selected
+    assert "cloud-option-selected" in opt.classes
+    assert "› staging-us-east-1" in opt.render_label_text()
+
+    # Toggle selected False in-place
+    opt.set_selected(False)
+    assert not opt.is_selected
+    assert "cloud-option-selected" not in opt.classes
+    assert "  staging-us-east-1" in opt.render_label_text()
+
+
+async def test_cloud_selector_navigation_and_batch_mount():
+    """Verify wrap-around navigation, page navigation, and fuzzy filter in CloudProfileSelectorScreen."""
+    from opscloud.config.cloud_profiles import AWSProfileInfo
+    from opscloud.ui.app import OpsCloudApp
+    from opscloud.ui.widgets.cloud_selector import CloudProfileSelectorScreen
+    from textual.widgets import Input
+
+    app = OpsCloudApp()
+    async with app.run_test(headless=True) as pilot:
+        screen = CloudProfileSelectorScreen(current_profile="dev-profile")
+        screen._load_profile_data = lambda: [
+            AWSProfileInfo(name="dev-profile", region="us-west-2"),
+            AWSProfileInfo(name="prod-profile", region="us-east-1", account_id="111222333444"),
+            AWSProfileInfo(name="staging-profile", region="eu-west-1"),
+            AWSProfileInfo(name="security-audit", region="us-east-1"),
+        ]
+        app.push_screen(screen)
+        await pilot.pause()
+
+        # Input should be focused immediately
+        inp = screen.query_one("#cloud-filter", Input)
+        assert inp.has_focus
+
+        assert screen._loaded is True
+        assert len(screen._option_widgets) > 0
+        total_widgets = len(screen._option_widgets)
+
+        # Selection starts at 0
+        assert screen._selected_index == 0
+
+        # Up arrow from 0 wraps to end
+        screen.action_move_up()
+        assert screen._selected_index == total_widgets - 1
+
+        # Down arrow wraps back to 0
+        screen.action_move_down()
+        assert screen._selected_index == 0
+
+        # Page down and page up
+        screen.action_page_down()
+        assert screen._selected_index >= 0
+        screen.action_page_up()
+        assert screen._selected_index == 0
+
+        # Tab complete
+        screen.action_tab_complete()
+        assert inp.value == screen._option_widgets[screen._selected_index].profile_name
+
+        # Fuzzy filter test
+        inp.value = "audit"
+        await pilot.pause()
+        filtered_names = [opt.profile_name for opt in screen._option_widgets]
+        assert "security-audit" in filtered_names
+
+        # Resize refit
+        screen._fit_cloud_list()
+
+
+
 def test_get_active_aws_region(monkeypatch, tmp_path: Path):
     from opscloud.config.cloud_profiles import get_active_aws_region
     from opscloud.config.toml_config import load_aws_region, save_aws_region

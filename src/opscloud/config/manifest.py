@@ -505,6 +505,18 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         settings_field="model_context_limit",
         default=128_000,
     ),
+    # ── Startup & Environment ─────────────────────────────
+    ConfigOption(
+        key="startup.read_project_dotenv",
+        group="Startup",
+        summary="Read nearest project .env file during directory walk-up",
+        kind=OptionKind.BOOL,
+        db_key="READ_PROJECT_DOTENV",
+        env_var="READ_PROJECT_DOTENV",
+        toml_keys=("startup", "read_project_dotenv"),
+        settings_field="read_project_dotenv",
+        default=True,
+    ),
     # ── Security & Approvals ──────────────────────────────
     ConfigOption(
         key="security.approval_mode",

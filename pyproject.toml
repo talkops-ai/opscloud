@@ -1,6 +1,6 @@
 [project]
 name = "talkops-opscloud"
-version = "0.3.0b4"
+version = "0.3.0b5"
 description = "Extensible Terminal Multi-Agent Framework for Cloud Operations & DevOps Coding"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -64,6 +64,12 @@ dependencies = [
     "langchain-perplexity>=1.4.1",
     "langchain-nvidia-ai-endpoints>=1.4.3",
     "langchain-huggingface>=1.2.2",
+    "langchain-baseten>=0.2.4",
+    "langchain-ibm>=1.1.2",
+    "transformers>=5.19.0",
+    "langchain-litellm>=0.11.0",
+    "langchain-meta>=0.5.0",
+    "litellm>=1.103.3",
 ]
 
 [project.optional-dependencies]

@@ -186,26 +186,39 @@ class DynamicModelPoolManager:
         if user_pool:
             resolved_provider = self._resolve_provider(provider, base_spec)
             pool_prov = user_pool.get("provider")
-            if not pool_prov:
-                sample = user_pool.get("standard") or user_pool.get("fast") or user_pool.get("powerful") or ""
-                pool_prov = detect_provider(sample) if sample else None
+            t0_raw = user_pool.get("fast")
+            t1_raw = user_pool.get("standard")
+            t2_raw = user_pool.get("powerful")
 
-            if not provider or not pool_prov or pool_prov == resolved_provider:
-                t0_raw = user_pool.get("fast")
-                t1_raw = user_pool.get("standard")
-                t2_raw = user_pool.get("powerful")
-
+            if t0_raw and t1_raw and t2_raw:
                 def _norm(raw_spec: str) -> str:
                     s = raw_spec.strip()
                     if ":" not in s:
+                        inferred = detect_provider(s)
+                        if inferred and inferred in AVAILABLE_MODELS:
+                            return f"{inferred}:{s}"
                         return f"{resolved_provider}:{s}"
                     return normalize_model_spec(s)
 
-                if t0_raw and t1_raw and t2_raw:
-                    t0 = _norm(t0_raw)
-                    t1 = _norm(t1_raw)
-                    t2 = _norm(t2_raw)
+                t0 = _norm(t0_raw)
+                t1 = _norm(t1_raw)
+                t2 = _norm(t2_raw)
 
+                prov0 = t0.split(":", 1)[0] if ":" in t0 else resolved_provider
+                prov1 = t1.split(":", 1)[0] if ":" in t1 else resolved_provider
+                prov2 = t2.split(":", 1)[0] if ":" in t2 else resolved_provider
+                distinct_provs = {prov0, prov1, prov2}
+                is_multi = len(distinct_provs) > 1 or pool_prov == "multi"
+
+                if (
+                    is_multi
+                    or not provider
+                    or provider in ("dynamic", "auto")
+                    or not pool_prov
+                    or pool_prov == "multi"
+                    or pool_prov == resolved_provider
+                    or pool_prov in distinct_provs
+                ):
                     t0_efforts = supported_efforts_for_model(t0)
                     e0 = "off" if ("off" in t0_efforts or not t0_efforts) else ("minimal" if "minimal" in t0_efforts else "off")
 
@@ -432,6 +445,25 @@ class DynamicModelPoolManager:
                 criteria=_format_criteria(spec2, eff2, criteria_map.get("powerful", fallback_criteria["powerful"])),
             ),
         }
+
+    def validate_pool(self, pool: dict[str, str]) -> tuple[bool, list[str]]:
+        """Validate a pool configuration dictionary (fast, standard, powerful).
+
+        Returns:
+            (is_valid, list_of_warning_or_error_messages)
+        """
+        warnings: list[str] = []
+        for tier in ("fast", "standard", "powerful"):
+            raw = pool.get(tier)
+            if not raw or not raw.strip():
+                return False, [f"Missing model for tier '{tier}'."]
+            spec = normalize_model_spec(raw.strip())
+            prov = spec.split(":", 1)[0] if ":" in spec else detect_provider(spec)
+            if not prov or prov not in AVAILABLE_MODELS:
+                warnings.append(f"Unrecognized provider for '{spec}' (tier {tier}).")
+            elif has_provider_credentials(prov) is False:
+                warnings.append(f"Missing API credentials for provider '{prov}' ({spec}).")
+        return True, warnings
 
 
 _GLOBAL_POOL_MANAGER: DynamicModelPoolManager | None = None

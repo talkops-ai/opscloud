@@ -4827,9 +4827,15 @@ class OpsCloudApp(App):
 
         if spec in ("auto", "dynamic"):
             import os
+            os.environ["OPSCLOUD_SERVER_MODEL"] = spec
+            os.environ["OPSCLOUD_MODEL_NAME"] = spec
             os.environ["OPSCODE_SERVER_MODEL"] = spec
             os.environ["OPSCODE_MODEL_NAME"] = spec
             self._model = spec
+            settings_obj = getattr(self, "settings", None)
+            if settings_obj:
+                settings_obj.model = spec
+                settings_obj.model_name = spec
             try:
                 status_bar = self.query_one("#status-bar", StatusBar)
                 status_bar.set_model(provider="typesafe", model="jev-router", effort="auto")
@@ -4845,13 +4851,19 @@ class OpsCloudApp(App):
             apply_stored_credentials(provider)
 
         import os
+        os.environ["OPSCLOUD_SERVER_MODEL"] = spec
+        os.environ["OPSCLOUD_MODEL_NAME"] = spec
         os.environ["OPSCODE_SERVER_MODEL"] = spec
         os.environ["OPSCODE_MODEL_NAME"] = spec
         self._model = spec
+        settings_obj = getattr(self, "settings", None)
+        if settings_obj:
+            settings_obj.model = spec
+            settings_obj.model_name = spec
         if effort is not None:
             self._reasoning_effort = effort
+            os.environ["OPSCLOUD_REASONING_EFFORT"] = effort
             os.environ["OPSCODE_REASONING_EFFORT"] = effort
-            settings_obj = getattr(self, "settings", None)
             if settings_obj:
                 settings_obj.reasoning_effort = effort
 
