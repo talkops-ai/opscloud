@@ -35,6 +35,14 @@ def _get_payload(model: Any, prompt: str = "test prompt") -> dict[str, Any]:
     return {}
 
 
+@pytest.fixture(autouse=True)
+def _mock_provider_keys(monkeypatch):
+    """Ensure baseline mock keys exist for Anthropic and OpenAI in offline unit tests."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-test-key-anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-test-key-openai")
+
+
+
 def test_claude_opus_5_effort_levels():
     """Verify profile advertises correct reasoning levels for claude-opus-5."""
     levels = supported_efforts_for_model("anthropic:claude-opus-5")

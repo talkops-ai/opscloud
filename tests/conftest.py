@@ -16,6 +16,10 @@ def clean_environment(monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "mock-test-key-google")
     if not os.environ.get("TYPESAFE_API_KEY") and not os.environ.get("JEV_API_KEY"):
         monkeypatch.setenv("TYPESAFE_API_KEY", "mock-test-key-typesafe")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-test-key-anthropic")
+    if not os.environ.get("OPENAI_API_KEY"):
+        monkeypatch.setenv("OPENAI_API_KEY", "mock-test-key-openai")
     if "AWS_DEFAULT_REGION" not in os.environ:
         monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     if "AWS_REGION" not in os.environ:

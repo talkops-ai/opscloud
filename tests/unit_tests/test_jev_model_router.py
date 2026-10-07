@@ -783,8 +783,11 @@ async def test_enriched_routing_state_orchestrator_vs_subagent():
     assert "cost_and_usage_analysis" in sub_state["agent_context"]["active_capabilities"]
 
 
-def test_multi_provider_agent_pool_tier_discovery(tmp_path, pool_manager):
+def test_multi_provider_agent_pool_tier_discovery(tmp_path, pool_manager, monkeypatch):
     """Verify that multi-provider agent pools resolve correctly across different providers and effort levels."""
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-test-key-openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-test-key-anthropic")
+    monkeypatch.setenv("GOOGLE_API_KEY", "mock-test-key-google")
     from opscloud.config.toml_config import clear_agent_pool, load_agent_pool, save_agent_pool
 
     tmp_config = tmp_path / "config.toml"
