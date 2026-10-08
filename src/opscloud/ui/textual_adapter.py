@@ -382,6 +382,7 @@ class TextualAdapter:
         prompt_manager: Any = None,
         request_approval: Callable[..., Any] | None = None,
         request_ask_user: Callable[..., Any] | None = None,
+        on_user_visible_output_started: Callable[[], None] | None = None,
     ) -> None:
         self._client = client
         self._assistant_id = assistant_id
@@ -394,6 +395,7 @@ class TextualAdapter:
         self._prompt_manager = prompt_manager
         self._request_approval = request_approval
         self._request_ask_user = request_ask_user
+        self._on_user_visible_output_started = on_user_visible_output_started
         self._stats = SessionStats()
         self._cancel_event = asyncio.Event()
         self._active_tools_map: dict[str, str] = {}
@@ -852,6 +854,12 @@ class TextualAdapter:
                 msg_obj=msg_obj,
             )
 
+            if is_main_agent and (text or thinking) and self._on_user_visible_output_started:
+                try:
+                    self._on_user_visible_output_started()
+                except Exception:
+                    pass
+
             if thinking:
                 if stream_state.thinking_start_t is None:
                     stream_state.thinking_start_t = time.time()
@@ -923,6 +931,11 @@ class TextualAdapter:
 
                 if buffer_id is not None and buffer_id not in stream_state.displayed_tool_ids:
                     stream_state.displayed_tool_ids.add(buffer_id)
+                    if is_main_agent and self._on_user_visible_output_started:
+                        try:
+                            self._on_user_visible_output_started()
+                        except Exception:
+                            pass
                     if not is_main_agent:
                         panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
                         if panel is not None:
@@ -1136,7 +1149,10 @@ class TextualAdapter:
             except Exception:
                 pass
         if self._status_bar is not None:
-            self._status_bar.set_status("")
+            if self._cancel_event.is_set():
+                self._status_bar.set_status("Interrupted")
+            else:
+                self._status_bar.set_status("")
         logger.debug("TUI: stream_turn finally complete")
 
     # ── Public Stream API ─────────────────────────────────
@@ -1157,6 +1173,7 @@ class TextualAdapter:
         config, enriched_context = await self._prepare_stream_config(thread_id, turn_id, context)
 
         start_t = time.time()
+        self._cancel_event.clear()
         self._stats.input_tokens += max(1, len(prompt) // 4)
         if self._status_bar is not None:
             self._status_bar.show_pending_tokens()
@@ -1228,8 +1245,23 @@ class TextualAdapter:
 
         except asyncio.CancelledError:
             logger.debug("TUI: stream_turn CancelledError")
+            self._cancel_event.set()
             if self._messages is not None:
                 self._messages.finish_assistant_message()
+            tid = getattr(self, "_current_thread_id", None)
+            if self._client and hasattr(self._client, "acancel_active_runs") and tid:
+                try:
+                    await self._client.acancel_active_runs({"configurable": {"thread_id": tid}})
+                except Exception:
+                    pass
+            try:
+                from opscloud.ui.widgets.messages import AppMessage
+                if self._app and hasattr(self._app, "_mount_message"):
+                    await self._app._mount_message(AppMessage("■ Interrupted by user"))
+                elif self._messages is not None:
+                    await self._messages.mount(AppMessage("■ Interrupted by user"))
+            except Exception:
+                pass
             raise
         except Exception as e:
             self._finalize_turn_error(e)
@@ -1239,19 +1271,18 @@ class TextualAdapter:
             await self._finalize_turn_cleanup(start_t, stream_state.turn_context_tokens)
 
 
-    def cancel(self) -> None:
+    def cancel(self, thread_id: str | None = None) -> None:
         """Cancel the current streaming turn and notify the server."""
         self._cancel_event.set()
-        if self._client and hasattr(self._client, "acancel_active_runs"):
-            tid = getattr(self, "_current_thread_id", None)
-            if tid:
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(
-                        self._client.acancel_active_runs({"configurable": {"thread_id": tid}})
-                    )
-                except RuntimeError:
-                    pass
+        tid = thread_id or getattr(self, "_current_thread_id", None)
+        if self._client and hasattr(self._client, "acancel_active_runs") and tid:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._client.acancel_active_runs({"configurable": {"thread_id": tid}})
+                )
+            except RuntimeError:
+                pass
 
     def submit_approval(self, call_id: str, approved: bool) -> None:
         """Submit HITL approval response from UI thread."""

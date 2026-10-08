@@ -3379,6 +3379,10 @@ class UserMessage(Static):
         link-background-hover: transparent;
         link-style-hover: not bold not underline;
     }
+
+    UserMessage.-cancelled {
+        opacity: 0.6;
+    }
     """
 
     def __init__(self, content: str) -> None:
@@ -3387,6 +3391,15 @@ class UserMessage(Static):
         self._show_timestamp = False
         # Pass empty string — render() provides the live content on every repaint.
         super().__init__("")
+
+    @property
+    def raw_text(self) -> str:
+        """The original, untruncated message text."""
+        return self._raw_content
+
+    def set_cancelled(self) -> None:
+        """Dim the message to mark its turn as interrupted by the user."""
+        self.add_class("-cancelled")
 
     def set_timestamp_visible(self, visible: bool) -> None:
         self._show_timestamp = visible

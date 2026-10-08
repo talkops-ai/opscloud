@@ -347,7 +347,14 @@ class OpsCloudApp(App):
     ENABLE_COMMAND_PALETTE = False
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "interrupt", "Cancel", show=False),
+        Binding("escape", "interrupt", "Interrupt", show=False, priority=True),
+        Binding(
+            "ctrl+c",
+            "quit_or_interrupt",
+            "Quit/Interrupt",
+            show=False,
+            priority=True,
+        ),
         Binding("ctrl+d", "quit_app", "Quit", show=False),
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
         Binding("shift+tab", "toggle_auto_approve", "Auto-approve", show=False),
@@ -368,7 +375,6 @@ class OpsCloudApp(App):
         Binding("s", "approval_smart", "Smart", show=False),
         Binding("a", "approval_smart", "Auto", show=False),
         Binding("n", "approval_no", "No", show=False),
-        Binding("escape", "approval_escape", "Esc", show=False),
     ]
 
     # ── App-level Lifecycle Messages ─────────────────────
@@ -506,6 +512,11 @@ class OpsCloudApp(App):
 
         # ── Worker Handles ───────────────────────────────
         self._agent_worker: Worker[None] | None = None
+        self._agent_turn_started: bool = False
+        self._active_user_message: Any | None = None
+        self._active_turn_visible_output_started: bool = False
+        self._clear_input_pending: bool = False
+        self._quit_pending: bool = False
         self._shell_worker: Any | None = None
         self._shell_process: asyncio.subprocess.Process | None = None
 
@@ -643,6 +654,7 @@ class OpsCloudApp(App):
             app=self,
             request_approval=self._request_approval,
             request_ask_user=self._request_ask_user,
+            on_user_visible_output_started=self._on_user_visible_output_started,
         )
 
         self._chat_input = self.query_one("#input-area", ChatInput)
@@ -1239,7 +1251,10 @@ class OpsCloudApp(App):
         Args:
             message: The user's message.
         """
-        await self._mount_message(UserMessage(message))
+        user_msg = UserMessage(message)
+        self._active_user_message = user_msg
+        self._active_turn_visible_output_started = False
+        await self._mount_message(user_msg)
         await self._send_to_agent(message)
 
     async def send_agent_message(self, message: str, **kwargs: Any) -> None:
@@ -1265,6 +1280,7 @@ class OpsCloudApp(App):
         # Check if agent is available
         if self._adapter and self._adapter.connected and self._agent_thread_id:
             await self._flush_pending_shell_messages()
+            self._agent_turn_started = False
             self._agent_running = True
             await self._set_spinner("Thinking")
 
@@ -1311,6 +1327,8 @@ class OpsCloudApp(App):
         """
         if self._adapter is None:
             return
+
+        self._agent_turn_started = True
 
         # Track criteria request correlation for cleanup (reference: app.py L15685-L15691).
         criteria_request_id: str | None = None
@@ -1368,6 +1386,10 @@ class OpsCloudApp(App):
             await self._mount_message(ErrorMessage(body))
 
         finally:
+            panel = self._get_subagent_panel()
+            if panel is not None:
+                panel.finalize_running()
+            self._close_active_tool_group()
             await self._cleanup_agent_task(
                 force_goal_sync=graph_input is not None,
                 goal_criteria_request_id=criteria_request_id,
@@ -1399,6 +1421,9 @@ class OpsCloudApp(App):
         self._agent_reconciling = True
         self._agent_running = False
         self._agent_worker = None
+        self._agent_turn_started = False
+        self._active_user_message = None
+        self._active_turn_visible_output_started = False
 
         try:
             try:
@@ -4144,6 +4169,10 @@ class OpsCloudApp(App):
         if panel is not None:
             panel.on_subagent_event(event)
 
+    def _on_user_visible_output_started(self) -> None:
+        """Record that the current turn has rendered model text or a tool call."""
+        self._active_turn_visible_output_started = True
+
     def action_toggle_subagent_panel(self) -> None:
         """Expand or collapse the subagent fan-out panel."""
         panel = self._get_subagent_panel()
@@ -4192,17 +4221,209 @@ class OpsCloudApp(App):
 
     # ── Global Actions ───────────────────────────────────
 
+    def _cancel_worker(
+        self, worker: Worker[None] | None, *, abort_pending_reconnect: bool = True
+    ) -> None:
+        """Discard the message queue and cancel an active worker."""
+        self._discard_queue()
+        if worker is not None:
+            worker.cancel()
+            self._recover_unstarted_agent_worker(worker)
+
+    def _recover_unstarted_agent_worker(self, worker: Worker[None]) -> None:
+        """Release the turn when a cancelled agent worker never started."""
+        if worker is not self._agent_worker or getattr(self, "_agent_turn_started", False):
+            return
+
+        async def _release() -> None:
+            if (
+                worker is not self._agent_worker
+                or getattr(self, "_agent_turn_started", False)
+                or not self._agent_running
+            ):
+                return
+            logger.warning(
+                "Agent worker was cancelled before it started; releasing the turn"
+            )
+            try:
+                await self._cleanup_agent_task()
+            except Exception:
+                logger.exception("Cleanup failed while releasing an unstarted turn")
+
+        if not self.call_after_refresh(_release):
+            logger.warning(
+                "Could not schedule unstarted-turn recovery; message pump is closing"
+            )
+
+    def _restore_interrupted_message_to_input(self, message: Any) -> None:
+        """Return an interrupted prompt to the chat input when it is empty and no output appeared."""
+        if getattr(self, "_active_turn_visible_output_started", False):
+            return
+        chat_input = self._chat_input
+        if chat_input is None:
+            return
+        if chat_input.value.strip():
+            return
+        raw_text = getattr(message, "raw_text", getattr(message, "_raw_content", ""))
+        chat_input.set_value_at_end(raw_text)
+
+    def _pop_last_queued_message(self) -> None:
+        """Remove the most recently queued message (LIFO)."""
+        if not self._pending_messages:
+            return
+        msg = self._pending_messages.pop()
+        self._sync_status_queued()
+        if self._queued_widgets:
+            widget = self._queued_widgets.pop()
+            try:
+                widget.remove()
+            except Exception:
+                pass
+        msg_text = msg.text if hasattr(msg, "text") else str(msg)
+        if not self._chat_input:
+            self.notify("Queued message discarded", timeout=2)
+            return
+
+        if self._chat_input.value.strip():
+            self.notify("Queued message discarded (input not empty)", timeout=3)
+        elif self._chat_input.set_value_at_end(msg_text):
+            self.notify("Queued message moved to input", timeout=2)
+        else:
+            self.notify("Queued message discarded", timeout=2)
+
+    def _handle_clear_input_escape(self) -> None:
+        """Clear the chat input draft on double Esc press."""
+        chat_input = self._chat_input
+        if chat_input is None or not chat_input.value:
+            self._clear_input_pending = False
+            return
+        if getattr(self, "_clear_input_pending", False):
+            self._clear_input_pending = False
+            if chat_input.discard_text():
+                self.notify("Input cleared", timeout=3)
+        else:
+            self._clear_input_pending = True
+            self.notify("Press Esc again to clear input", timeout=2)
+            self.set_timer(2.0, lambda: setattr(self, "_clear_input_pending", False))
+
     def action_interrupt(self) -> None:
-        """Interrupt active agent or shell work."""
-        if self._agent_running and self._adapter:
-            self._adapter.cancel()
+        """Handle escape key or interrupt request.
+
+        Priority order (aligned with dcode):
+        1. If modal screen is active, dismiss it
+        2. If completion popup is open, dismiss it
+        3. If input is in command/shell mode, exit to normal mode
+        4. If shell command is running, kill it
+        5. If approval menu is active, reject it
+        6. If ask-user menu is active, cancel it
+        7. If queued messages exist, pop the last one (LIFO)
+        8. If agent is running, interrupt it (restoring the interrupted prompt
+           to the chat input when it is empty and no user-visible output
+           has appeared yet for the turn)
+        9. Otherwise, a second Esc clears the chat input draft (undoable)
+        """
+        from textual.screen import ModalScreen
+
+        clear_was_pending = getattr(self, "_clear_input_pending", False)
+        self._clear_input_pending = False
+
+        # 1. Dismiss modal screen if active
+        try:
+            screen = self.screen
+        except Exception:
+            screen = None
+        if screen is not None and isinstance(screen, ModalScreen):
+            cancel = getattr(screen, "action_cancel", None)
+            if cancel is not None:
+                cancel()
+            else:
+                screen.dismiss(None)
+            return
+
+        # 2 & 3. Close completion popup or exit slash/shell command mode
+        if self._chat_input:
+            if hasattr(self._chat_input, "dismiss_completion") and self._chat_input.dismiss_completion():
+                return
+            if hasattr(self._chat_input, "exit_mode") and self._chat_input.exit_mode():
+                return
+
+        # 4. If shell command is running, cancel the worker
+        if self._shell_running and self._shell_worker:
+            self._cancel_worker(self._shell_worker)
+            return
+
+        # 5. If approval menu is active, reject it
+        if self._pending_approval_widget is not None:
+            self._pending_approval_widget.action_select_reject()
+            return
+
+        # 6. If ask_user menu is active, cancel it
+        if self._pending_ask_user_widget is not None:
+            self._pending_ask_user_widget.action_cancel()
+            return
+
+        # 7. If queued messages exist, pop the last one (LIFO)
+        if self._pending_messages:
+            self._pop_last_queued_message()
+            return
+
+        # 8. If agent is running, interrupt it and discard queued messages
+        if self._agent_running and self._agent_worker:
+            if self._active_user_message is not None:
+                if hasattr(self._active_user_message, "set_cancelled"):
+                    self._active_user_message.set_cancelled()
+                self._restore_interrupted_message_to_input(self._active_user_message)
+            if self._adapter:
+                self._adapter.cancel(thread_id=self._agent_thread_id)
+            self._cancel_worker(self._agent_worker)
             try:
                 self.query_one("#status-bar", StatusBar).set_status("Interrupted")
-            except NoMatches:
+            except Exception:
                 pass
-        if self._shell_running:
-            if self._shell_worker:
-                self._shell_worker.cancel()
+            return
+
+        # 9. Double-Esc clears chat input
+        self._clear_input_pending = clear_was_pending
+        self._handle_clear_input_escape()
+
+    def action_quit_or_interrupt(self) -> None:
+        """Handle Ctrl+C: interrupt running work or quit on second press."""
+        if self._shell_running and self._shell_worker:
+            self._cancel_worker(self._shell_worker)
+            self._quit_pending = False
+            return
+
+        if self._pending_approval_widget is not None:
+            self._pending_approval_widget.action_select_reject()
+            self._quit_pending = False
+            return
+
+        if self._pending_ask_user_widget is not None:
+            self._pending_ask_user_widget.action_cancel()
+            self._quit_pending = False
+            return
+
+        if self._agent_running and self._agent_worker:
+            if self._active_user_message is not None:
+                if hasattr(self._active_user_message, "set_cancelled"):
+                    self._active_user_message.set_cancelled()
+            if self._adapter:
+                self._adapter.cancel(thread_id=self._agent_thread_id)
+            self._cancel_worker(self._agent_worker)
+            try:
+                self.query_one("#status-bar", StatusBar).set_status("Interrupted")
+            except Exception:
+                pass
+            self._quit_pending = False
+            return
+
+        if getattr(self, "_quit_pending", False):
+            self.exit()
+            return
+
+        self._quit_pending = True
+        self.notify("Press Ctrl+C again to quit", timeout=2)
+        self.set_timer(2.0, lambda: setattr(self, "_quit_pending", False))
 
     def action_clear_chat(self) -> None:
         """Clear chat and start fresh (Ctrl+L)."""

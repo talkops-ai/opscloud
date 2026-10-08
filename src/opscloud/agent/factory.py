@@ -415,9 +415,9 @@ def _subagent_cli_middleware(
 
     server_keys: list[str] = []
     if mcp_config:
-        server_keys.extend(mcp_config.keys())
+        server_keys.extend(str(k) for k in mcp_config.keys())
     if mcp_server_info:
-        server_keys.extend(getattr(s, "name", str(s)) for s in mcp_server_info)
+        server_keys.extend(str(getattr(s, "name", s)) for s in mcp_server_info)
 
     if allowed_tools or capabilities:
         middleware.append(
@@ -603,13 +603,16 @@ def create_opscloud_agent(
 
     # 5. MCP Discovery
     mcp_tools_list: list[BaseTool] = []
-    cached_infos: list[Any] | None = None
-    mcp_configs: dict[str, Any] | None = None
+    cached_infos: list[Any] | None = kwargs.get("mcp_server_info")
+    mcp_configs: dict[str, Any] | None = kwargs.get("mcp_config")
     if mcp_tools is not None:
         mcp_tools_list = list(mcp_tools)
         all_tools.extend(mcp_tools)
+        if mcp_configs is None:
+            mcp_configs = discover_mcp_configs(project_scope_root)
     else:
-        mcp_configs = discover_mcp_configs(project_scope_root)
+        if mcp_configs is None:
+            mcp_configs = discover_mcp_configs(project_scope_root)
         from opscloud.mcp.preload import (
             get_cached_mcp_server_infos,
             preload_mcp_metadata,
@@ -707,6 +710,7 @@ def create_opscloud_agent(
     from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT, SubAgent
 
     compiled_subagents: list[SubAgent] = []
+    base_subagent_tools = [t for t in all_tools if t not in mcp_tools_list]
     for name, subagent_meta in subagent_by_name.items():
         model_spec = subagent_meta.get("model")
         has_explicit_model = bool(model_spec)
@@ -723,6 +727,18 @@ def create_opscloud_agent(
         subagent_path = subagent_meta.get("path")
         custom_mw = subagent_meta.get("middleware")
 
+        # Build per-subagent MCP config and tools for this subagent
+        from opscloud.plugins.adapters.mcp import prepare_subagent_mcp
+
+        servers, subagent_mcp_tools, sub_mcp_server_infos = prepare_subagent_mcp(
+            subagent_name, subagent_meta, project_scope_root
+        )
+
+        if subagent_mcp_tools:
+            subagent_dict["tools"] = [*base_subagent_tools, *subagent_mcp_tools]
+        else:
+            subagent_dict["tools"] = list(base_subagent_tools)
+
         sub_middleware = _subagent_cli_middleware(
             has_explicit_model=has_explicit_model,
             assistant_id=assistant_id,
@@ -738,6 +754,9 @@ def create_opscloud_agent(
             worktree_root=effective_cwd,
             subagent_path=subagent_path if subagent_path else None,
             custom_middleware=custom_mw if isinstance(custom_mw, list) else None,
+            mcp_server_info=sub_mcp_server_infos or None,
+            mcp_config=servers or None,
+            mcp_tools=subagent_mcp_tools or None,
             backend=composite_backend,
             model=active_model,
         )
@@ -748,9 +767,10 @@ def create_opscloud_agent(
 
         compiled_subagents.append(cast(SubAgent, subagent_dict))
         logger.info(
-            "Registered declarative subagent '%s'",
+            "Compiled subagent '%s' (tools: %d)",
             subagent_name,
-            extra={"subagent": subagent_name},
+            len(subagent_dict.get("tools", [])),
+            extra={"subagent": subagent_name, "tools_count": len(subagent_dict.get("tools", []))},
         )
 
     if not any(sub.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for sub in compiled_subagents):
@@ -773,6 +793,7 @@ def create_opscloud_agent(
             "name": gp_name,
             "description": gp_description,
             "system_prompt": gp_system_prompt,
+            "tools": list(base_subagent_tools),
             "middleware": gp_middleware,
         }
         if interrupt_on is not None:
@@ -832,12 +853,22 @@ def create_opscloud_agent(
         agent_middleware.append(AskUserMiddleware())
 
     # 10.5 MCP tool arguments and error handling
-    if mcp_tools_list:
-        if cached_infos or mcp_configs:
+    if mcp_tools_list or cached_infos or mcp_configs:
+        mcp_cfg_for_mw = mcp_configs
+        if not mcp_cfg_for_mw and not cached_infos and mcp_tools_list:
+            synth_cfg: dict[str, Any] = {}
+            for t in mcp_tools_list:
+                srv = getattr(t, "metadata", {}).get("_mcp_server") if isinstance(getattr(t, "metadata", None), dict) else None
+                if srv and srv not in synth_cfg:
+                    synth_cfg[srv] = {"command": "custom", "args": []}
+            if synth_cfg:
+                mcp_cfg_for_mw = synth_cfg
+
+        if cached_infos or mcp_cfg_for_mw:
             from opscloud.middleware.mcp_context import MCPContextMiddleware
 
             agent_middleware.append(
-                MCPContextMiddleware(mcp_server_info=cached_infos, mcp_config=mcp_configs)
+                MCPContextMiddleware(mcp_server_info=cached_infos, mcp_config=mcp_cfg_for_mw)
             )
         agent_middleware.append(MCPToolMiddleware())
 

@@ -172,3 +172,64 @@ def test_tool_filter_middleware_validates_request_and_rejects_unallowed():
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert "tool `aws-mcp_aws___run_script` is restricted" in result.content
+
+
+def test_generic_open_source_mcp_matching_and_filtering():
+    """Verify arbitrary third-party open-source plugins work with various user-defined pattern styles."""
+    known_servers = ["postgres", "github", "datadog"]
+    mock_postgres_tool = MagicMock()
+    mock_postgres_tool.name = "postgres_query"
+    mock_postgres_tool.metadata = {
+        "_mcp_server": "postgres",
+        "_mcp_original_name": "query",
+    }
+
+    mock_github_tool = MagicMock()
+    mock_github_tool.name = "github_create_issue"
+    mock_github_tool.metadata = {
+        "_mcp_server": "github",
+        "_mcp_original_name": "create_issue",
+    }
+
+    mock_datadog_tool = MagicMock()
+    mock_datadog_tool.name = "datadog_get_metrics"
+    mock_datadog_tool.metadata = {
+        "_mcp_server": "datadog",
+        "_mcp_original_name": "get_metrics",
+    }
+
+    # Style 1: Server colon wildcard (postgres:*) and server underscore wildcard (github_*)
+    mw1 = ToolFilterMiddleware(
+        allowed_patterns=["postgres:*", "github_*", "Read", "Bash"],
+        subagent_name="custom-devops-subagent",
+        known_mcp_servers=known_servers,
+        mcp_tools=[mock_postgres_tool, mock_github_tool, mock_datadog_tool],
+    )
+    assert mw1.is_tool_allowed("postgres_query", tool_obj=mock_postgres_tool) is True
+    assert mw1.is_tool_allowed("postgres:query") is True
+    assert mw1.is_tool_allowed("mcp__postgres__query") is True
+    assert mw1.is_tool_allowed("github_create_issue", tool_obj=mock_github_tool) is True
+    assert mw1.is_tool_allowed("read_file") is True
+    assert mw1.is_tool_allowed("execute") is True
+    # datadog not in allowed_patterns
+    assert mw1.is_tool_allowed("datadog_get_metrics", tool_obj=mock_datadog_tool) is False
+
+    # Style 2: Bare server name ("postgres")
+    mw2 = ToolFilterMiddleware(
+        allowed_patterns=["postgres"],
+        subagent_name="custom-devops-subagent",
+        known_mcp_servers=known_servers,
+        mcp_tools=[mock_postgres_tool, mock_github_tool],
+    )
+    assert mw2.is_tool_allowed("postgres_query", tool_obj=mock_postgres_tool) is True
+    assert mw2.is_tool_allowed("github_create_issue", tool_obj=mock_github_tool) is False
+
+    # Style 3: Arbitrary third-party namespaced pattern (e.g. from open-source marketplace package)
+    mw3 = ToolFilterMiddleware(
+        allowed_patterns=["mcp__acme-corp_custom-agent_postgres__*"],
+        subagent_name="custom-agent",
+        known_mcp_servers=["postgres"],
+        mcp_tools=[mock_postgres_tool],
+    )
+    assert mw3.is_tool_allowed("postgres_query", tool_obj=mock_postgres_tool) is True
+    assert mw3.is_tool_allowed("mcp__postgres__query") is True

@@ -68,47 +68,54 @@ def _mcp_original_name_from_tool(tool: object | None) -> str | None:
 
 def _parse_mcp_pattern(
     pattern: str,
-    known_servers: set[str],
+    known_servers: set[str] | None = None,
     subagent_name: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """Parse (server_name, tool_pattern) from an MCP tool pattern.
+    """Parse (server_name, tool_pattern) from an MCP tool pattern generically.
 
-    Supports:
-    - mcp__plugin_<subagent>_<server>__<tool>
-    - mcp__plugin__<subagent>__<server>__<tool>
+    Supports arbitrary namespaces and patterns:
     - mcp__<server>__<tool>
+    - mcp__<namespace>_<server>__<tool>
+    - mcp__<namespace>__<server>__<tool>
     - <server>:<tool>
     - <server>_*
     """
-    if pattern.startswith("mcp__"):
-        content = pattern[5:]
-        parts = content.split("__")
-        if len(parts) == 2:
-            server_part, tool_pat = parts[0], parts[1]
-            if server_part.startswith("plugin_"):
-                rest = server_part[7:]
-                if subagent_name and rest.startswith(f"{subagent_name}_"):
-                    return rest[len(subagent_name) + 1 :], tool_pat
-                for srv in sorted(known_servers, key=len, reverse=True):
-                    if rest.endswith(f"_{srv}"):
-                        return srv, tool_pat
-                if "_" in rest:
-                    return rest.rsplit("_", 1)[1], tool_pat
-                return rest, tool_pat
-            return server_part, tool_pat
-        elif len(parts) >= 3:
-            tool_pat = parts[-1]
-            if parts[0] == "plugin":
-                server = parts[-2]
-                return server, tool_pat
-            return parts[0], tool_pat
-    elif ":" in pattern:
-        srv, tool_pat = pattern.split(":", 1)
+    known = known_servers or set()
+    pat = pattern.strip()
+
+    if pat.startswith("mcp__"):
+        rest = pat[5:]
+        if "__" in rest:
+            qualifier, tool_pat = rest.rsplit("__", 1)
+            # 1. Direct match with known servers
+            if qualifier in known:
+                return qualifier, tool_pat
+            # 2. Check if qualifier ends with a known server (e.g. prefix_server or prefix__server)
+            for srv in sorted(known, key=len, reverse=True):
+                if qualifier.endswith(f"_{srv}") or qualifier.endswith(f"__{srv}"):
+                    return srv, tool_pat
+            # 3. Subagent name check if provided
+            if subagent_name and (qualifier == subagent_name or qualifier.endswith(f"_{subagent_name}")):
+                return subagent_name, tool_pat
+            # 4. Fallback: extract last token
+            if "__" in qualifier:
+                return qualifier.rsplit("__", 1)[1], tool_pat
+            if "_" in qualifier:
+                return qualifier.rsplit("_", 1)[1], tool_pat
+            return qualifier, tool_pat
+    elif ":" in pat:
+        srv, tool_pat = pat.split(":", 1)
+        for known_srv in sorted(known, key=len, reverse=True):
+            if srv == known_srv or srv.endswith(f"_{known_srv}") or srv.endswith(f"__{known_srv}"):
+                return known_srv, tool_pat
         return srv, tool_pat
-    elif pattern.endswith("_*"):
-        srv = pattern[:-2]
-        if srv in known_servers:
-            return srv, "*"
+    elif pat.endswith("_*"):
+        srv = pat[:-2]
+        for known_srv in sorted(known, key=len, reverse=True):
+            if srv == known_srv or srv.endswith(f"_{known_srv}"):
+                return known_srv, "*"
+        return srv, "*"
+
     return None, None
 
 
@@ -117,7 +124,7 @@ def _expand_tool_patterns(
     known_servers: set[str] | None = None,
     subagent_name: str | None = None,
 ) -> tuple[str, ...]:
-    """Expand tool pattern list with aliases, wire projections, and provider-safe variations."""
+    """Expand tool pattern list with aliases, wire projections, and standard MCP variations."""
     expanded: list[str] = []
     seen: set[str] = set()
 
@@ -141,9 +148,6 @@ def _expand_tool_patterns(
             _add(f"mcp__{server}__{tool_pat}")
             _add(f"{server}:{tool_pat}")
             _add(f"{server}_{tool_pat}")
-            if subagent_name:
-                _add(f"mcp__plugin_{subagent_name}_{server}__{tool_pat}")
-                _add(f"mcp__plugin__{subagent_name}__{server}__{tool_pat}")
             if tool_pat == "*":
                 _add(server)
                 _add(f"{server}_*")
@@ -159,30 +163,60 @@ _GLOB_METACHARS = frozenset("*?[")
 
 
 def _entry_matches_tool(
-    pattern: str,
-    cand: str,
-    base_name: str,
+    entry: str,
+    candidates: Sequence[str] | set[str],
     server_name: str | None = None,
+    original_name: str | None = None,
 ) -> bool:
-    """Check if an allowed pattern matches a tool call under any valid naming projection."""
+    """Return True if a single filter entry matches any tool candidate.
+
+    Aligned directly with dcode's _entry_matches_tool candidate matching:
+    checks candidates via case-insensitive fnmatchcase when glob metachars are present,
+    or case-insensitive equality otherwise. Also checks structured MCP qualifiers.
+    """
+    entry_clean = entry.strip()
+    entry_lower = entry_clean.lower()
+    has_glob = any(ch in _GLOB_METACHARS for ch in entry_clean)
+
+    # 1. Match against generated candidates
+    for cand in candidates:
+        cand_lower = cand.lower()
+        if has_glob:
+            if fnmatch.fnmatchcase(cand_lower, entry_lower):
+                return True
+        else:
+            if cand_lower == entry_lower:
+                return True
+
+    # 2. Semantic matching for server-qualified patterns (e.g. "billing:*", "billing", "mcp__..._billing__*")
     if server_name:
-        if pattern in {
-            f"mcp__{server_name}__*",
-            f"{server_name}:*",
-            f"{server_name}_*",
-            server_name,
-        }:
-            return True
-        if fnmatch.fnmatch(server_name, pattern) or fnmatch.fnmatch(server_name.lower(), pattern.lower()):
+        srv_lower = server_name.lower()
+        if entry_lower in {srv_lower, f"{srv_lower}:*", f"{srv_lower}_*", f"mcp__{srv_lower}__*"}:
             return True
 
-    is_glob = any(ch in _GLOB_METACHARS for ch in pattern)
-    if is_glob:
-        if fnmatch.fnmatch(cand, pattern) or fnmatch.fnmatch(cand.lower(), pattern.lower()):
-            return True
-    else:
-        if cand == pattern or cand.lower() == pattern.lower():
-            return True
+        # Parse qualifier and tool pattern from entry
+        tool_pat: str | None = None
+        qualifier: str | None = None
+        if entry_clean.startswith("mcp__") and "__" in entry_clean[5:]:
+            qualifier, tool_pat = entry_clean[5:].rsplit("__", 1)
+        elif ":" in entry_clean:
+            qualifier, tool_pat = entry_clean.split(":", 1)
+
+        if qualifier is not None and tool_pat is not None:
+            qual_lower = qualifier.lower()
+            if (
+                qual_lower == srv_lower
+                or qual_lower.endswith(f"_{srv_lower}")
+                or qual_lower.endswith(f"__{srv_lower}")
+            ):
+                if tool_pat == "*":
+                    return True
+                if original_name:
+                    orig_lower = original_name.lower()
+                    pat_lower = tool_pat.lower()
+                    if any(ch in _GLOB_METACHARS for ch in tool_pat):
+                        return fnmatch.fnmatchcase(orig_lower, pat_lower)
+                    return orig_lower == pat_lower
 
     return False
 
@@ -224,9 +258,7 @@ class ToolFilterMiddleware(AgentMiddleware[Any, Any]):
                 if isinstance(item, dict):
                     server = item.get("mcp_server")
                     if server and item.get("allow_all"):
-                        patterns.append(f"mcp__{server}__*")
                         patterns.append(f"{server}:*")
-                        patterns.append(f"{server}_*")
                     if "tools" in item and isinstance(item["tools"], (list, tuple)):
                         patterns.extend(str(t) for t in item["tools"])
                 elif isinstance(item, str):
@@ -237,9 +269,7 @@ class ToolFilterMiddleware(AgentMiddleware[Any, Any]):
                 if isinstance(cap, dict):
                     server = cap.get("mcp_server")
                     if server and cap.get("allow_all"):
-                        patterns.append(f"mcp__{server}__*")
                         patterns.append(f"{server}:*")
-                        patterns.append(f"{server}_*")
                     if "tools" in cap and isinstance(cap["tools"], (list, tuple)):
                         patterns.extend(str(t) for t in cap["tools"])
                 elif isinstance(cap, str):
@@ -251,6 +281,43 @@ class ToolFilterMiddleware(AgentMiddleware[Any, Any]):
             else ()
         )
 
+    def _get_tool_candidates(
+        self,
+        tool_name: str,
+        server_name: str | None = None,
+        original_name: str | None = None,
+    ) -> list[str]:
+        """Generate dcode-aligned candidate names for a tool."""
+        candidates: list[str] = [tool_name]
+        if original_name and original_name != tool_name:
+            candidates.append(original_name)
+
+        if server_name:
+            candidates.append(server_name)
+            if original_name:
+                candidates.extend([
+                    f"{server_name}_{original_name}",
+                    f"{server_name}:{original_name}",
+                    f"mcp__{server_name}__{original_name}",
+                ])
+
+        # Aliases for native tools
+        clean = tool_name.lower()
+        if clean in TOOL_ALIAS_MAP:
+            candidates.extend(TOOL_ALIAS_MAP[clean])
+        for alias_key, alias_group in TOOL_ALIAS_MAP.items():
+            if tool_name in alias_group or clean in alias_group:
+                candidates.append(alias_key)
+                candidates.extend(alias_group)
+
+        from opscloud.hooks.tools import to_wire_tool_name
+
+        wire_name = to_wire_tool_name(tool_name, mcp_server=server_name)
+        if wire_name and wire_name not in candidates:
+            candidates.append(wire_name)
+
+        return list(dict.fromkeys(candidates))
+
     def is_tool_allowed(self, tool_name: str, tool_obj: Any = None) -> bool:
         """Check if a tool name matches any allowed patterns."""
         if tool_name in ALWAYS_ALLOWED_SYSTEM_TOOLS:
@@ -259,69 +326,55 @@ class ToolFilterMiddleware(AgentMiddleware[Any, Any]):
             return True
 
         server_name: str | None = None
-        base_name: str | None = None
+        original_name: str | None = None
 
         if tool_obj is not None:
             server_name = _mcp_server_from_tool(tool_obj)
-            base_name = _mcp_original_name_from_tool(tool_obj)
+            original_name = _mcp_original_name_from_tool(tool_obj)
             if server_name:
                 self._known_mcp_servers.add(server_name)
                 self._tool_to_server[tool_name] = server_name
 
         if not server_name and tool_name in self._tool_to_server:
             server_name = self._tool_to_server[tool_name]
-            base_name = self._tool_to_orig_name.get(tool_name)
+            original_name = original_name or self._tool_to_orig_name.get(tool_name)
 
         if not server_name:
             if tool_name.startswith("mcp__"):
                 parts = tool_name[5:].split("__")
-                if len(parts) == 2:
-                    server_name, base_name = parts[0], parts[1]
-                elif len(parts) >= 3:
-                    base_name = parts[-1]
-                    server_part = parts[-2]
+                if len(parts) >= 2:
+                    original_name = original_name or parts[-1]
+                    qualifier = parts[0] if len(parts) == 2 else parts[-2]
                     for srv in sorted(self._known_mcp_servers, key=len, reverse=True):
-                        if parts[1].endswith(f"_{srv}") or parts[1].endswith(f"__{srv}") or parts[1] == srv:
+                        if qualifier == srv or qualifier.endswith(f"_{srv}") or qualifier.endswith(f"__{srv}"):
                             server_name = srv
                             break
                     if not server_name:
-                        server_name = server_part
+                        server_name = qualifier
             elif ":" in tool_name:
-                server_name, base_name = tool_name.split(":", 1)
+                srv, orig = tool_name.split(":", 1)
+                original_name = original_name or orig
+                for known_srv in sorted(self._known_mcp_servers, key=len, reverse=True):
+                    if srv == known_srv or srv.endswith(f"_{known_srv}"):
+                        server_name = known_srv
+                        break
+                if not server_name:
+                    server_name = srv
             else:
                 for srv in sorted(self._known_mcp_servers, key=len, reverse=True):
                     if tool_name.startswith(f"{srv}_"):
                         server_name = srv
-                        base_name = tool_name[len(srv) + 1 :]
+                        original_name = original_name or tool_name[len(srv) + 1 :]
                         break
 
-        if not base_name:
-            base_name = tool_name
+        if not original_name:
+            original_name = tool_name
 
-        candidates: list[str] = [tool_name, base_name]
-        if server_name:
-            candidates.extend([
-                f"{server_name}_{base_name}",
-                f"{server_name}:{base_name}",
-                f"mcp__{server_name}__{base_name}",
-                server_name,
-            ])
-            if self._subagent_name:
-                candidates.extend([
-                    f"mcp__plugin_{self._subagent_name}_{server_name}__{base_name}",
-                    f"mcp__plugin__{self._subagent_name}__{server_name}__{base_name}",
-                ])
+        candidates = self._get_tool_candidates(tool_name, server_name, original_name)
 
-        from opscloud.hooks.tools import to_wire_tool_name
-
-        wire_name = to_wire_tool_name(tool_name, mcp_server=server_name)
-        if wire_name not in candidates:
-            candidates.append(wire_name)
-
-        for cand in candidates:
-            for pattern in self._allowed_patterns:
-                if _entry_matches_tool(pattern, cand, base_name, server_name):
-                    return True
+        for pattern in self._allowed_patterns:
+            if _entry_matches_tool(pattern, candidates, server_name=server_name, original_name=original_name):
+                return True
 
         return False
 

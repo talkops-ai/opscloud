@@ -242,25 +242,49 @@ class RemoteAgent:
         graph = self._get_graph()
         try:
             client = graph._validate_client()
-            runs = await client.runs.list(thread_id)
-            active_runs = [
-                r for r in runs if isinstance(r, dict) and r.get("status") in ("pending", "running")
-            ]
-            if not active_runs:
-                return
-
-            async def _cancel_one(run_id: str) -> None:
-                try:
-                    await asyncio.wait_for(
-                        client.runs.cancel(thread_id, run_id, wait=True, action="interrupt"),
-                        timeout=_RUN_CANCEL_WAIT_SECONDS,
-                    )
-                except Exception:
-                    pass
-
-            await asyncio.gather(*(_cancel_one(r["run_id"]) for r in active_runs if "run_id" in r))
         except Exception:
-            logger.debug("Failed to cancel active runs for thread %s", thread_id, exc_info=True)
+            logger.debug("Failed to get SDK client to cancel runs for thread %s", thread_id, exc_info=True)
+            return
+
+        run_ids: set[str] = set()
+        for status in ("running", "pending"):
+            try:
+                runs = await client.runs.list(thread_id, status=status, limit=10)
+                for run in runs:
+                    r_status = run.get("status") if isinstance(run, dict) else getattr(run, "status", None)
+                    if r_status is not None and r_status != status:
+                        continue
+                    rid = run.get("run_id") if isinstance(run, dict) else getattr(run, "run_id", None)
+                    if rid:
+                        run_ids.add(rid)
+            except Exception:
+                logger.debug("Failed to list %s runs for thread %s", status, thread_id, exc_info=True)
+
+        if not run_ids:
+            try:
+                runs = await client.runs.list(thread_id)
+                for r in runs:
+                    status = r.get("status") if isinstance(r, dict) else getattr(r, "status", None)
+                    if status in ("pending", "running"):
+                        rid = r.get("run_id") if isinstance(r, dict) else getattr(r, "run_id", None)
+                        if rid:
+                            run_ids.add(rid)
+            except Exception:
+                pass
+
+        if not run_ids:
+            return
+
+        async def _cancel_one(run_id: str) -> None:
+            try:
+                await asyncio.wait_for(
+                    client.runs.cancel(thread_id, run_id, wait=True, action="interrupt"),
+                    timeout=_RUN_CANCEL_WAIT_SECONDS,
+                )
+            except Exception:
+                pass
+
+        await asyncio.gather(*(_cancel_one(rid) for rid in set(run_ids)))
 
     async def aupdate_state(
         self,

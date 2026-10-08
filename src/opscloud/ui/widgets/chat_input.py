@@ -454,9 +454,7 @@ class ChatInput(Widget):
     }
     """
 
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("escape", "dismiss_or_clear", "Clear", show=False),
-    ]
+    BINDINGS: ClassVar[list[BindingType]] = []
 
     mode: reactive[str] = reactive("normal")
     _app: Any = None
@@ -554,6 +552,53 @@ class ChatInput(Widget):
         else:
             self._text_area.text = value
             self._sync_mode()
+
+    @property
+    def value(self) -> str:
+        """The logical content of the input text area."""
+        if self._text_area:
+            return self._text_area.text
+        return ""
+
+    @value.setter
+    def value(self, val: str) -> None:
+        self.text = val
+
+    def set_value_at_end(self, val: str) -> bool:
+        """Set the input value and place cursor at the end."""
+        if not self._text_area:
+            return False
+        self.text = val
+        lines = self._text_area.text.split("\n")
+        self._text_area.cursor_location = (len(lines) - 1, len(lines[-1])) if lines else (0, 0)
+        return True
+
+    def discard_text(self) -> bool:
+        """Clear the input text draft."""
+        if self._text_area is None:
+            return False
+        had_text = bool(self._text_area.text)
+        self.clear()
+        return had_text
+
+    def dismiss_completion(self) -> bool:
+        """Dismiss completion popup if active."""
+        if not getattr(self, "_current_suggestions", None):
+            return False
+        if self._completion_manager:
+            self._completion_manager.reset()
+        self.clear_completion_suggestions()
+        return True
+
+    def exit_mode(self) -> bool:
+        """Exit the current input mode (command/shell) back to normal."""
+        if self.mode == "normal":
+            return False
+        self.mode = "normal"
+        if self._completion_manager:
+            self._completion_manager.reset()
+        self.clear_completion_suggestions()
+        return True
 
     def clear(self) -> None:
         self._text_area.clear()

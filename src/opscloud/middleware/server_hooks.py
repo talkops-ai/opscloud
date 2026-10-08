@@ -919,7 +919,7 @@ def _mcp_server_from_tool(tool: object | None) -> str | None:
     metadata = getattr(tool, "metadata", None)
     if not isinstance(metadata, Mapping):
         return None
-    for key in ("mcp_server", "mcp_server_name", "server_name"):
+    for key in ("_mcp_server", "mcp_server", "mcp_server_name", "server_name"):
         value = metadata.get(key)
         if isinstance(value, str) and value:
             return value

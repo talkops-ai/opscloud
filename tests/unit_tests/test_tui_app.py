@@ -353,3 +353,144 @@ async def test_deprecated_cost_and_tokens_command():
     assert result.success is True
     assert "deprecated" in result.message.lower()
     assert "status bar" in result.message.lower()
+
+
+def test_interrupt_and_quit_bindings():
+    """Verify priority bindings for escape and ctrl+c."""
+    bindings = {b.key: b for b in OpsCloudApp.BINDINGS}
+    assert "escape" in bindings
+    assert bindings["escape"].action == "interrupt"
+    assert bindings["escape"].priority is True
+
+    assert "ctrl+c" in bindings
+    assert bindings["ctrl+c"].action == "quit_or_interrupt"
+    assert bindings["ctrl+c"].priority is True
+
+
+def test_user_message_set_cancelled_and_raw_text():
+    """Verify UserMessage tracks raw text and can be dimmed via set_cancelled."""
+    from opscloud.ui.widgets.messages import UserMessage
+
+    msg = UserMessage("hello world")
+    assert msg.raw_text == "hello world"
+    assert "-cancelled" not in msg.classes
+    msg.set_cancelled()
+    assert "-cancelled" in msg.classes
+
+
+def test_action_interrupt_cancels_agent_worker():
+    """Verify action_interrupt cancels agent worker, adapter, and dims message."""
+    from unittest.mock import MagicMock
+    from opscloud.ui.widgets.messages import UserMessage
+
+    app = OpsCloudApp(defer_server_start=True)
+    app._agent_running = True
+    app._agent_thread_id = "test-thread-interrupt"
+
+    mock_worker = MagicMock()
+    app._agent_worker = mock_worker
+
+    mock_adapter = MagicMock()
+    app._adapter = mock_adapter
+
+    user_msg = UserMessage("test prompt to interrupt")
+    app._active_user_message = user_msg
+    app._active_turn_visible_output_started = False
+
+    mock_chat_input = MagicMock()
+    mock_chat_input.value = ""
+    mock_chat_input.dismiss_completion.return_value = False
+    mock_chat_input.exit_mode.return_value = False
+    app._chat_input = mock_chat_input
+
+    app.action_interrupt()
+
+    # Worker was cancelled
+    mock_worker.cancel.assert_called_once()
+    # Adapter cancel was called with thread_id
+    mock_adapter.cancel.assert_called_once_with(thread_id="test-thread-interrupt")
+    # User message was dimmed
+    assert "-cancelled" in user_msg.classes
+    # Prompt was restored to chat input
+    mock_chat_input.set_value_at_end.assert_called_once_with("test prompt to interrupt")
+
+
+def test_action_interrupt_preserves_prompt_if_output_appeared():
+    """Verify prompt is NOT restored if visible model output already appeared."""
+    from unittest.mock import MagicMock
+    from opscloud.ui.widgets.messages import UserMessage
+
+    app = OpsCloudApp(defer_server_start=True)
+    app._agent_running = True
+    app._agent_thread_id = "test-thread-interrupt"
+    app._agent_worker = MagicMock()
+    app._adapter = MagicMock()
+
+    user_msg = UserMessage("test prompt with output")
+    app._active_user_message = user_msg
+    app._active_turn_visible_output_started = True
+
+    mock_chat_input = MagicMock()
+    mock_chat_input.value = ""
+    mock_chat_input.dismiss_completion.return_value = False
+    mock_chat_input.exit_mode.return_value = False
+    app._chat_input = mock_chat_input
+
+    app.action_interrupt()
+
+    # set_value_at_end was NOT called because output already appeared
+    mock_chat_input.set_value_at_end.assert_not_called()
+    assert "-cancelled" in user_msg.classes
+
+
+def test_action_interrupt_rejects_pending_approval_first():
+    """Verify approval widget is rejected before agent worker is cancelled."""
+    from unittest.mock import MagicMock
+
+    app = OpsCloudApp(defer_server_start=True)
+    app._agent_running = True
+    mock_worker = MagicMock()
+    app._agent_worker = mock_worker
+
+    mock_approval = MagicMock()
+    app._pending_approval_widget = mock_approval
+
+    app.action_interrupt()
+
+    # Approval was rejected
+    mock_approval.action_select_reject.assert_called_once()
+    # Agent worker was NOT cancelled yet because approval handled the interrupt
+    mock_worker.cancel.assert_not_called()
+
+
+def test_action_interrupt_pops_queued_message():
+    """Verify queued message is popped instead of cancelling active agent worker."""
+    from collections import deque
+    from unittest.mock import MagicMock
+    from opscloud.ui.app import QueuedMessage
+
+    app = OpsCloudApp(defer_server_start=True)
+    app._agent_running = True
+    mock_worker = MagicMock()
+    app._agent_worker = mock_worker
+
+    app._pending_messages = deque([QueuedMessage(text="queued prompt 1"), QueuedMessage(text="queued prompt 2")])
+    mock_widget = MagicMock()
+    app._queued_widgets = deque([MagicMock(), mock_widget])
+
+    mock_chat_input = MagicMock()
+    mock_chat_input.value = ""
+    mock_chat_input.dismiss_completion.return_value = False
+    mock_chat_input.exit_mode.return_value = False
+    app._chat_input = mock_chat_input
+
+    app.action_interrupt()
+
+    # Last queued message was popped
+    assert len(app._pending_messages) == 1
+    assert app._pending_messages[0].text == "queued prompt 1"
+    mock_widget.remove.assert_called_once()
+    mock_chat_input.set_value_at_end.assert_called_once_with("queued prompt 2")
+    # Agent worker was NOT cancelled
+    mock_worker.cancel.assert_not_called()
+
