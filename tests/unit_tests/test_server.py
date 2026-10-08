@@ -1,6 +1,5 @@
 """Unit tests for ServerProcess, ServerConfig, stream item parsing, and RemoteAgent connection."""
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,7 +9,6 @@ from opscloud.server import ServerConfig, ServerProcess, find_free_port, generat
 from opscloud.ui.remote_client import (
     RemoteAgent,
     _convert_ai_message,
-    _convert_interrupts,
     _convert_tool_message,
     _parse_stream_item,
 )
@@ -162,7 +160,6 @@ def test_server_graph_factory_signature():
 
 def test_wait_for_graph_ready_single_request():
     """Verify wait_for_graph_ready sends a single request with full remaining timeout."""
-    import httpx
     from unittest.mock import MagicMock, patch
 
     cfg = ServerConfig()
@@ -186,7 +183,6 @@ def test_wait_for_graph_ready_single_request():
 
 def test_wait_for_graph_ready_fallback():
     """Verify wait_for_graph_ready falls back from agent to opscloud on 404."""
-    import httpx
     from unittest.mock import MagicMock, patch
 
     cfg = ServerConfig()
@@ -218,8 +214,8 @@ def test_server_prepare_launch_environment_sanitization(monkeypatch):
     assert "PYTHONEXECUTABLE" not in env
     assert env["LANGGRAPH_AUTH_TYPE"] == "noop"
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"
-    assert "LANGGRAPH_ALLOW_BLOCKING" not in env
-    assert "--allow-blocking" not in cmd
+    assert env["LANGGRAPH_ALLOW_BLOCKING"] == "true"
+    assert "--allow-blocking" in cmd
     assert "--server-log-level" in cmd
 
 

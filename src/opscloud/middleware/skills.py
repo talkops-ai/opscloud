@@ -222,6 +222,7 @@ class PluginSkillsMiddleware(SkillsMiddleware):
             source[2] if len(source) == _PLUGIN_SKILL_SOURCE_LENGTH else None for source in sources
         )
         self._allowed_skills = tuple(allowed_skills) if allowed_skills is not None else None
+        self._cached_live_skills: list[sdk_skills.SkillMetadata] | None = None
 
     def _format_skills_locations(self) -> str:
         """Format skills locations for display in system prompt."""
@@ -322,6 +323,7 @@ class PluginSkillsMiddleware(SkillsMiddleware):
             SkillsStateUpdate if changes were detected, or None.
         """
         live_skills, errors = self._get_live_skills()
+        self._cached_live_skills = live_skills
         current_skills = state.get("skills_metadata") or []
         current_names = [s["name"] for s in current_skills]
         live_names = [s["name"] for s in live_skills]
@@ -362,7 +364,14 @@ class PluginSkillsMiddleware(SkillsMiddleware):
         Returns:
             Modified request with pruned skill metadata.
         """
-        live_skills, _ = self._get_live_skills()
+        live_skills = getattr(self, "_cached_live_skills", None)
+        if live_skills is None:
+            if hasattr(request, "state") and isinstance(request.state, dict) and request.state.get("skills_metadata"):
+                live_skills = request.state["skills_metadata"]
+            else:
+                live_skills, _ = self._get_live_skills()
+            self._cached_live_skills = live_skills
+
         live_names = {s["name"] for s in live_skills}
 
         if hasattr(request, "state") and isinstance(request.state, dict):

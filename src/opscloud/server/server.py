@@ -156,6 +156,7 @@ class ServerProcess:
 
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["LANGGRAPH_AUTH_TYPE"] = "noop"
+        env["LANGGRAPH_ALLOW_BLOCKING"] = "true"
 
         # If in a dev repository checkout, ensure src/ is on PYTHONPATH.
         # Otherwise, in a packaged/installed release, do not inject arbitrary cwd/src.
@@ -190,6 +191,7 @@ class ServerProcess:
             str(self.runtime_dir / "langgraph.json"),
             "--server-log-level",
             server_log_level,
+            "--allow-blocking",
         ]
 
         return env, cmd
