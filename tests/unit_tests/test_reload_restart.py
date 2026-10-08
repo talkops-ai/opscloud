@@ -346,3 +346,85 @@ async def test_server_process_restart():
 
     assert proc._stop_process.called
     assert proc.start.called
+
+
+@pytest.mark.asyncio
+async def test_on_server_start_failed_missing_credentials_message():
+    """Verify _on_server_start_failed does not hardcode OpenAI and provides provider hint."""
+    from opscloud.exceptions import MissingCredentialsError
+    from opscloud.ui.widgets.messages import ErrorMessage
+
+    app = OpsCloudApp(defer_server_start=True)
+    mounted: list[Any] = []
+    app._mount_message = AsyncMock(side_effect=lambda msg: mounted.append(msg))
+
+    err = MissingCredentialsError("API key missing", provider="google_genai", env_var="GEMINI_API_KEY")
+    event = OpsCloudApp.ServerStartFailed(err)
+
+    await app._on_server_start_failed(event)
+
+    assert app._connecting is False
+    assert app._server_startup_error == err
+    assert len(mounted) == 1
+    assert isinstance(mounted[0], ErrorMessage)
+    content = mounted[0]._raw_content
+    assert "google_genai" in content
+    assert "GEMINI_API_KEY" in content
+    assert "OPENAI_API_KEY" not in content
+
+
+@pytest.mark.asyncio
+async def test_on_server_start_failed_generic_error_message():
+    """Verify general server startup errors do not contain hardcoded OpenAI/Anthropic references."""
+    from opscloud.ui.widgets.messages import ErrorMessage
+
+    app = OpsCloudApp(defer_server_start=True)
+    mounted: list[Any] = []
+    app._mount_message = AsyncMock(side_effect=lambda msg: mounted.append(msg))
+
+    err = TimeoutError("Server at http://127.0.0.1:51314 failed to become healthy within 60.0s")
+    event = OpsCloudApp.ServerStartFailed(err)
+
+    await app._on_server_start_failed(event)
+
+    assert len(mounted) == 1
+    assert isinstance(mounted[0], ErrorMessage)
+    content = mounted[0]._raw_content
+    assert "51314" in content
+    assert "OPENAI_API_KEY" not in content
+
+
+@pytest.mark.asyncio
+async def test_restart_lifecycle_deferred_server_guidance():
+    """Verify running restart when server is deferred tells user it's waiting for a model."""
+    app = OpsCloudApp(
+        defer_server_start=True,
+        server_kwargs={"assistant_id": "opscloud", "interactive": True},
+    )
+
+    restored_notices: list[str] = []
+    app._restore_queue_to_input = AsyncMock(
+        side_effect=lambda notice, empty_notice=None: restored_notices.append(notice)
+    )
+
+    success = await app._run_restart_command()
+    assert success is False
+    assert len(restored_notices) == 1
+    assert "Server startup is waiting for a model" in restored_notices[0]
+    assert "remote LangGraph server" not in restored_notices[0]
+
+
+@pytest.mark.asyncio
+async def test_restart_lifecycle_remote_detection():
+    """Verify running restart when server_kwargs is None indicates remote server."""
+    app = OpsCloudApp(server_url="http://remote-server:2024", server_kwargs=None)
+
+    restored_notices: list[str] = []
+    app._restore_queue_to_input = AsyncMock(
+        side_effect=lambda notice, empty_notice=None: restored_notices.append(notice)
+    )
+
+    success = await app._run_restart_command()
+    assert success is False
+    assert len(restored_notices) == 1
+    assert "connected to a remote LangGraph server" in restored_notices[0]

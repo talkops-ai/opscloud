@@ -33,6 +33,8 @@ from opscloud.utils.logger import get_logger
 
 if TYPE_CHECKING:
     import aiosqlite
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.base import CheckpointTuple
     from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 logger = get_logger(__name__)
@@ -770,6 +772,15 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
 
         async with aiosqlite.connect(conn_string) as conn:
             yield cls(conn)
+
+    async def aget_iter(self, config: RunnableConfig) -> AsyncIterator[CheckpointTuple]:
+        """Asynchronously iterate checkpoints matching config."""
+        async def gen() -> AsyncIterator[CheckpointTuple]:
+            tup = await self.aget_tuple(config)
+            if tup is not None:
+                yield tup
+
+        return gen()
 
     async def adelete_for_runs(self, run_ids: Sequence[str] | Iterable[str]) -> None:
         """Asynchronously delete all checkpoints and writes associated with the given run IDs.

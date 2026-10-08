@@ -486,7 +486,7 @@ class OpsCloudApp(App):
         # ── State Flags ──────────────────────────────────
         self._agent_running = False
         self._shell_running = False
-        self._connecting = server_kwargs is not None and client is None
+        self._connecting = server_kwargs is not None and not self._server_startup_deferred and client is None
         self._startup_sequence_running = False
         self._server_startup_error: Exception | None = None
         self._exit = False
@@ -786,11 +786,14 @@ class OpsCloudApp(App):
         self._server_startup_deferred = False
         self._model = model_spec
         self._connecting = True
-        self._server_kwargs = {
-            "assistant_id": self._assistant_id,
-            "model_name": model_spec,
-            "auto_approve": self._auto_approve,
-        }
+        if self._server_kwargs is None:
+            self._server_kwargs = {
+                "assistant_id": self._assistant_id,
+                "model_name": model_spec,
+                "auto_approve": self._auto_approve,
+            }
+        else:
+            self._server_kwargs["model_name"] = model_spec
 
         try:
             status_bar = self.query_one(StatusBar)
@@ -932,10 +935,12 @@ class OpsCloudApp(App):
             except Exception:
                 pass
 
+        self._connecting = False
+        self._server_startup_error = event.error
         try:
             status_bar = self.query_one("#status-bar", StatusBar)
             status_bar.set_status("Server Error")
-        except NoMatches:
+        except Exception:
             pass
 
         try:
@@ -944,13 +949,27 @@ class OpsCloudApp(App):
         except Exception:
             pass
 
-        await self._mount_message(
-            ErrorMessage(
+        from opscloud.exceptions import MissingCredentialsError, MissingProviderPackageError
+
+        if isinstance(event.error, MissingCredentialsError):
+            env_var_hint = f" (`{event.error.env_var}`)" if event.error.env_var else ""
+            provider_hint = f" for provider `{event.error.provider}`{env_var_hint}" if event.error.provider else ""
+            msg = (
                 f"Server startup failed: {event.error}\n\n"
-                "Check your API key (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`) "
-                "and relaunch, or use `/model` to reconfigure."
+                f"Hint: Run `/auth` to configure credentials{provider_hint}, or use `/model` to select a different model."
             )
-        )
+        elif isinstance(event.error, MissingProviderPackageError):
+            msg = (
+                f"Server startup failed: {event.error}\n\n"
+                f"Hint: Install `{event.error.package}` to use provider `{event.error.provider}`, or switch models with `/model`."
+            )
+        else:
+            msg = (
+                f"Server startup failed: {event.error}\n\n"
+                "Hint: Check credentials with `/auth` or use `/model` to reconfigure."
+            )
+
+        await self._mount_message(ErrorMessage(msg))
         logger.error("Server startup failed: %s", event.error)
 
         # Keep input focusable for slash commands even after failure
@@ -1055,6 +1074,25 @@ class OpsCloudApp(App):
         """Copy selection to clipboard after click-chain selection updates."""
         from opscloud.ui.clipboard import copy_selection_to_clipboard
         self.call_after_refresh(copy_selection_to_clipboard, self)
+
+    def on_click(self, event: events.Click) -> None:
+        """Handle clicks anywhere in the terminal to restore focus to chat input."""
+        if not self._chat_input:
+            return
+        from textual.screen import ModalScreen
+        if isinstance(self.screen, ModalScreen):
+            return
+        # Don't steal focus from active approval or interactive prompt widgets.
+        pending_approval = getattr(self, "_pending_approval_widget", None)
+        if pending_approval is not None and getattr(pending_approval, "is_mounted", False) and getattr(pending_approval, "display", True):
+            return
+        pending_ask_user = getattr(self, "_pending_ask_user_widget", None)
+        if pending_ask_user is not None and getattr(pending_ask_user, "is_mounted", False) and getattr(pending_ask_user, "display", True):
+            return
+        pending_goal = getattr(self, "_pending_goal_review_widget", None)
+        if pending_goal is not None and getattr(pending_goal, "is_mounted", False) and getattr(pending_goal, "display", True):
+            return
+        self.call_after_refresh(self._chat_input.focus_input)
 
     # ── Input Submission Pipeline ────────────────────────
 
@@ -2443,7 +2481,7 @@ class OpsCloudApp(App):
             )
             return False
 
-        if self._server_proc is None and self._server_kwargs is None:
+        if self._server_kwargs is None:
             await self._restore_queue_to_input(
                 "Cannot restart: this app is connected to a remote LangGraph "
                 "server (no owned subprocess). Configuration was reloaded; "
@@ -2455,6 +2493,62 @@ class OpsCloudApp(App):
                     "relaunch opscloud to fully restart."
                 ),
             )
+            return False
+
+        if self._connecting or self._server_proc is None:
+            if self._server_startup_deferred:
+                notice = (
+                    "Server startup is waiting for a model. Configuration was "
+                    "reloaded; queued prompts were returned to the input. Set "
+                    "credentials with `/auth`, reload the environment with "
+                    "`/reload`, or pick a model with `/model` to start the "
+                    "server."
+                )
+                empty_notice = (
+                    "Server startup is waiting for a model. Configuration was "
+                    "reloaded. Set credentials with `/auth`, reload the "
+                    "environment with `/reload`, or pick a model with `/model` "
+                    "to start the server."
+                )
+            elif self._connecting:
+                notice = (
+                    "The server is still starting. Configuration was reloaded "
+                    "and will apply once it finishes connecting; queued prompts "
+                    "were returned to the input. Re-submit them to send on the "
+                    "current session, or run `/restart` again afterward."
+                )
+                empty_notice = (
+                    "The server is still starting. Configuration was reloaded "
+                    "and will apply once it finishes connecting; run `/restart` "
+                    "again afterward."
+                )
+            elif self._server_startup_error is not None:
+                notice = (
+                    "Cannot restart yet because the server did not finish "
+                    "starting. Configuration was reloaded; queued prompts were "
+                    "returned to the input. Update credentials with `/auth` if "
+                    "needed, then pick a model with `/model` to try again. You "
+                    "can also relaunch opscloud.\n\n"
+                    f"Last error: {self._server_startup_error}"
+                )
+                empty_notice = (
+                    "Cannot restart yet because the server did not finish "
+                    "starting. Configuration was reloaded. Update credentials "
+                    "with `/auth` if needed, then pick a model with `/model` to "
+                    "try again. You can also relaunch opscloud.\n\n"
+                    f"Last error: {self._server_startup_error}"
+                )
+            else:
+                notice = (
+                    "Cannot restart yet because the server is not running. "
+                    "Configuration was reloaded; queued prompts were returned "
+                    "to the input. Relaunch opscloud to start again."
+                )
+                empty_notice = (
+                    "Cannot restart yet because the server is not running. "
+                    "Configuration was reloaded. Relaunch opscloud to start again."
+                )
+            await self._restore_queue_to_input(notice, empty_notice=empty_notice)
             return False
 
         self._connecting = True
@@ -2531,7 +2625,7 @@ class OpsCloudApp(App):
         log_message: str = "Server respawn failed",
         mcp_failure_log: str = "MCP preload after restart failed",
         mcp_failure_toast: str = "MCP metadata could not be refreshed",
-        restart_timeout: float = 30.0,
+        restart_timeout: float = 60.0,
     ) -> _ServerRespawnResult:
         """Stop the app-owned server subprocess and rebuild the agent."""
         server_proc = self._server_proc
@@ -4964,6 +5058,12 @@ class OpsCloudApp(App):
         def _on_pool_selected(result: dict[str, str] | None) -> None:
             if result is None:
                 return
+
+            from opscloud.model.pool import get_model_pool_manager
+            pool_mgr = get_model_pool_manager()
+            with pool_mgr._lock:
+                pool_mgr._instances.clear()
+
             if result.get("_cleared"):
                 self.notify("Agent model pool cleared (dynamic discovery restored)", severity="information")
                 self.run_worker(
@@ -4976,6 +5076,13 @@ class OpsCloudApp(App):
             fast = result.get("fast", "")
             std = result.get("standard", "")
             pow_m = result.get("powerful", "")
+
+            # Apply stored credentials for all providers present in the pool
+            from opscloud.model.config import apply_stored_credentials
+            provs = {s.split(":", 1)[0] for s in (fast, std, pow_m) if ":" in s}
+            for p in provs:
+                apply_stored_credentials(p)
+
             self.notify("Agent model pool saved to config.toml", severity="information")
             msg = (
                 f"**Agent Model Pool Saved (`config.toml [agent_pool]`):**\n"

@@ -120,6 +120,21 @@ def run_interactive(
         "trust_project_mcp": trust_project_mcp,
     }
 
+    server_kwargs: dict[str, Any] = {
+        "assistant_id": "opscloud",
+        "model_name": resolved_model,
+        "interactive": True,
+        "auto_approve": (approval_mode == ApprovalMode.AUTO or approval_mode == "auto"),
+        "cwd": resolved_cwd,
+        "read_only": read_only,
+        "aws_profile": aws_profile,
+        "aws_region": aws_region,
+        "shell_allow_list": tuple(shell_allow_list) if shell_allow_list else None,
+        "mcp_config_path": mcp_config_path,
+        "no_mcp": no_mcp,
+        "trust_project_mcp": trust_project_mcp,
+    }
+
     try:
         app = OpsCloudApp(
             server_url=url,
@@ -129,6 +144,7 @@ def run_interactive(
             model=resolved_model,
             approval_mode=approval_mode,
             defer_server_start=defer_server_start,
+            server_kwargs=server_kwargs,
             goal=goal,
             cwd=resolved_cwd,
             mcp_preload_kwargs=mcp_preload_kwargs,

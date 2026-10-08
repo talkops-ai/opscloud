@@ -220,7 +220,7 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
 
         # Pre-select initial values from saved pool or dynamic discovery
         saved_pool = load_agent_pool() or {}
-        default_tiers = self._pool_mgr.discover_tiers(provider=self._provider)
+        default_tiers = self._pool_mgr.discover_tiers(provider=self._provider, ignore_custom_pool=True)
 
         def _resolve_tier_init(tier_name: str, tier_num: int) -> tuple[str, str, list[tuple[str, str]]]:
             saved_spec = saved_pool.get(tier_name)
@@ -392,7 +392,7 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
         try:
             sel = self.query_one(f"#select-{tier_name}", Select)
             sel.set_options(new_options)
-            default_tiers = self._pool_mgr.discover_tiers(provider=provider)
+            default_tiers = self._pool_mgr.discover_tiers(provider=provider, ignore_custom_pool=True)
             rec_spec = default_tiers.get(tier_num, ("", ""))[0]
             avail_specs = [opt[1] for opt in new_options]
             sel.value = rec_spec if rec_spec in avail_specs else (avail_specs[0] if avail_specs else Select.NULL)
@@ -457,6 +457,7 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
             pow_val = str(pow_sel.value) if pow_sel.value != Select.NULL else ""
 
             if not fast_val or not std_val or not pow_val:
+                self.notify("Please select a valid model for each tier (Fast, Standard, Powerful).", severity="error")
                 return
 
             pool_dict = {
@@ -474,11 +475,16 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
                     severity="warning",
                 )
 
-            save_agent_pool(pool_dict, provider=pool_provider)
+            ok = save_agent_pool(pool_dict, provider=pool_provider)
+            if not ok:
+                self.notify("Failed to write agent pool configuration to config.toml", severity="error")
+                return
+
             logger.info("Saved agent model pool to config.toml [agent_pool]: %s (provider=%s)", pool_dict, pool_provider)
             self.dismiss({**pool_dict, "provider": pool_provider})
         except Exception as exc:
             logger.exception("Failed to save agent model pool: %s", exc)
+            self.notify(f"Error saving agent pool: {exc}", severity="error")
             self.dismiss(None)
 
     def action_reset_pool(self) -> None:

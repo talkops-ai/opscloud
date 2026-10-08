@@ -14,6 +14,7 @@ import shutil
 # S404: subprocess is required for git ls-files to get project file list
 import subprocess  # noqa: S404
 from difflib import SequenceMatcher
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -95,6 +96,10 @@ class CompletionController(Protocol):
 
     def reset(self) -> None:
         """Reset/clear the completion state."""
+        ...
+
+    def apply_selection(self, index: int, text: str, cursor_index: int) -> bool:
+        """Apply a clicked completion row."""
         ...
 
 
@@ -292,6 +297,17 @@ class SlashCommandController:
         self._view.replace_completion_range(0, cursor_index, command)
         self.reset()
         return True
+
+    def apply_selection(self, index: int, text: str, cursor_index: int) -> bool:  # noqa: ARG002
+        """Apply a clicked slash-command completion row.
+
+        Returns:
+            Whether the selected row was applied.
+        """
+        if index < 0 or index >= len(self._suggestions):
+            return False
+        self._selected_index = index
+        return self._apply_selected_completion(cursor_index)
 
     def apply_name_prefix_completion(
         self, match: CommandEntry, cursor_index: int
@@ -639,6 +655,17 @@ class FuzzyFileController:
         self.reset()
         return True
 
+    def apply_selection(self, index: int, text: str, cursor_index: int) -> bool:
+        """Apply a clicked file completion row.
+
+        Returns:
+            Whether the selected row was applied.
+        """
+        if index < 0 or index >= len(self._suggestions):
+            return False
+        self._selected_index = index
+        return self._apply_selected_completion(text, cursor_index)
+
 
 PathCompletionController = FuzzyFileController
 
@@ -651,9 +678,9 @@ PathCompletionController = FuzzyFileController
 class MultiCompletionManager:
     """Manages multiple completion controllers, delegating to the active one."""
 
-    def __init__(self, controllers: list[CompletionController]) -> None:
+    def __init__(self, controllers: Sequence[CompletionController]) -> None:
         """Initialize with a list of controllers."""
-        self._controllers = controllers
+        self._controllers = list(controllers)
         self._active: CompletionController | None = None
 
     def on_text_changed(self, text: str, cursor_index: int) -> None:
@@ -690,6 +717,18 @@ class MultiCompletionManager:
         if self._active is not None:
             self._active.reset()
             self._active = None
+
+    def apply_selection(self, index: int, text: str, cursor_index: int) -> bool:
+        """Apply a clicked completion through the active controller.
+
+        Returns:
+            Whether the active controller applied the row.
+        """
+        if self._active is None:
+            return False
+        if hasattr(self._active, "apply_selection"):
+            return self._active.apply_selection(index, text, cursor_index)
+        return False
 
 
 # ── AutocompletePopup (widget stub) ──────────────────────

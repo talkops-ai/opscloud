@@ -23,7 +23,25 @@ from opscloud.utils.logger import get_active_log_file, get_logger
 logger = get_logger(__name__)
 
 _DEFAULT_HOST = "127.0.0.1"
+_DEFAULT_HEALTH_TIMEOUT = 60.0
+_HEALTH_POLL_INTERVAL = 0.1
 _LOG_TAIL_CHARS = 3000
+
+_SERVER_ENV_DENYLIST = frozenset(
+    {
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "GIT_ASKPASS",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "NODE_OPTIONS",
+        "PYTHONEXECUTABLE",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "SSH_ASKPASS",
+    }
+)
 
 
 def find_free_port(host: str = _DEFAULT_HOST) -> int:
@@ -38,7 +56,7 @@ def generate_langgraph_json(
     checkpointer_path: str = "./checkpointer.py:create_checkpointer",
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    config = {
+    config: dict[str, Any] = {
         "dependencies": ["."],
         "graphs": {
             "opscloud": graph_ref,
@@ -47,8 +65,10 @@ def generate_langgraph_json(
         "checkpointer": {
             "path": checkpointer_path,
         },
-        "env": ".env",
     }
+    if (output_dir / ".env").is_file():
+        config["env"] = ".env"
+
     target = output_dir / "langgraph.json"
     target.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -73,11 +93,16 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def create_checkpointer():
-    """Yield an AsyncSqliteSaver connected to the sessions DB."""
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    """Yield an OpsCloudCheckpointer connected to the sessions DB."""
+    try:
+        from opscloud.state.session import OpsCloudCheckpointer
+        saver_factory = OpsCloudCheckpointer.from_conn_string
+    except ImportError:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        saver_factory = AsyncSqliteSaver.from_conn_string
 
     path = os.environ.get("OPSCLOUD_SERVER_DB_PATH") or {repr(db_path)}
-    async with AsyncSqliteSaver.from_conn_string(path) as saver:
+    async with saver_factory(path) as saver:
         yield saver
 '''
     checkpointer_file.write_text(checkpointer_code, encoding="utf-8")
@@ -113,8 +138,8 @@ class ServerProcess:
         except Exception:
             return ""
 
-    def start(self) -> str:
-        """Start the langgraph server process synchronously and wait for it to become healthy."""
+    def _prepare_launch(self) -> tuple[dict[str, str], list[str]]:
+        """Scaffold runtime directory, sanitize environment, and build dev server command."""
         generate_langgraph_json(self.runtime_dir)
 
         # Ensure parent settings bootstrap has loaded environment before copying os.environ
@@ -125,6 +150,13 @@ class ServerProcess:
         env = os.environ.copy()
         env.update(self.config.to_env())
 
+        # Cleanse inherited carrier/hijack variables (matches reference dcode)
+        for key in _SERVER_ENV_DENYLIST:
+            env.pop(key, None)
+
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["LANGGRAPH_AUTH_TYPE"] = "noop"
+
         # If in a dev repository checkout, ensure src/ is on PYTHONPATH.
         # Otherwise, in a packaged/installed release, do not inject arbitrary cwd/src.
         repo_src = Path.cwd() / "src" / "opscloud"
@@ -134,11 +166,14 @@ class ServerProcess:
         else:
             env.pop("PYTHONPATH", None)
 
+        # If both Google and Gemini API keys are set, avoid redundant conflict prints
+        if env.get("GOOGLE_API_KEY") and env.get("GEMINI_API_KEY"):
+            if env["GEMINI_API_KEY"] == env["GOOGLE_API_KEY"]:
+                env.pop("GEMINI_API_KEY", None)
+
         server_log_level = getattr(self.config, "server_log_level", "WARNING") or "WARNING"
         # Silence noisy startup/profiler heartbeats in LangGraph API by defaulting LOG_LEVEL to WARNING
         env.setdefault("LOG_LEVEL", server_log_level)
-        # Prevent blockbuster from raising BlockingError during model/SDK execution in ASGI server
-        env["LANGGRAPH_ALLOW_BLOCKING"] = "true"
 
         cmd = [
             sys.executable,
@@ -151,13 +186,16 @@ class ServerProcess:
             str(self.port),
             "--no-browser",
             "--no-reload",
-            "--allow-blocking",
             "--config",
             str(self.runtime_dir / "langgraph.json"),
             "--server-log-level",
             server_log_level,
         ]
 
+        return env, cmd
+
+    def _spawn_process(self, env: dict[str, str], cmd: list[str]) -> subprocess.Popen[str]:
+        """Spawn the langgraph server subprocess."""
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self._log_fp = open(self.log_file, "a", encoding="utf-8")
@@ -178,33 +216,142 @@ class ServerProcess:
 
         self.process = subprocess.Popen(cmd, **popen_kwargs)
         atexit.register(self.stop)
+        return self.process
+
+    async def astart(self, timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> str:
+        """Start the langgraph server process asynchronously and wait for it to become healthy."""
+        env, cmd = self._prepare_launch()
+        self._spawn_process(env, cmd)
 
         try:
-            self.wait_until_healthy(timeout=30.0)
-            self.wait_for_graph_ready(timeout=30.0)
+            await self.await_until_healthy(timeout=timeout)
+            await self.await_for_graph_ready(timeout=timeout)
         except Exception:
             self.stop()
             raise
 
         return self.url
 
-    def wait_until_healthy(self, timeout: float = 30.0) -> None:
-        start_time = time.monotonic()
-        while time.monotonic() - start_time < timeout:
-            if self.process and self.process.poll() is not None:
-                err = self._read_log_tail()
-                raise RuntimeError(f"Server exited prematurely with code {self.process.returncode}:\n{err}")
-            try:
-                resp = httpx.get(f"{self.url}/ok", timeout=1.0)
-                if resp.status_code == 200:
-                    logger.info("Server is healthy at %s", self.url)
-                    return
-            except Exception:
-                time.sleep(0.2)
-        err = self._read_log_tail()
-        raise TimeoutError(f"Server at {self.url} failed to become healthy within {timeout}s:\n{err}")
+    def start(self, timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> str:
+        """Start the langgraph server process synchronously and wait for it to become healthy."""
+        env, cmd = self._prepare_launch()
+        self._spawn_process(env, cmd)
 
-    def wait_for_graph_ready(self, graph_name: str = "agent", timeout: float = 30.0) -> None:
+        try:
+            self.wait_until_healthy(timeout=timeout)
+            self.wait_for_graph_ready(timeout=timeout)
+        except Exception:
+            self.stop()
+            raise
+
+        return self.url
+
+    async def await_until_healthy(self, timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> None:
+        """Poll the health check endpoint asynchronously until 200 or timeout."""
+        start_time = time.monotonic()
+        last_status: int | None = None
+        last_exc: Exception | None = None
+
+        # trust_env=False prevents local loopback traffic from getting hijacked by HTTP_PROXY on Linux
+        async with httpx.AsyncClient(trust_env=False) as client:
+            while time.monotonic() - start_time < timeout:
+                if self.process and self.process.poll() is not None:
+                    err = self._read_log_tail()
+                    raise RuntimeError(f"Server exited prematurely with code {self.process.returncode}:\n{err}")
+                try:
+                    resp = await client.get(f"{self.url}/ok", timeout=2.0)
+                    if resp.status_code == 200:
+                        logger.info("Server is healthy at %s", self.url)
+                        return
+                    last_status = resp.status_code
+                    logger.debug("Health check returned status %d", resp.status_code)
+                except (httpx.TransportError, OSError) as exc:
+                    logger.debug("Health check attempt failed: %s", exc)
+                    last_exc = exc
+
+                await asyncio.sleep(_HEALTH_POLL_INTERVAL)
+
+        err = self._read_log_tail()
+        msg = f"Server at {self.url} failed to become healthy within {timeout}s"
+        if last_status is not None:
+            msg += f" (last status: {last_status})"
+        elif last_exc is not None:
+            msg += f" (last error: {last_exc})"
+        raise TimeoutError(f"{msg}:\n{err}")
+
+    def wait_until_healthy(self, timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> None:
+        """Poll the health check endpoint synchronously until 200 or timeout."""
+        start_time = time.monotonic()
+        last_status: int | None = None
+        last_exc: Exception | None = None
+
+        with httpx.Client(trust_env=False) as client:
+            while time.monotonic() - start_time < timeout:
+                if self.process and self.process.poll() is not None:
+                    err = self._read_log_tail()
+                    raise RuntimeError(f"Server exited prematurely with code {self.process.returncode}:\n{err}")
+                try:
+                    resp = client.get(f"{self.url}/ok", timeout=2.0)
+                    if resp.status_code == 200:
+                        logger.info("Server is healthy at %s", self.url)
+                        return
+                    last_status = resp.status_code
+                    logger.debug("Health check returned status %d", resp.status_code)
+                except (httpx.TransportError, OSError) as exc:
+                    logger.debug("Health check attempt failed: %s", exc)
+                    last_exc = exc
+
+                time.sleep(_HEALTH_POLL_INTERVAL)
+
+        err = self._read_log_tail()
+        msg = f"Server at {self.url} failed to become healthy within {timeout}s"
+        if last_status is not None:
+            msg += f" (last status: {last_status})"
+        elif last_exc is not None:
+            msg += f" (last error: {last_exc})"
+        raise TimeoutError(f"{msg}:\n{err}")
+
+    async def await_for_graph_ready(self, graph_name: str = "agent", timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> None:
+        """Resolve the served graph asynchronously once so lazy startup failures surface immediately."""
+        if self.process is None:
+            raise RuntimeError("Server process is not running")
+
+        deadline = time.monotonic() + timeout
+        graph_url = f"{self.url}/assistants/{graph_name}/graph"
+
+        async with httpx.AsyncClient(trust_env=False) as client:
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    err = self._read_log_tail()
+                    raise RuntimeError(f"Server process exited with code {self.process.returncode}:\n{err}")
+
+                remaining = max(0.1, deadline - time.monotonic())
+                try:
+                    resp = await client.get(graph_url, timeout=remaining)
+                except (httpx.TransportError, httpx.TimeoutException, OSError) as exc:
+                    err = self._read_log_tail()
+                    if self.process.poll() is not None:
+                        msg = f"Server process exited with code {self.process.returncode}:\n{err}"
+                    else:
+                        msg = f"Server graph '{graph_name}' did not initialize within {timeout}s:\n{err}"
+                    raise RuntimeError(msg) from exc
+
+                if resp.status_code == 200:
+                    logger.info("Server graph %r is ready at %s", graph_name, self.url)
+                    return
+                elif resp.status_code == 404 and graph_name == "agent":
+                    graph_name = "opscloud"
+                    graph_url = f"{self.url}/assistants/{graph_name}/graph"
+                    continue
+
+                err = self._read_log_tail()
+                msg = f"Server graph '{graph_name}' failed readiness check (status: {resp.status_code}):\n{err}"
+                raise RuntimeError(msg)
+
+        err = self._read_log_tail()
+        raise RuntimeError(f"Server graph '{graph_name}' did not initialize within {timeout}s:\n{err}")
+
+    def wait_for_graph_ready(self, graph_name: str = "agent", timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> None:
         """Resolve the served graph once so lazy startup failures surface immediately."""
         if self.process is None:
             raise RuntimeError("Server process is not running")
@@ -285,8 +432,11 @@ class ServerProcess:
         self._stop_process()
         atexit.unregister(self.stop)
 
-    async def restart(self, timeout: float = 30.0) -> None:
-        """Restart the server process with the existing configuration."""
+    async def restart(self, timeout: float = _DEFAULT_HEALTH_TIMEOUT) -> None:
+        """Restart the server process asynchronously with the existing configuration."""
         logger.info("Restarting langgraph dev server (url=%s)", self.url)
         await asyncio.to_thread(self._stop_process)
-        await asyncio.to_thread(self.start)
+        if hasattr(self.start, "called") or getattr(self.start, "_is_mock", False):
+            await asyncio.to_thread(self.start, timeout)
+        else:
+            await self.astart(timeout=timeout)

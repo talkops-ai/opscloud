@@ -169,70 +169,77 @@ class DynamicModelPoolManager:
         self,
         provider: str | None = None,
         base_spec: str | None = None,
+        *,
+        ignore_custom_pool: bool = False,
     ) -> dict[int, tuple[str, str]]:
         """Dynamically build Tier 0, 1, and 2 definitions from registry metadata.
 
         Args:
             provider: Target provider name, or None to infer.
             base_spec: Baseline model spec selected by the session/thread.
+            ignore_custom_pool: If True, bypass user-configured [agent_pool] and
+                perform raw registry discovery for the requested provider/baseline.
 
         Returns:
             Dictionary mapping tier level (0, 1, 2) to (model_spec, reasoning_effort).
         """
         # 1. Prioritize user-configured pool from config.toml [agent_pool]
-        from opscloud.config.toml_config import load_agent_pool
+        if not ignore_custom_pool:
+            from opscloud.config.toml_config import load_agent_pool
 
-        user_pool = load_agent_pool()
-        if user_pool:
-            resolved_provider = self._resolve_provider(provider, base_spec)
-            pool_prov = user_pool.get("provider")
-            t0_raw = user_pool.get("fast")
-            t1_raw = user_pool.get("standard")
-            t2_raw = user_pool.get("powerful")
+            user_pool = load_agent_pool()
+            if user_pool:
+                resolved_provider = self._resolve_provider(provider, base_spec)
+                pool_prov = user_pool.get("provider")
+                t0_raw = user_pool.get("fast")
+                t1_raw = user_pool.get("standard")
+                t2_raw = user_pool.get("powerful")
 
-            if t0_raw and t1_raw and t2_raw:
-                def _norm(raw_spec: str) -> str:
-                    s = raw_spec.strip()
-                    if ":" not in s:
-                        inferred = detect_provider(s)
-                        if inferred and inferred in AVAILABLE_MODELS:
-                            return f"{inferred}:{s}"
-                        return f"{resolved_provider}:{s}"
-                    return normalize_model_spec(s)
+                if t0_raw and t1_raw and t2_raw:
+                    def _norm(raw_spec: str) -> str:
+                        s = raw_spec.strip()
+                        if ":" not in s:
+                            inferred = detect_provider(s)
+                            if inferred and inferred in AVAILABLE_MODELS:
+                                return f"{inferred}:{s}"
+                            if pool_prov and pool_prov in AVAILABLE_MODELS:
+                                return f"{pool_prov}:{s}"
+                            return f"{resolved_provider}:{s}"
+                        return normalize_model_spec(s)
 
-                t0 = _norm(t0_raw)
-                t1 = _norm(t1_raw)
-                t2 = _norm(t2_raw)
+                    t0 = _norm(t0_raw)
+                    t1 = _norm(t1_raw)
+                    t2 = _norm(t2_raw)
 
-                prov0 = t0.split(":", 1)[0] if ":" in t0 else resolved_provider
-                prov1 = t1.split(":", 1)[0] if ":" in t1 else resolved_provider
-                prov2 = t2.split(":", 1)[0] if ":" in t2 else resolved_provider
-                distinct_provs = {prov0, prov1, prov2}
-                is_multi = len(distinct_provs) > 1 or pool_prov == "multi"
+                    prov0 = t0.split(":", 1)[0] if ":" in t0 else resolved_provider
+                    prov1 = t1.split(":", 1)[0] if ":" in t1 else resolved_provider
+                    prov2 = t2.split(":", 1)[0] if ":" in t2 else resolved_provider
+                    distinct_provs = {prov0, prov1, prov2}
+                    is_multi = len(distinct_provs) > 1 or pool_prov == "multi"
 
-                if (
-                    is_multi
-                    or not provider
-                    or provider in ("dynamic", "auto")
-                    or not pool_prov
-                    or pool_prov == "multi"
-                    or pool_prov == resolved_provider
-                    or pool_prov in distinct_provs
-                ):
-                    t0_efforts = supported_efforts_for_model(t0)
-                    e0 = "off" if ("off" in t0_efforts or not t0_efforts) else ("minimal" if "minimal" in t0_efforts else "off")
+                    should_use_custom = (
+                        not provider
+                        or provider in ("dynamic", "auto")
+                        or is_multi
+                        or provider == pool_prov
+                        or provider in distinct_provs
+                    )
 
-                    t1_efforts = supported_efforts_for_model(t1)
-                    e1 = "medium" if "medium" in t1_efforts else (default_effort_for_model(t1) or "off")
+                    if should_use_custom:
+                        t0_efforts = supported_efforts_for_model(t0)
+                        e0 = "off" if ("off" in t0_efforts or not t0_efforts) else ("minimal" if "minimal" in t0_efforts else "off")
 
-                    t2_efforts = supported_efforts_for_model(t2)
-                    e2 = "max" if "max" in t2_efforts else ("high" if "high" in t2_efforts else ("medium" if "medium" in t2_efforts else (default_effort_for_model(t2) or "off")))
+                        t1_efforts = supported_efforts_for_model(t1)
+                        e1 = "medium" if "medium" in t1_efforts else (default_effort_for_model(t1) or "off")
 
-                    return {
-                        0: (t0, e0),
-                        1: (t1, e1),
-                        2: (t2, e2),
-                    }
+                        t2_efforts = supported_efforts_for_model(t2)
+                        e2 = "max" if "max" in t2_efforts else ("high" if "high" in t2_efforts else ("medium" if "medium" in t2_efforts else (default_effort_for_model(t2) or "off")))
+
+                        return {
+                            0: (t0, e0),
+                            1: (t1, e1),
+                            2: (t2, e2),
+                        }
 
         all_supported = [p for p in DEFAULT_PROVIDER_PRIORITY if p in AVAILABLE_MODELS] + [
             p for p in AVAILABLE_MODELS if p not in DEFAULT_PROVIDER_PRIORITY

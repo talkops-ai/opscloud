@@ -36,7 +36,7 @@ async def start_server_and_get_agent(
     port: int = 0,
     **kwargs: Any,
 ) -> tuple[RemoteAgent, ServerProcess]:
-    """Start a LangGraph dev server and return a RemoteAgent client."""
+    """Start a LangGraph dev server asynchronously and return a RemoteAgent client."""
     from opscloud.project_utils import ProjectContext
 
     project_context = (
@@ -44,15 +44,24 @@ async def start_server_and_get_agent(
         if cwd is not None
         else ProjectContext.from_user_cwd(Path.cwd())
     )
+    resolved_model = model_name or kwargs.pop("model", None)
+    if not resolved_model:
+        try:
+            from opscloud.model.factory import _get_default_model_spec
+
+            resolved_model = _get_default_model_spec()
+        except Exception:
+            resolved_model = None
+
     config = ServerConfig.from_cli_args(
         project_context=project_context,
         assistant_id=assistant_id,
-        model=model_name or "anthropic:claude-3-5-sonnet-latest",
+        model=resolved_model,
         interactive=interactive,
         approval_mode="never" if auto_approve else "auto",
         **kwargs,
     )
     server = ServerProcess(config, host=host, port=port)
-    url = server.start()
+    url = await server.astart()
     agent = RemoteAgent(url=url, graph_name="agent")
     return agent, server

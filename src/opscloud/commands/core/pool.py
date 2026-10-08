@@ -41,6 +41,9 @@ class PoolHandler(BaseCommandHandler):
         # 1. Clear pool configuration
         if args in ("--clear", "clear"):
             clear_agent_pool()
+            pool_mgr = get_model_pool_manager()
+            with pool_mgr._lock:
+                pool_mgr._instances.clear()
             return CommandResult(
                 success=True,
                 message="**Agent Model Pool Cleared:** Reverted to automatic dynamic discovery from provider capabilities.",
@@ -84,7 +87,7 @@ class PoolHandler(BaseCommandHandler):
                 current = load_agent_pool() or {}
                 merged = {**current, **updates}
 
-                from opscloud.model.config import detect_provider
+                from opscloud.model.config import detect_provider, apply_stored_credentials
                 provs = set()
                 for v in merged.values():
                     if ":" in v:
@@ -96,6 +99,13 @@ class PoolHandler(BaseCommandHandler):
 
                 provider_to_save = next(iter(provs)) if len(provs) == 1 else ("multi" if len(provs) > 1 else None)
                 save_agent_pool(merged, provider=provider_to_save)
+
+                pool_mgr = get_model_pool_manager()
+                with pool_mgr._lock:
+                    pool_mgr._instances.clear()
+
+                for p in provs:
+                    apply_stored_credentials(p)
 
                 from opscloud.model.config import has_provider_credentials
                 warnings = []

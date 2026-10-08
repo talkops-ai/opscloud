@@ -10,7 +10,7 @@ from __future__ import annotations
 import contextlib
 from opscloud.utils.logger import get_logger
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self, cast
+from typing import Any, ClassVar, Literal, Self
 
 from rich.cells import cell_len
 from rich.segment import Segment
@@ -302,32 +302,20 @@ class _CompletionViewAdapter:
     def render_completion_suggestions(
         self, suggestions: list[tuple[str, str]], selected_index: int
     ) -> None:
-        self._chat_input._autocomplete.update_suggestions(suggestions, selected_index)
+        self._chat_input.render_completion_suggestions(suggestions, selected_index)
 
     def clear_completion_suggestions(self) -> None:
-        self._chat_input._autocomplete.hide()
+        self._chat_input.clear_completion_suggestions()
 
     def replace_completion_range(self, start: int, end: int, replacement: str) -> None:
-        text_area = self._chat_input._text_area
-        current = text_area.text
-        start = max(0, min(start, len(current)))
-        end = max(0, min(end, len(current)))
-        new_text = current[:start] + replacement + current[end:]
-        text_area.text = new_text
-        target_idx = start + len(replacement)
-        doc = cast(Any, text_area.document)
-        if hasattr(doc, "get_location_from_index"):
-            text_area.cursor_location = doc.get_location_from_index(target_idx)
-        else:
-            lines = doc.lines
-            acc = 0
-            for r, line in enumerate(lines):
-                if acc + len(line) + 1 > target_idx:
-                    text_area.cursor_location = (r, target_idx - acc)
-                    break
-                acc += len(line) + 1
-            else:
-                text_area.cursor_location = (len(lines) - 1, len(lines[-1])) if lines else (0, 0)
+        prefix = MODE_PREFIXES.get(self._chat_input.mode, "")
+        if prefix and replacement.startswith(prefix):
+            replacement = replacement[len(prefix) :]
+        self._chat_input.replace_completion_range(
+            self._chat_input._completion_index_to_text_index(start),
+            self._chat_input._completion_index_to_text_index(end),
+            replacement,
+        )
 
 
 class ChatTextArea(TextArea):
@@ -367,7 +355,7 @@ class ChatTextArea(TextArea):
         suffix_width = suffix.cell_length
 
         cursor_style = suffix._segments[0].style if suffix._segments else None
-        hint_text = f" {self.argument_hint}"
+        hint_text = self.argument_hint
         
         if cursor_style and self.has_focus:
             first_char_style = _HINT_STYLE + cursor_style
@@ -396,6 +384,19 @@ class ChatTextArea(TextArea):
 
     async def _on_key(self, event: events.Key) -> None:
         chat_input = self._find_chat_input()
+        if (
+            event.is_printable
+            and event.character is not None
+            and self.cursor_location == (0, 0)
+            and self.selection.is_empty
+            and not self.text
+            and chat_input is not None
+            and chat_input.handle_mode_prefix_keystroke(event.character)
+        ):
+            event.prevent_default()
+            event.stop()
+            return
+
         if chat_input is not None:
             handled = await chat_input._handle_key_event(event)
             if handled:
@@ -507,6 +508,9 @@ class ChatInput(Widget):
         self._pasted_full_text: str | None = None
         self._cwd = Path.cwd()
         self._argument_hints: dict[str, str] = {}
+        self._current_suggestions: list[tuple[str, str]] = []
+        self._current_selected_index: int = 0
+        self._completion_prefix_len: int = 0
         self._rebuild_argument_hints()
 
     def on_mount(self) -> None:
@@ -542,8 +546,14 @@ class ChatInput(Widget):
 
     @text.setter
     def text(self, value: str) -> None:
-        self._text_area.text = value
-        self._sync_mode()
+        mode = detect_input_mode(value)
+        prefix = MODE_PREFIXES.get(mode, "")
+        if prefix and value.startswith(prefix):
+            self.mode = mode
+            self._text_area.text = value[len(prefix) :]
+        else:
+            self._text_area.text = value
+            self._sync_mode()
 
     def clear(self) -> None:
         self._text_area.clear()
@@ -585,6 +595,144 @@ class ChatInput(Widget):
             self.text = preview
             event.prevent_default()
             event.stop()
+
+    def handle_mode_prefix_keystroke(self, char: str) -> bool:
+        """Switch input mode for a mode trigger typed at the start of empty input.
+
+        Handles the switch before TextArea inserts the character so the trigger
+        (/, !, !!) is consumed cleanly without appearing inside the text area.
+        """
+        if char == "/" and self.mode == "command":
+            return False
+
+        if char == "/":
+            detected = "command"
+        elif char == "!":
+            if self.mode == "shell":
+                detected = "shell_incognito"
+            elif self.mode == "shell_incognito":
+                return False
+            else:
+                detected = "shell"
+        else:
+            return False
+
+        if self.mode != detected:
+            self.mode = detected
+
+        self._update_argument_hint()
+        if hasattr(self, "_completion_manager") and self._completion_manager:
+            vtext, vcursor = self._completion_text_and_cursor()
+            self._completion_manager.on_text_changed(vtext, vcursor)
+        return True
+
+    def _get_cursor_offset(self) -> int:
+        """Get cursor position as character offset from start of text."""
+        if not self._text_area:
+            return 0
+        text = self._text_area.text
+        row, col = self._text_area.cursor_location
+        if not text:
+            return 0
+        lines = text.split("\n")
+        row = max(0, min(row, len(lines) - 1))
+        col = max(0, col)
+        return sum(len(line) + 1 for line in lines[:row]) + min(col, len(lines[row]))
+
+    def _completion_text_and_cursor(self) -> tuple[str, int]:
+        """Return controller-facing text/cursor in completion space."""
+        if not self._text_area:
+            self._completion_prefix_len = 0
+            return "", 0
+
+        text = self._text_area.text
+        cursor = self._get_cursor_offset()
+        prefix = MODE_PREFIXES.get(self.mode, "")
+        self._completion_prefix_len = len(prefix)
+
+        if prefix:
+            return prefix + text, cursor + len(prefix)
+        return text, cursor
+
+    def _completion_index_to_text_index(self, index: int) -> int:
+        """Translate completion-space index into text-area index."""
+        if not self._text_area:
+            return 0
+        if 0 <= index <= self._completion_prefix_len:
+            return 0
+        mapped = index - self._completion_prefix_len
+        text_len = len(self._text_area.text)
+        return max(0, min(mapped, text_len))
+
+    def render_completion_suggestions(
+        self, suggestions: list[tuple[str, str]], selected_index: int
+    ) -> None:
+        """Update popup with completion suggestions and track current list."""
+        self._current_suggestions = suggestions
+        self._current_selected_index = selected_index
+        self._autocomplete.update_suggestions(suggestions, selected_index)
+
+    def clear_completion_suggestions(self) -> None:
+        """Clear and hide completion popup."""
+        self._current_suggestions = []
+        self._current_selected_index = 0
+        self._autocomplete.hide()
+
+    def replace_completion_range(self, start: int, end: int, replacement: str) -> None:
+        """Replace text in input field and append trailing space for completed tokens."""
+        if not self._text_area:
+            return
+
+        text = self._text_area.text
+        start = max(0, min(start, len(text)))
+        end = max(start, min(end, len(text)))
+
+        prefix = text[:start]
+        suffix = text[end:]
+
+        if replacement.endswith("/"):
+            insertion = replacement
+        else:
+            insertion = replacement + " " if not suffix.startswith(" ") else replacement
+
+        new_text = f"{prefix}{insertion}{suffix}"
+        self._text_area.text = new_text
+
+        new_offset = start + len(insertion)
+        lines = new_text.split("\n")
+        remaining = new_offset
+        for row, line in enumerate(lines):
+            if remaining <= len(line):
+                self._text_area.cursor_location = (row, remaining)
+                break
+            remaining -= len(line) + 1
+        else:
+            self._text_area.cursor_location = (len(lines) - 1, len(lines[-1])) if lines else (0, 0)
+
+        self._update_argument_hint()
+
+    def on_completion_popup_option_clicked(
+        self, event: CompletionPopup.OptionClicked
+    ) -> None:
+        """Handle click on a completion option."""
+        if not self._current_suggestions or not self._text_area:
+            return
+
+        index = event.index
+        if index < 0 or index >= len(self._current_suggestions):
+            return
+
+        if self._completion_manager is None:
+            return
+        text, cursor = self._completion_text_and_cursor()
+        self._completion_manager.apply_selection(index, text, cursor)
+        with contextlib.suppress(Exception):
+            self._text_area.focus()
+
+    def on_click(self, event: Click) -> None:
+        """Focus the text area when clicking anywhere on the chat input box."""
+        with contextlib.suppress(Exception):
+            self.focus()
 
     async def _handle_key_event(self, event: events.Key) -> bool:
         """Handle key presses — intercept submit/history, delegate rest to TextArea."""
@@ -659,11 +807,22 @@ class ChatInput(Widget):
                 event.stop()
                 return True
 
-        lines = self._text_area.document.lines
-        cursor_row, cursor_col = self._text_area.cursor_location
-        cursor_index = sum(len(line) + 1 for line in lines[:cursor_row]) + cursor_col
-        
-        result = self._completion_manager.on_key(event, self.text, cursor_index)
+        # Backspace at start of mode prompt exits the current mode
+        if (
+            key == "backspace"
+            and self.mode != "normal"
+            and self._get_cursor_offset() == 0
+            and not self.text
+        ):
+            self.mode = "normal"
+            self._completion_manager.reset()
+            self._update_argument_hint()
+            event.prevent_default()
+            event.stop()
+            return True
+
+        vtext, vcursor = self._completion_text_and_cursor()
+        result = self._completion_manager.on_key(event, vtext, vcursor)
         if result == CompletionResult.HANDLED:
             event.prevent_default()
             event.stop()
@@ -706,20 +865,23 @@ class ChatInput(Widget):
 
     def _after_key_sync(self) -> None:
         self._sync_mode()
-        lines = self._text_area.document.lines
-        cursor_row, cursor_col = self._text_area.cursor_location
-        cursor_index = sum(len(line) + 1 for line in lines[:cursor_row]) + cursor_col
-        
-        self._completion_manager.on_text_changed(self.text, cursor_index)
+        vtext, vcursor = self._completion_text_and_cursor()
+        self._completion_manager.on_text_changed(vtext, vcursor)
         self._update_argument_hint()
 
     # ── Mode Detection ──────────────────────────────────
 
     def _sync_mode(self) -> None:
-        """Detect and update the input mode from current text content."""
-        new_mode = detect_input_mode(self.text)
-        if new_mode != self.mode:
-            self.mode = new_mode
+        """Detect and update the input mode from current text content, stripping prefix if pasted."""
+        text = self._text_area.text
+        if self.mode == "normal":
+            for mode, prefix in (("shell_incognito", "!!"), ("shell", "!"), ("command", "/")):
+                if text.startswith(prefix):
+                    self.mode = mode
+                    self._text_area.text = text[len(prefix) :]
+                    row, col = self._text_area.cursor_location
+                    self._text_area.cursor_location = (row, max(0, col - len(prefix)))
+                    return
 
     # ── Argument Hint Ghost Text ────────────────────────
 
@@ -741,10 +903,13 @@ class ChatInput(Widget):
 
     def _update_argument_hint(self) -> None:
         """Show or clear inline ghost text for slash-command argument hints."""
+        if not self._text_area:
+            return
+
         if self.mode == "command":
             text = self._text_area.text
             if text.endswith(" ") and text.count(" ") == 1:
-                command = text.rstrip().lstrip("/")
+                command = text[:-1]
                 hint = self._argument_hints.get(command, "")
                 if hint:
                     self._text_area.argument_hint = hint
@@ -762,7 +927,10 @@ class ChatInput(Widget):
         if not content:
             return
 
-        mode = detect_input_mode(content)
+        mode = self.mode
+        prefix = MODE_PREFIXES.get(mode, "")
+        if prefix and not content.startswith(prefix):
+            content = prefix + content
 
         if not self._history or self._history[-1] != content:
             self._history.append(content)

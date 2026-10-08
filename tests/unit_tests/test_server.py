@@ -54,6 +54,9 @@ def test_generate_langgraph_json_scaffolding(tmp_path: Path):
     assert "checkpointer.py:create_checkpointer" in content
     assert "server_graph.py:make_graph" in content
 
+    checkpointer_content = (tmp_path / "checkpointer.py").read_text(encoding="utf-8")
+    assert "OpsCloudCheckpointer" in checkpointer_content
+
 
 def test_find_free_port():
     port = find_free_port()
@@ -200,4 +203,39 @@ def test_wait_for_graph_ready_fallback():
         assert mock_get.call_count == 2
         assert mock_get.call_args_list[0][0][0] == f"{proc.url}/assistants/agent/graph"
         assert mock_get.call_args_list[1][0][0] == f"{proc.url}/assistants/opscloud/graph"
+
+
+def test_server_prepare_launch_environment_sanitization(monkeypatch):
+    """Verify dangerous carrier env vars are denied and langgraph flags configured."""
+    monkeypatch.setenv("LD_PRELOAD", "/lib/malicious.so")
+    monkeypatch.setenv("PYTHONEXECUTABLE", "/custom/bin/python")
+
+    cfg = ServerConfig()
+    proc = ServerProcess(cfg, port=8123)
+    env, cmd = proc._prepare_launch()
+
+    assert "LD_PRELOAD" not in env
+    assert "PYTHONEXECUTABLE" not in env
+    assert env["LANGGRAPH_AUTH_TYPE"] == "noop"
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert "LANGGRAPH_ALLOW_BLOCKING" not in env
+    assert "--allow-blocking" not in cmd
+    assert "--server-log-level" in cmd
+
+
+@pytest.mark.asyncio
+async def test_server_process_astart_success():
+    """Verify ServerProcess.astart() runs asynchronously and waits for health."""
+    cfg = ServerConfig()
+    proc = ServerProcess(cfg, port=8123)
+
+    proc._prepare_launch = MagicMock(return_value=({}, ["dummy_cmd"]))
+    proc._spawn_process = MagicMock()
+    proc.await_until_healthy = AsyncMock()
+    proc.await_for_graph_ready = AsyncMock()
+
+    url = await proc.astart(timeout=10.0)
+    assert url == proc.url
+    proc.await_until_healthy.assert_awaited_once_with(timeout=10.0)
+    proc.await_for_graph_ready.assert_awaited_once_with(timeout=10.0)
 
