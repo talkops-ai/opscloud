@@ -77,42 +77,63 @@ def _filter_tool_names(
     return True
 
 
-def _clean_mcp_schema(schema: Any) -> dict[str, Any]:
+def _clean_mcp_schema(schema: Any, max_ref_depth: int = 3) -> dict[str, Any]:
     """Clean JSON Schema for compatibility with LLM provider tool schemas (Gemini, Anthropic, OpenAI).
 
-    Dereferences all `$ref` pointers (such as `#/$defs/...` or `#/definitions/...`)
-    using LangChain's `dereference_refs` so that referenced models (like PricingFilter)
-    are inlined directly into properties before removing metadata keys.
+    Safely inlines local `$ref` pointers (such as `#/$defs/...` or `#/definitions/...`)
+    up to a bounded ref depth, strips provider-incompatible metadata keys (`$schema`, `$id`,
+    `additionalProperties`), and prevents recursive bloat or corrupted empty keys.
     """
     if not isinstance(schema, dict):
         return {}
 
-    from langchain_core.utils.json_schema import dereference_refs
+    defs: dict[str, Any] = {}
+    if isinstance(schema.get("$defs"), dict):
+        defs.update(schema["$defs"])
+    if isinstance(schema.get("definitions"), dict):
+        defs.update(schema["definitions"])
 
-    try:
-        resolved = dereference_refs(schema)
-    except Exception as exc:
-        logger.debug("Failed to dereference MCP schema refs: %s", exc)
-        resolved = schema
+    def _resolve(node: Any, ref_depth: int, seen_refs: set[str]) -> Any:
+        if isinstance(node, dict):
+            if "$ref" in node:
+                ref = node["$ref"]
+                if (
+                    ref_depth >= max_ref_depth
+                    or not isinstance(ref, str)
+                    or not ref.startswith("#/")
+                    or ref in seen_refs
+                ):
+                    return {"type": "object"}
 
-    cleaned = dict(resolved) if isinstance(resolved, dict) else dict(schema)
-    for key in ("$schema", "$id", "$defs", "definitions", "additionalProperties"):
-        cleaned.pop(key, None)
+                parts = ref.lstrip("#/").split("/")
+                target = None
+                if len(parts) >= 2 and parts[0] in ("$defs", "definitions"):
+                    target = defs.get(parts[1])
+                elif len(parts) == 1 and parts[0] in defs:
+                    target = defs.get(parts[0])
 
-    properties = cleaned.get("properties")
-    if isinstance(properties, dict):
-        new_props = {}
-        for prop_name, prop_val in properties.items():
-            if isinstance(prop_val, dict):
-                p_clean = dict(prop_val)
-                p_clean.pop("additionalProperties", None)
-                p_clean.pop("$schema", None)
-                new_props[prop_name] = p_clean
-            else:
-                new_props[prop_name] = prop_val
-        cleaned["properties"] = new_props
+                if isinstance(target, dict):
+                    merged = dict(target)
+                    for k, v in node.items():
+                        if k != "$ref":
+                            merged[k] = v
+                    return _resolve(merged, ref_depth + 1, seen_refs | {ref})
+                return {"type": "object"}
 
-    return cleaned
+            res = {}
+            for k, v in node.items():
+                if k in ("$schema", "$id", "additionalProperties", "$defs", "definitions"):
+                    continue
+                res[k] = _resolve(v, ref_depth, seen_refs)
+            return res
+
+        if isinstance(node, list):
+            return [_resolve(item, ref_depth, seen_refs) for item in node]
+
+        return node
+
+    result = _resolve(schema, 0, set())
+    return result if isinstance(result, dict) else {}
 
 
 def _clean_stderr_diagnostic(stderr_text: str | None) -> str | None:

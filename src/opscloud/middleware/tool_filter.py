@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 import fnmatch
 from typing import Any
 
-from langchain.agents.middleware.types import AgentMiddleware
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
@@ -427,6 +427,40 @@ class ToolFilterMiddleware(AgentMiddleware[Any, Any]):
         err = self._validate_tool_call(request)
         if err is not None:
             return err
+        return await handler(request)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], Any],
+    ) -> Any:
+        """Prune unavailable tools from model request before sending to LLM."""
+        if self._allowed_patterns and request.tools:
+            filtered_tools = []
+            for t in request.tools:
+                raw_name = getattr(t, "name", None) if not isinstance(t, dict) else t.get("name")
+                name = str(raw_name) if raw_name is not None else ""
+                tool_obj = t if not isinstance(t, dict) else None
+                if name and self.is_tool_allowed(name, tool_obj=tool_obj):
+                    filtered_tools.append(t)
+            request = request.override(tools=filtered_tools)
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], Any],
+    ) -> Any:
+        """Asynchronously prune unavailable tools from model request before sending to LLM."""
+        if self._allowed_patterns and request.tools:
+            filtered_tools = []
+            for t in request.tools:
+                raw_name = getattr(t, "name", None) if not isinstance(t, dict) else t.get("name")
+                name = str(raw_name) if raw_name is not None else ""
+                tool_obj = t if not isinstance(t, dict) else None
+                if name and self.is_tool_allowed(name, tool_obj=tool_obj):
+                    filtered_tools.append(t)
+            request = request.override(tools=filtered_tools)
         return await handler(request)
 
 

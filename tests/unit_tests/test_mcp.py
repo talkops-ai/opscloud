@@ -192,6 +192,23 @@ def test_clean_mcp_schema() -> None:
     assert "Field" in items_schema["properties"]
     assert "Value" in items_schema["properties"]
 
+    # Verify circular references and bounded recursion break safely without empty keys or infinite loop
+    circular_schema = {
+        "type": "object",
+        "properties": {"node": {"$ref": "#/$defs/Node"}},
+        "$defs": {
+            "Node": {
+                "type": "object",
+                "properties": {"child": {"$ref": "#/$defs/Node"}},
+            }
+        },
+    }
+    cleaned_circ = _clean_mcp_schema(circular_schema)
+    assert "$defs" not in cleaned_circ
+    assert "$ref" not in str(cleaned_circ)
+    assert "" not in cleaned_circ
+    assert cleaned_circ["properties"]["node"]["properties"]["child"] == {"type": "object"}
+
 
 def test_is_transient_session_error() -> None:
     assert _is_transient_session_error(BrokenPipeError()) is True

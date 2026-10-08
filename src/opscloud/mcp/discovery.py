@@ -117,7 +117,11 @@ class MCPDiscovery:
         """
         self._store = store
 
-    def discover(self, project_root: Path | None = None) -> dict[str, MCPServerConfig]:
+    def discover(
+        self,
+        project_root: Path | None = None,
+        include_subagents: bool = False,
+    ) -> dict[str, MCPServerConfig]:
         """Discover and merge MCP server configs across global, user, plugin, and project files.
 
         Precedence (lowest to highest):
@@ -158,7 +162,10 @@ class MCPDiscovery:
         try:
             from opscloud.plugins.adapters.mcp import discover_plugin_mcp_configs
 
-            plugin_configs = discover_plugin_mcp_configs(project_dir=effective_project_root)
+            plugin_configs = discover_plugin_mcp_configs(
+                project_dir=effective_project_root,
+                include_subagents=include_subagents,
+            )
             if isinstance(plugin_configs, dict):
                 for name, config in plugin_configs.items():
                     if isinstance(config, dict):
@@ -224,6 +231,9 @@ class MCPDiscovery:
         return results
 
 
-def discover_mcp_configs(project_root: Path | None = None) -> dict[str, MCPServerConfig]:
+def discover_mcp_configs(
+    project_root: Path | None = None,
+    include_subagents: bool = False,
+) -> dict[str, MCPServerConfig]:
     """Discover active MCP server configs from disk."""
-    return MCPDiscovery().discover(project_root)
+    return MCPDiscovery().discover(project_root, include_subagents=include_subagents)

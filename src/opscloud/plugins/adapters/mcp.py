@@ -199,7 +199,7 @@ def plugin_mcp_configs(
     configs: list[dict[str, Any]] = []
     for plugin in plugins:
         if not include_subagents and plugin.is_agent_plugin:
-            continue  # Dynamic subagent plugins isolate their own MCP servers
+            continue  # Agent-based plugins isolate their MCP servers to their own subagents
 
         if plugin.data_dir is not None:
             try:

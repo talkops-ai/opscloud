@@ -233,3 +233,75 @@ def test_generic_open_source_mcp_matching_and_filtering():
     )
     assert mw3.is_tool_allowed("postgres_query", tool_obj=mock_postgres_tool) is True
     assert mw3.is_tool_allowed("mcp__postgres__query") is True
+
+
+def test_tool_filter_wrap_model_call():
+    """Verify wrap_model_call prunes disallowed tools before calling model."""
+    from langchain.agents.middleware.types import ModelRequest
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.tools import tool
+
+    @tool("read_file")
+    def mock_read(path: str) -> str:
+        """Read file."""
+        return "content"
+
+    @tool("bash")
+    def mock_bash(cmd: str) -> str:
+        """Execute command."""
+        return "out"
+
+    mw = ToolFilterMiddleware(allowed_patterns=["read"])
+    fake_llm = FakeListChatModel(responses=["ok"])
+    req = ModelRequest(
+        model=fake_llm,
+        messages=[],
+        tools=[mock_read, mock_bash],
+    )
+
+    captured_tools = []
+
+    def mock_handler(r):
+        captured_tools.extend(r.tools)
+        return fake_llm.invoke([])
+
+    mw.wrap_model_call(req, mock_handler)
+    assert len(captured_tools) == 1
+    assert captured_tools[0].name == "read_file"
+
+
+@pytest.mark.asyncio
+async def test_tool_filter_awrap_model_call():
+    """Verify awrap_model_call asynchronously prunes disallowed tools before calling model."""
+    from langchain.agents.middleware.types import ModelRequest
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.tools import tool
+
+    @tool("read_file")
+    def mock_read(path: str) -> str:
+        """Read file."""
+        return "content"
+
+    @tool("bash")
+    def mock_bash(cmd: str) -> str:
+        """Execute command."""
+        return "out"
+
+    mw = ToolFilterMiddleware(allowed_patterns=["read"])
+    fake_llm = FakeListChatModel(responses=["ok"])
+    req = ModelRequest(
+        model=fake_llm,
+        messages=[],
+        tools=[mock_read, mock_bash],
+    )
+
+    captured_tools = []
+
+    async def mock_handler(r):
+        captured_tools.extend(r.tools)
+        return await fake_llm.ainvoke([])
+
+    await mw.awrap_model_call(req, mock_handler)
+    assert len(captured_tools) == 1
+    assert captured_tools[0].name == "read_file"
+

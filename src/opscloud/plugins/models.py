@@ -189,6 +189,16 @@ class PluginInstance:
         """Alias for is_agent_plugin."""
         return self.is_agent_plugin
 
+    @property
+    def is_partner_plugin(self) -> bool:
+        """Return True if plugin provides MCP tools and skills without autonomous agents."""
+        return not self.is_agent_plugin and bool(self.inventory.mcp_files or (self.manifest and self.manifest.inline_mcp))
+
+    @property
+    def is_vertical_plugin(self) -> bool:
+        """Return True if plugin provides specialized skills without agents or MCP servers."""
+        return not self.is_agent_plugin and not self.is_partner_plugin and bool(self.inventory.skills)
+
 
 def is_agent_plugin_dir(plugin_dir: Path) -> bool:
     """Return True if a plugin directory contains an agents/ component with markdown definitions."""
