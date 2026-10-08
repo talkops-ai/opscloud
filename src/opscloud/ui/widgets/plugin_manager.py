@@ -92,6 +92,7 @@ class _PluginRow:
     session_loaded: bool = False
     load_error: str | None = None
     scope: InstallScope | None = None
+    project_path: str | None = None
 
     @property
     def load_state(self) -> PluginLoadState:
@@ -287,6 +288,11 @@ def _installed_plugin_details_content(row: _PluginRow) -> Content:
     ]
     if row.version:
         parts.extend(["\n", Content.styled(f"Version: {row.version}", "dim")])
+    if row.scope:
+        scope_str = f"Scope: {row.scope}"
+        if row.project_path:
+            scope_str += f" ({row.project_path})"
+        parts.extend(["\n", Content.styled(scope_str, "dim")])
     if row.description:
         parts.extend(["\n\n", row.description])
     if row.author:
@@ -385,7 +391,7 @@ def _load_manager_state(
 ) -> _ManagerState:
     records = load_marketplace_records(project_root=project_root)
     enabled = load_all_enabled_plugin_ids(project_root=project_root)
-    installed = load_installed_plugins()
+    installed = load_installed_plugins(project_root=project_root)
     all_entries = load_installed_plugin_entries()
     from opscloud.plugins.store import load_all_disabled_plugin_ids
 
@@ -462,12 +468,35 @@ def _load_manager_state(
             author = (
                 plugin.author.get("name") if isinstance(plugin.author, dict) else plugin.author
             )
-            # Determine scope from install entries
+            # Determine scope and project_path from install entries
             entry_list = all_entries.get(plugin_id, [])
+            primary_entry = None
+            if entry_list:
+                if project_root:
+                    for e in entry_list:
+                        if e.project_path and (
+                            e.project_path == str(project_root)
+                            or Path(e.project_path).resolve() == project_root.resolve()
+                        ):
+                            primary_entry = e
+                            break
+                if primary_entry is None:
+                    for e in entry_list:
+                        if e.scope in {"user", "global"}:
+                            primary_entry = e
+                            break
+                if primary_entry is None:
+                    primary_entry = entry_list[0]
+
             scope: InstallScope | None = (
-                entry_list[0].scope
-                if entry_list
+                primary_entry.scope
+                if primary_entry
                 else ("project" if is_project_marketplace else None)
+            )
+            project_path: str | None = (
+                primary_entry.project_path
+                if primary_entry
+                else (str(project_root) if is_project_marketplace and project_root else None)
             )
             row = _PluginRow(
                 plugin_id=plugin_id,
@@ -483,8 +512,34 @@ def _load_manager_state(
                 unsupported_components=instance.inventory.unsupported if instance else (),
                 session_loaded=plugin_id in loaded_plugin_ids,
                 scope=scope if is_installed else None,
+                project_path=project_path if is_installed else None,
             )
             (installed_plugins if is_installed else available_plugins).append(row)
+
+    # Ensure any installed plugin not listed in active marketplaces still appears in installed_plugins
+    seen_installed_ids = {row.plugin_id for row in installed_plugins}
+    for plugin_id, entry in sorted(installed.items()):
+        if plugin_id not in seen_installed_ids:
+            entry_list = all_entries.get(plugin_id, [entry])
+            primary_entry = entry_list[0] if entry_list else entry
+            instance = discovered.get(plugin_id)
+            row = _PluginRow(
+                plugin_id=plugin_id,
+                description="",
+                enabled=plugin_id in enabled,
+                version=instance.version if instance else primary_entry.version,
+                author=None,
+                display_name=instance.manifest.display_name if instance and instance.manifest and instance.manifest.display_name else plugin_id.partition("@")[0],
+                skill_count=len(instance.inventory.skills) if instance else None,
+                skill_names=tuple(p.stem for p in instance.inventory.skills) if instance else (),
+                mcp_connected=None,
+                mcp_server_names=(),
+                unsupported_components=instance.inventory.unsupported if instance else (),
+                session_loaded=plugin_id in loaded_plugin_ids,
+                scope=primary_entry.scope,
+                project_path=primary_entry.project_path,
+            )
+            installed_plugins.append(row)
 
     return _ManagerState(
         tuple(available_plugins),
@@ -1141,22 +1196,32 @@ class PluginManagerScreen(ModalScreen[None]):
             return
         if option_id == "action:uninstall":
             if self._selected_plugin:
-                self._status = f"Uninstalling {self._selected_plugin.label}..."
+                plugin = self._selected_plugin
+                self._status = f"Uninstalling {plugin.label}..."
+                self._error = None
                 self._refresh_view()
+                target_root = (
+                    Path(plugin.project_path)
+                    if plugin.project_path
+                    else self._project_root
+                )
                 try:
                     await asyncio.to_thread(
                         uninstall_plugin,
-                        self._selected_plugin.plugin_id,
-                        scope=self._selected_plugin.scope,
-                        project_root=self._project_root,
+                        plugin.plugin_id,
+                        scope=plugin.scope,
+                        project_root=target_root,
+                        project_path=plugin.project_path,
                     )
                     self._mode = "list"
                     self._selected_plugin = None
-                    self._status = "Plugin uninstalled."
+                    reload_hint = " Run /reload to unload." if plugin.enabled else ""
+                    self._status = f"Uninstalled {plugin.label}.{reload_hint}"
+                    self._error = None
                     await self._refresh_state()
                 except Exception as exc:
                     self._status = None
-                    self._error = str(exc)
+                    self._error = f"Could not uninstall plugin: {exc}"
                     self._refresh_view()
             return
         if option_id == "action:refresh-marketplace":

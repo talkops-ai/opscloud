@@ -69,10 +69,12 @@ from opscloud.plugins.models import (
     split_plugin_id,
 )
 from opscloud.plugins.store import (
+    PluginNotFoundError,
     cache_and_register_plugin,
     load_all_enabled_plugin_ids,
     load_installed_plugins,
     load_marketplace_records,
+    remove_plugin_enabled_for_scope,
     versioned_cache_path,
 )
 
@@ -149,6 +151,7 @@ __all__ = [
     "PluginManifest",
     "PluginManifestError",
     "PluginMarketplace",
+    "PluginNotFoundError",
     "PluginSource",
     "TerraformPlugin",
     "add_local_marketplace",
@@ -181,6 +184,7 @@ __all__ = [
     "refresh_all_marketplaces",
     "refresh_marketplace",
     "remove_marketplace",
+    "remove_plugin_enabled_for_scope",
     "set_installed_plugin_enabled",
     "setup_plugin_parser",
     "split_plugin_id",

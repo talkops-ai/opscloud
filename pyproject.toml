@@ -1,6 +1,6 @@
 [project]
 name = "talkops-opscloud"
-version = "0.3.0b9"
+version = "0.3.0b10"
 description = "Extensible Terminal Multi-Agent Framework for Cloud Operations & DevOps Coding"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import suppress
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ from opscloud.plugins.store import (
     load_enabled_plugin_ids,
     load_local_enabled_plugin_ids,
     load_project_enabled_plugin_ids,
+    PluginNotFoundError,
     load_installed_plugins,
     load_marketplace_records,
     plugin_data_dir,
@@ -108,7 +110,8 @@ def remove_marketplace(name: str) -> bool:
         except ValueError:
             continue
         if marketplace_name == name:
-            uninstall_plugin(plugin_id)
+            with suppress(PluginNotFoundError):
+                uninstall_plugin(plugin_id)
 
     removed = remove_marketplace_record(name)
     location = Path(record.install_location)
@@ -241,15 +244,15 @@ def uninstall_plugin(
     *,
     scope: InstallScope | None = None,
     project_root: Path | None = None,
-) -> None:
+    project_path: str | None = None,
+) -> bool:
     """Uninstall a plugin (disable, clear records, delete orphaned cache)."""
     canonical_id = _resolve_installed_plugin_id(plugin_id)
-    effective_scope = scope or ("project" if project_root else "user")
-    set_plugin_enabled_for_scope(
-        canonical_id, False, scope=effective_scope, project_root=project_root
-    )
-    uninstall_plugin_record(
-        canonical_id, scope=scope, project_root=project_root
+    return uninstall_plugin_record(
+        canonical_id,
+        scope=scope,
+        project_root=project_root,
+        project_path=project_path,
     )
 
 

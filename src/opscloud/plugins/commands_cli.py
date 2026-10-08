@@ -25,7 +25,7 @@ from opscloud.plugins.marketplace import (
     redact_urls_in_text,
 )
 from opscloud.plugins.models import InstallScope
-from opscloud.plugins.store import load_marketplace_records
+from opscloud.plugins.store import PluginNotFoundError, load_marketplace_records
 
 
 def _resolve_project_root(scope: str | None) -> Path | None:
@@ -361,7 +361,12 @@ def execute_plugin_command(args: argparse.Namespace) -> str | None:
         raw_scope = getattr(args, "scope", None)
         scope = cast(InstallScope, raw_scope) if raw_scope else None
         project_root = _resolve_project_root(scope) if scope else None
-        uninstall_plugin(args.plugin_id, scope=scope, project_root=project_root)
+        try:
+            uninstall_plugin(args.plugin_id, scope=scope, project_root=project_root)
+        except (PluginNotFoundError, MarketplaceError, OSError, ValueError) as exc:
+            text = f"Failed to uninstall {args.plugin_id}: {exc}"
+            print(text)
+            raise SystemExit(1) from exc
         text = f"Uninstalled plugin {args.plugin_id}."
         print(text)
         return text

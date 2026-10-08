@@ -39,6 +39,10 @@ class PluginStateError(OSError):
     """Raised when existing plugin state cannot be safely modified."""
 
 
+class PluginNotFoundError(ValueError):
+    """Raised when an operation targets a plugin that is not installed."""
+
+
 def plugin_storage_root() -> Path:
     """Return the plugin storage root directory."""
     from opscloud.config.paths import PLUGINS_DIR
@@ -469,6 +473,23 @@ def _write_settings_plugin_enabled_state(
     _atomic_write_json(path, existing)
 
 
+def _remove_settings_plugin_enabled_state(path: Path, plugin_id: str) -> None:
+    """Remove a plugin from the enabledPlugins map in a settings JSON file."""
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    enabled = data.get("enabledPlugins")
+    if isinstance(enabled, dict) and plugin_id in enabled:
+        del enabled[plugin_id]
+        data["enabledPlugins"] = enabled
+        _atomic_write_json(path, data)
+
+
 def load_user_enabled_plugin_ids() -> frozenset[str]:
     """Read enabledPlugins from ``~/.opscloud/settings.json``."""
     return _load_settings_enabled_plugins(_user_settings_path())
@@ -545,6 +566,33 @@ def set_plugin_enabled_for_scope(
 def set_plugin_enabled(plugin_id: str, enabled: bool) -> None:
     """Persist a plugin enablement value (user scope)."""
     set_plugin_enabled_for_scope(plugin_id, enabled, scope="user")
+
+
+def remove_plugin_enabled_for_scope(
+    plugin_id: str,
+    scope: InstallScope = "user",
+    project_root: Path | None = None,
+) -> None:
+    """Remove plugin enablement key from the settings file for the given scope."""
+    from opscloud.config.paths import (
+        project_local_settings_path,
+        project_settings_path,
+    )
+
+    if scope in {"user", "global"}:
+        path = _user_settings_path()
+    elif scope == "project":
+        if project_root is None:
+            return
+        path = project_settings_path(project_root)
+    elif scope == "local":
+        if project_root is None:
+            return
+        path = project_local_settings_path(project_root)
+    else:
+        path = _user_settings_path()
+
+    _remove_settings_plugin_enabled_state(path, plugin_id)
 
 
 def _ensure_local_settings_gitignored(project_root: Path) -> None:
@@ -644,14 +692,38 @@ def load_installed_plugin_entries(
     return result
 
 
-def load_installed_plugins(*, strict: bool = False) -> dict[str, InstalledPluginEntry]:
-    """Load installed plugin records (first entry per plugin, backward-compat)."""
+def load_installed_plugins(
+    *,
+    strict: bool = False,
+    project_root: Path | None = None,
+) -> dict[str, InstalledPluginEntry]:
+    """Load installed plugin records (first entry per plugin, backward-compat).
+
+    If project_root is provided, entries matching that workspace or user scope are prioritized.
+    """
     all_entries = load_installed_plugin_entries(strict=strict)
-    return {
-        plugin_id: entries[0]
-        for plugin_id, entries in all_entries.items()
-        if entries
-    }
+    result: dict[str, InstalledPluginEntry] = {}
+    for plugin_id, entries in all_entries.items():
+        if not entries:
+            continue
+        primary: InstalledPluginEntry | None = None
+        if project_root is not None:
+            for e in entries:
+                if e.project_path and (
+                    e.project_path == str(project_root)
+                    or Path(e.project_path).resolve() == project_root.resolve()
+                ):
+                    primary = e
+                    break
+            if primary is None:
+                for e in entries:
+                    if e.scope in {"user", "global"}:
+                        primary = e
+                        break
+        if primary is None:
+            primary = entries[0]
+        result[plugin_id] = primary
+    return result
 
 
 def _entry_to_json(entry: InstalledPluginEntry) -> dict[str, Any]:
@@ -755,33 +827,71 @@ def remove_installed_plugin(
     *,
     scope: InstallScope | None = None,
     project_root: Path | None = None,
+    project_path: str | None = None,
 ) -> InstalledPluginEntry | None:
     """Remove install record(s) for a plugin."""
     all_entries = load_installed_plugin_entries(strict=True)
-    existing = all_entries.get(plugin_id)
+    target_id = plugin_id
+    if target_id not in all_entries and "@" not in target_id:
+        matches = [pid for pid in all_entries if pid.startswith(f"{target_id}@")]
+        if matches:
+            target_id = matches[0]
+
+    existing = all_entries.get(target_id)
     if not existing:
         return None
 
+    target_project_path = (
+        project_path
+        if project_path is not None
+        else (str(project_root) if (scope != "user" and project_root is not None) else None)
+    )
+
+    removed: InstalledPluginEntry | None = None
+    remaining: list[InstalledPluginEntry] = []
+
     if scope is None:
+        # Global removal: remove all entries for this plugin
         removed = existing[0] if existing else None
-        del all_entries[plugin_id]
+        all_entries.pop(target_id, None)
     else:
-        project_path = (
-            str(project_root)
-            if (scope != "user" and project_root is not None)
-            else None
-        )
-        removed = None
-        remaining = []
+        # Pass 1: exact match on scope and project_path
         for e in existing:
-            if e.scope == scope and (scope == "user" or e.project_path == project_path):
+            is_match = False
+            if removed is None and e.scope == scope:
+                if scope in {"user", "global"}:
+                    is_match = True
+                elif target_project_path is None:
+                    is_match = True
+                else:
+                    if e.project_path == target_project_path:
+                        is_match = True
+                    elif e.project_path:
+                        try:
+                            if Path(e.project_path).resolve() == Path(target_project_path).resolve():
+                                is_match = True
+                        except (OSError, RuntimeError):
+                            pass
+            if is_match:
                 removed = e
             else:
                 remaining.append(e)
+
+        # Fallback 1: match on scope even if project_path differed (cross-project invocation)
+        if removed is None:
+            for idx, e in enumerate(remaining):
+                if e.scope == scope:
+                    removed = remaining.pop(idx)
+                    break
+
+        # Fallback 2: if there's only one entry or scope was generic, remove it rather than no-op
+        if removed is None and remaining:
+            removed = remaining.pop(0)
+
         if remaining:
-            all_entries[plugin_id] = remaining
+            all_entries[target_id] = remaining
         else:
-            all_entries.pop(plugin_id, None)
+            all_entries.pop(target_id, None)
 
     _write_installed_plugins_raw(all_entries)
     return removed
@@ -859,47 +969,110 @@ def uninstall_plugin(
     *,
     scope: InstallScope | None = None,
     project_root: Path | None = None,
-) -> None:
-    """Disable a plugin, remove install records, and delete orphaned cache dirs."""
+    project_path: str | None = None,
+) -> bool:
+    """Disable a plugin, remove install records, and delete orphaned cache dirs.
+
+    Returns:
+        True on successful uninstallation.
+
+    Raises:
+        PluginNotFoundError: If the plugin is not installed in the target scope.
+    """
     from opscloud.config.settings import settings
     from opscloud.skills.registry import SkillRegistry
 
+    target_id = plugin_id
+    all_entries = load_installed_plugin_entries(strict=True)
+    if target_id not in all_entries and "@" not in target_id:
+        matches = [pid for pid in all_entries if pid.startswith(f"{target_id}@")]
+        if matches:
+            target_id = matches[0]
+
     effective_root = (
-        project_root if isinstance(project_root, Path) else settings.effective_project_root
+        Path(project_path)
+        if project_path is not None
+        else (project_root if isinstance(project_root, Path) else settings.effective_project_root)
     )
-    load_installed_plugin_entries(strict=True)
 
     removed = remove_installed_plugin(
-        plugin_id, scope=scope, project_root=effective_root
+        target_id, scope=scope, project_root=effective_root, project_path=project_path
     )
 
-    if scope is not None:
+    if removed is None:
+        scope_detail = f" (scope={scope!r})" if scope else ""
+        raise PluginNotFoundError(f"Plugin {plugin_id!r} is not installed{scope_detail}")
+
+    entry_scope = removed.scope
+    entry_root = Path(removed.project_path) if removed.project_path else effective_root
+
+    # Clean up enablement in the removed entry's scope
+    with suppress(Exception):
         set_plugin_enabled_for_scope(
-            plugin_id, False, scope=scope, project_root=effective_root
+            target_id, False, scope=entry_scope, project_root=entry_root
         )
-    else:
-        set_plugin_enabled_for_scope(plugin_id, False, scope="user")
+        remove_plugin_enabled_for_scope(
+            target_id, scope=entry_scope, project_root=entry_root
+        )
+
+    if scope is not None and scope != entry_scope:
+        with suppress(Exception):
+            set_plugin_enabled_for_scope(
+                target_id, False, scope=scope, project_root=effective_root
+            )
+            remove_plugin_enabled_for_scope(
+                target_id, scope=scope, project_root=effective_root
+            )
+
+    all_after = load_installed_plugin_entries()
+    has_remaining_installs = bool(all_after.get(target_id))
+
+    if scope is None or not has_remaining_installs:
+        with suppress(Exception):
+            set_plugin_enabled_for_scope(target_id, False, scope="user")
+            remove_plugin_enabled_for_scope(target_id, scope="user")
         if effective_root:
             with suppress(Exception):
                 set_plugin_enabled_for_scope(
-                    plugin_id, False, scope="project", project_root=effective_root
+                    target_id, False, scope="project", project_root=effective_root
+                )
+                remove_plugin_enabled_for_scope(
+                    target_id, scope="project", project_root=effective_root
                 )
             with suppress(Exception):
                 set_plugin_enabled_for_scope(
-                    plugin_id, False, scope="local", project_root=effective_root
+                    target_id, False, scope="local", project_root=effective_root
+                )
+                remove_plugin_enabled_for_scope(
+                    target_id, scope="local", project_root=effective_root
+                )
+        if entry_root and entry_root != effective_root:
+            with suppress(Exception):
+                set_plugin_enabled_for_scope(
+                    target_id, False, scope="project", project_root=entry_root
+                )
+                remove_plugin_enabled_for_scope(
+                    target_id, scope="project", project_root=entry_root
+                )
+            with suppress(Exception):
+                set_plugin_enabled_for_scope(
+                    target_id, False, scope="local", project_root=entry_root
+                )
+                remove_plugin_enabled_for_scope(
+                    target_id, scope="local", project_root=entry_root
                 )
 
-    if removed is not None:
-        all_after = load_installed_plugin_entries()
-        all_paths_after = {
-            e.install_path
-            for entries in all_after.values()
-            for e in entries
-        }
-        if removed.install_path not in all_paths_after:
-            path = Path(removed.install_path)
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
+    all_paths_after = {
+        e.install_path
+        for entries in all_after.values()
+        for e in entries
+    }
+    if removed.install_path not in all_paths_after:
+        path = Path(removed.install_path)
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
     with suppress(Exception):
         SkillRegistry.get_instance().discover_skills(force=True)
+
+    return True

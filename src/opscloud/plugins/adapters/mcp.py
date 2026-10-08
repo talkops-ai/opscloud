@@ -77,13 +77,16 @@ def _server_map(raw: object) -> dict[str, Any]:
     """Extract the server-name to config map from a decoded MCP document."""
     if not isinstance(raw, dict):
         return {}
-    wrapped = raw.get("mcpServers")
-    if isinstance(wrapped, dict):
-        return dict(wrapped)
-    codex_wrapped = raw.get("mcp_servers")
-    if isinstance(codex_wrapped, dict):
-        return dict(codex_wrapped)
-    return dict(raw)
+    target: Any = raw.get("mcpServers")
+    if not isinstance(target, dict):
+        target = raw.get("mcp_servers")
+    if not isinstance(target, dict):
+        target = raw
+    return {
+        str(k): v
+        for k, v in target.items()
+        if isinstance(k, str)
+    }
 
 
 def _try_repair_mcp_json(text: str) -> dict[str, Any] | None:
