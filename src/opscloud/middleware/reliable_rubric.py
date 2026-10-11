@@ -294,6 +294,23 @@ with warnings.catch_warnings():
                 except Exception:
                     logger.debug("Failed to emit rubric stream event %s", payload, exc_info=True)
 
+        def _prepare_evaluation(
+            self,
+            state: RubricState,
+            runtime: Runtime[Any],
+        ) -> tuple[str, int] | None:
+            """Skip grading on isolated workflow turns.
+
+            A ``/workflow`` turn short-circuits the main agent and never touches
+            the main transcript, so grading it against a goal rubric would be
+            meaningless (and could loop the main model back into execution).
+            """
+            from opscloud.state.workflow_channels import is_workflow_turn
+
+            if is_workflow_turn(state):
+                return None
+            return super()._prepare_evaluation(state, runtime)
+
         def _grader_input(
             self,
             state: RubricState,

@@ -68,6 +68,19 @@ def _is_renderable_subagent_event(data: Any, *, is_main_agent: bool) -> bool:
     return isinstance(data, dict) and data.get("type") == "subagent"
 
 
+_WORKFLOW_NAMESPACE_PREFIX = "WorkflowMiddleware."
+"""Mirrors ``opscloud.middleware.workflow.WORKFLOW_NODE_PREFIX``."""
+
+
+def _is_workflow_namespace(ns_key: tuple[str, ...]) -> bool:
+    """Whether ``ns_key`` is the isolated workflow agent graph.
+
+    Only the direct child of ``WorkflowMiddleware.before_agent`` qualifies;
+    deeper graphs stay non-primary.
+    """
+    return len(ns_key) == 1 and ns_key[0].startswith(_WORKFLOW_NAMESPACE_PREFIX)
+
+
 def _is_auto_mode_classifier_chunk(metadata: dict[str, Any] | None) -> bool:
     """Check if a message chunk is internal Auto mode classifier output.
 
@@ -662,6 +675,10 @@ class TextualAdapter:
                         self._app._reasoning_effort = effort
             return
 
+        if isinstance(data, dict) and str(data.get("type") or "").startswith("workflow_"):
+            self._handle_workflow_stream_event(data, is_main_agent)
+            return
+
         if self._on_subagent_event is not None and _is_renderable_subagent_event(data, is_main_agent=is_main_agent):
             try:
                 self._on_subagent_event(data)
@@ -698,6 +715,20 @@ class TextualAdapter:
                 else:
                     widget = SystemMessage(formatted_event)
                 self._messages.mount(widget)
+
+    def _handle_workflow_stream_event(self, data: dict[str, Any], is_main_agent: bool) -> None:
+        """Render ``workflow_phase`` events as spinner updates."""
+        del is_main_agent
+        if str(data.get("type") or "") != "workflow_phase":
+            return
+        phase = str(data.get("phase") or "")
+        name = str(data.get("name") or "").rsplit(":", 1)[-1]
+        if phase == "running" and self._set_spinner:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._set_spinner(f"Running workflow {name}".strip()))
+            except RuntimeError:
+                pass
 
     def _handle_updates_stream_event(
         self,
@@ -1208,7 +1239,9 @@ class TextualAdapter:
 
                     namespace, current_stream_mode, data = chunk
                     ns_key = tuple(namespace) if namespace else ()
-                    is_main_agent = ns_key == ()
+                    # The isolated /workflow agent runs one level down inside
+                    # WorkflowMiddleware; render it as primary.
+                    is_main_agent = ns_key == () or _is_workflow_namespace(ns_key)
 
                     if current_stream_mode == "custom":
                         self._handle_custom_stream_event(data, is_main_agent, stream_state=stream_state)

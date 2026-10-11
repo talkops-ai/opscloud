@@ -25,6 +25,7 @@ from opscloud.commands.power.ui_toggles import (
     TimestampsHandler,
 )
 from opscloud.commands.power.version import VersionHandler
+from opscloud.commands.power.workflow import WorkflowHandler, WorkflowInvokeHandler
 
 __all__ = [
     "AgentsHandler",
@@ -48,4 +49,6 @@ __all__ = [
     "TraceHandler",
     "UpdateHandler",
     "VersionHandler",
+    "WorkflowHandler",
+    "WorkflowInvokeHandler",
 ]

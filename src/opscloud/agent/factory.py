@@ -351,6 +351,8 @@ def _subagent_cli_middleware(
     mcp_tools: list[Any] | None = None,
     backend: BackendProtocol | None = None,
     model: str | BaseChatModel | None = None,
+    skill_sources_override: Sequence[Any] | None = None,
+    include_telemetry: bool = True,
 ) -> list[Any]:
     middleware: list[AgentMiddleware[Any, Any]] = []
     subagent_cwd = Path(worktree_root) if worktree_root is not None else Path.cwd()
@@ -388,7 +390,8 @@ def _subagent_cli_middleware(
 
     middleware.append(CodeModelRetryMiddleware())
     middleware.append(CostTrackingMiddleware(nested=True))
-    middleware.append(SubagentTelemetryMiddleware(subagent_name=subagent_name))
+    if include_telemetry:
+        middleware.append(SubagentTelemetryMiddleware(subagent_name=subagent_name))
 
     if not interactive:
         middleware.append(GlmTerminalStallRecoveryMiddleware())
@@ -415,7 +418,7 @@ def _subagent_cli_middleware(
 
     server_keys: list[str] = []
     if mcp_config:
-        server_keys.extend(str(k) for k in mcp_config.keys())
+        server_keys.extend(k for k in mcp_config.keys())
     if mcp_server_info:
         server_keys.extend(str(getattr(s, "name", s)) for s in mcp_server_info)
 
@@ -435,11 +438,17 @@ def _subagent_cli_middleware(
 
     skill_sources: list[CodeSkillSource] = []
     meta_for_skills = subagent_meta or {"path": subagent_path, "name": subagent_name}
-    bundled_source = get_subagent_skills_source(meta_for_skills)
+    bundled_source = (
+        None if skill_sources_override is not None else get_subagent_skills_source(meta_for_skills)
+    )
     if bundled_source and Path(bundled_source[0]).is_dir():
         skill_sources.append(bundled_source)
 
-    if allowed_skills is not None:
+    if skill_sources_override is not None:
+        # Explicit, exclusive skill sources (e.g. workflow executor built-ins);
+        # never inherit the global skill catalog.
+        skill_sources.extend(tuple(src) for src in skill_sources_override if Path(src[0]).is_dir())
+    elif allowed_skills is not None:
         global_sources = get_skill_sources(
             project_root=Path(worktree_root) if worktree_root else None,
             include_subagent_skills=True,
@@ -1019,6 +1028,36 @@ def create_opscloud_agent(
     from opscloud.tools.goal_tools import set_active_criteria_agent
 
     set_active_criteria_agent(criteria_agent, fallback_agent)
+
+    # 10.12a WorkflowMiddleware — isolated `/workflow` runbook agent.
+    # Runs before goal-criteria handling; a workflow turn jumps to "end" so the
+    # main deep agent never sees it. The workflow agent reuses the main agent's
+    # interrupt_on mapping, so plugin MCP tools / shell / writes follow exactly
+    # the same HITL approval policy.
+    from opscloud.middleware.workflow import WorkflowMiddleware
+
+    workflow_agent = None
+    try:
+        from opscloud.workflows.agent import create_workflow_agent
+
+        workflow_agent = create_workflow_agent(
+            model=active_model,
+            backend=composite_backend,
+            tools=all_tools,
+            worktree_root=effective_cwd,
+            assistant_id=assistant_id,
+            interactive=interactive,
+            auto_approve=auto_approve,
+            shell_allow_list=allow_list,
+            interrupt_on=interrupt_on,
+            mcp_server_info=cached_infos,
+            mcp_config=mcp_configs,
+            mcp_tools=mcp_tools_list or None,
+        )
+    except Exception as exc:
+        logger.warning("Failed to create workflow agent: %s", exc, exc_info=True)
+
+    agent_middleware.append(WorkflowMiddleware(workflow_agent=workflow_agent))
 
     agent_middleware.append(
         GoalCriteriaMiddleware(

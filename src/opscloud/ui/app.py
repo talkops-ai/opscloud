@@ -1255,6 +1255,8 @@ class OpsCloudApp(App):
         self._active_user_message = user_msg
         self._active_turn_visible_output_started = False
         await self._mount_message(user_msg)
+        if await self._maybe_continue_workflow(message):
+            return
         await self._send_to_agent(message)
 
     async def send_agent_message(self, message: str, **kwargs: Any) -> None:
@@ -1338,6 +1340,7 @@ class OpsCloudApp(App):
                 raw_request_id = criteria_request.get("request_id")
                 if isinstance(raw_request_id, str):
                     criteria_request_id = raw_request_id
+        workflow_turn = graph_input is not None and isinstance(graph_input.get("workflow_request"), dict)
 
         task_succeeded = False
         try:
@@ -1383,6 +1386,8 @@ class OpsCloudApp(App):
                     "Could not generate acceptance criteria for this goal. "
                     "Run `/goal` again to retry."
                 )
+            elif workflow_turn:
+                body = f"Workflow turn failed: {body}\n\nUse `/workflow show` to inspect or `/workflow cancel` to stop."
             await self._mount_message(ErrorMessage(body))
 
         finally:
@@ -1391,11 +1396,12 @@ class OpsCloudApp(App):
                 panel.finalize_running()
             self._close_active_tool_group()
             await self._cleanup_agent_task(
-                force_goal_sync=graph_input is not None,
+                force_goal_sync=graph_input is not None and not workflow_turn,
                 goal_criteria_request_id=criteria_request_id,
                 goal_criteria_succeeded=(
                     criteria_request_id is None or task_succeeded
                 ),
+                workflow_sync=workflow_turn,
             )
 
     async def _cleanup_agent_task(
@@ -1404,6 +1410,7 @@ class OpsCloudApp(App):
         force_goal_sync: bool = False,
         goal_criteria_request_id: str | None = None,
         goal_criteria_succeeded: bool = True,
+        workflow_sync: bool = False,
     ) -> None:
         """Tear down after a turn completes or is cancelled.
 
@@ -1417,6 +1424,8 @@ class OpsCloudApp(App):
                 when restoring a newly generated proposal.
             goal_criteria_succeeded: Whether criteria generation completed
                 without failure or cancellation.
+            workflow_sync: Reconcile and announce workflow state (after a
+                ``/workflow`` turn).
         """
         self._agent_reconciling = True
         self._agent_running = False
@@ -1440,6 +1449,13 @@ class OpsCloudApp(App):
                     proposal_request_id=goal_criteria_request_id,
                     allow_pending_proposal=goal_criteria_succeeded,
                 )
+
+                # ── Workflow state synchronization from checkpoint ──
+                if workflow_sync:
+                    try:
+                        await self._sync_workflow_state_from_checkpoint(announce=True)
+                    except Exception:
+                        logger.exception("Error during agent cleanup workflow sync")
 
                 # ── Session cost & token state synchronization from checkpoint ──
                 try:
@@ -2806,9 +2822,14 @@ class OpsCloudApp(App):
             removed_skills = sorted(old_skill_names - new_skill_names)
 
             if hasattr(self, "_chat_input") and self._chat_input:
-                from opscloud.ui.command_registry import build_skill_commands, get_all_entries
+                from opscloud.ui.command_registry import (
+                    build_skill_commands,
+                    build_workflow_commands,
+                    get_all_entries,
+                )
 
                 skill_commands = build_skill_commands(self._discovered_skills)
+                skill_commands.extend(build_workflow_commands(self._discovered_skills or []))
                 self._chat_input.update_slash_commands(get_all_entries(skill_commands))
 
             # 4. Compose initial report lines
@@ -3622,9 +3643,14 @@ class OpsCloudApp(App):
             skills = await asyncio.to_thread(self.get_discovered_skills)
             self._discovered_skills = skills
             if skills and hasattr(self, "_chat_input") and self._chat_input:
-                from opscloud.ui.command_registry import build_skill_commands, get_all_entries
+                from opscloud.ui.command_registry import (
+                    build_skill_commands,
+                    build_workflow_commands,
+                    get_all_entries,
+                )
 
                 skill_commands = build_skill_commands(skills)
+                skill_commands.extend(build_workflow_commands(skills))
                 self._chat_input.update_slash_commands(get_all_entries(skill_commands))
         except Exception as exc:
             logger.debug("Failed startup skill discovery: %s", exc)
@@ -5616,7 +5642,122 @@ class OpsCloudApp(App):
         GoalHandler._sync_status_rubric(self, state)
         self._focus_chat_input_after_refresh()
 
+    # ── Workflow (/workflow) ─────────────────────────────
+    #
+    # Workflows run in an isolated workflow agent inside the server graph;
+    # the TUI only submits typed requests and mirrors ``_workflow_*`` channels.
 
+    async def _run_workflow_request(self, request: dict[str, Any]) -> None:
+        """Submit one typed workflow request through the normal agent stream."""
+        if not self._adapter or not self._adapter.connected:
+            await self._mount_message(ErrorMessage("Workflows require a connected server."))
+            return
+        from opscloud.commands.power.workflow import get_workflow_state
+
+        get_workflow_state(self).thread_id = self._agent_thread_id
+        kind = request.get("kind")
+        spinner = "Cancelling workflow" if kind == "cancel" else "Running workflow"
+        self._agent_turn_started = False
+        self._agent_running = True
+        await self._set_spinner(spinner)
+        self._agent_worker = self.run_worker(
+            self._run_agent_task(
+                "",
+                graph_input={
+                    "messages": [],
+                    "workflow_request": request,
+                },
+            ),
+            exclusive=False,
+        )
+
+    async def _maybe_continue_workflow(self, message: str) -> bool:
+        """Route plain chat input to an attached, running workflow.
+
+        Returns:
+            Whether the message was consumed by the workflow.
+        """
+        from opscloud.commands.power.workflow import get_workflow_state
+
+        state = get_workflow_state(self)
+        if state.thread_id not in {None, self._agent_thread_id}:
+            # Mirror belongs to another thread (e.g. after /threads); drop it.
+            state.clear()
+            return False
+        if not state.accepts_replies:
+            return False
+        await self._run_workflow_request(
+            {
+                "kind": "continue",
+                "request_id": str(uuid.uuid4()),
+                "message": message,
+            }
+        )
+        return True
+
+    async def _sync_workflow_state_from_checkpoint(self, *, announce: bool = False) -> None:
+        """Mirror the thread's ``_workflow_*`` channels into ``WorkflowState``.
+
+        Args:
+            announce: Report status transitions (only after a workflow turn,
+                never on passive refresh).
+        """
+        from opscloud.commands.power.workflow import get_workflow_state, sync_workflow_status_label
+        from opscloud.ui.widgets.messages import AppMessage
+
+        state = get_workflow_state(self)
+        values = await self._get_thread_state_values()
+        if not values:
+            return
+        state.thread_id = self._agent_thread_id
+
+        def _text(key: str) -> str | None:
+            raw = values.get(key)
+            return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+        previous_run = state.run_id
+        state.run_id = _text("_workflow_run_id")
+        state.name = _text("_workflow_name")
+        state.args = _text("_workflow_args")
+        state.status = _text("_workflow_status")
+        state.note = _text("_workflow_status_note")
+        artifacts = values.get("_workflow_artifacts")
+        state.artifacts = [str(a) for a in artifacts] if isinstance(artifacts, list) else []
+        if state.run_id and state.run_id != previous_run:
+            state.attached = True
+        sync_workflow_status_label(self, state)
+
+        if not announce:
+            return
+        key = (state.run_id, state.status, state.note)
+        if key == state.announced:
+            return
+        state.announced = key
+
+        label = f"`{state.name}`" if state.name else "Workflow"
+        if state.status == "complete":
+            body = f"✓ Workflow {label} complete."
+            if state.note:
+                body += f"\n\n{state.note}"
+            if state.artifacts:
+                body += "\n\n**Artifacts:**\n" + "\n".join(f"- `{a}`" for a in state.artifacts)
+            await self._mount_message(AppMessage(body))
+        elif state.status == "blocked":
+            body = f"⚠ Workflow {label} needs your input."
+            if state.note:
+                body += f"\n\n{state.note}"
+            body += "\n\nReply to continue, or `/workflow cancel`."
+            await self._mount_message(AppMessage(body))
+        elif state.status == "failed":
+            body = f"Workflow {label} failed: {state.note or 'unknown error'}"
+            if state.artifacts:
+                body += "\n\n**Artifacts:**\n" + "\n".join(f"- `{a}`" for a in state.artifacts)
+            await self._mount_message(ErrorMessage(body))
+        elif state.status == "cancelled":
+            await self._mount_message(AppMessage("Workflow cancelled."))
+        elif state.note:
+            # Rejected request (e.g. another run still open) — status unchanged.
+            await self._mount_message(AppMessage(state.note))
 
     # ── Skill Command ────────────────────────────────────
 

@@ -3,6 +3,9 @@ name: remember
 description: "Distill the conversation to capture cloud infrastructure decisions, DevOps patterns, operator preferences, and operational runbooks into persistent memory (AGENTS.md) or reusable OpsCloud skills. Use when the operator says: (1) remember this, (2) save cloud preferences, (3) update memory, (4) persist operational learnings."
 license: MIT
 compatibility: designed for opscloud
+metadata:
+  # Utility skill bound to the main conversation; not offered as a /workflow.
+  workflow: "false"
 ---
 
 Review the conversation and capture valuable operational knowledge. Focus especially on **cloud & DevOps best practices**, **infrastructure conventions**, and **operator preferences**—these are the most important things to preserve across sessions.

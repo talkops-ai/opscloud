@@ -354,6 +354,13 @@ COMMANDS: tuple[SlashCommand, ...] = (
         argument_hint="[on|off|status]",
         hidden_keywords="auto-update autoupdate check startup",
     ),
+    SlashCommand(
+        name="/workflow",
+        description="Trigger a skill as an isolated, parameterised workflow",
+        bypass_tier=BypassTier.QUEUED,
+        argument_hint="[<name> [params]|show|cancel|detach|attach]",
+        hidden_keywords="workflow runbook playbook pipeline job procedure run skill isolated execute",
+    ),
 )
 
 
@@ -437,6 +444,40 @@ def build_skill_commands(skills: list[Any]) -> list[CommandEntry]:
             name = getattr(skill, "name", "")
         if name and name.lower() not in _STATIC_SKILL_ALIASES:
             entries.append(_skill_command_entry(skill))
+    return entries
+
+
+def build_workflow_commands(skills: list[Any]) -> list[CommandEntry]:
+    """Build ``/workflow:<name>`` autocomplete entries for workflow-capable skills.
+
+    Uses the same opt-out rules as the server (``workflow: false`` in SKILL.md
+    frontmatter hides a skill). Plugin workflows show a short, plugin-tagged label.
+    """
+    from opscloud.workflows.discovery import workflow_from_skill
+
+    entries: list[CommandEntry] = []
+    for skill in skills:
+        raw = skill if isinstance(skill, dict) else {
+            "name": getattr(skill, "name", ""),
+            "description": getattr(skill, "description", ""),
+            "path": getattr(skill, "path", ""),
+            "source": getattr(skill, "source", ""),
+            "frontmatter": getattr(skill, "frontmatter", {}),
+        }
+        spec = workflow_from_skill(raw)
+        if spec is None:
+            continue
+        desc = spec.description.splitlines()[0] if spec.description else spec.name
+        is_namespaced = ":" in spec.name
+        entries.append(
+            CommandEntry(
+                name=f"/workflow:{spec.name}",
+                description=f"(workflow · {spec.plugin_id}) {desc}" if spec.plugin_id else f"(workflow) {desc}",
+                hidden_keywords=f"workflow {spec.name.replace(':', ' ')}",
+                argument_hint="[params]",
+                display_name=f"/workflow:{spec.short_name}" if is_namespaced else "",
+            )
+        )
     return entries
 
 
