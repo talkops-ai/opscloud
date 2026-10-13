@@ -13,15 +13,16 @@ from typing import TYPE_CHECKING, ClassVar
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
 
+from opscloud.config.settings import get_glyphs
 from opscloud.model.config import get_credential_env_var
 from opscloud.ui.widgets.auth import AuthPromptScreen, AuthResult, PROVIDER_DISPLAY_NAMES
+from opscloud.ui.widgets.modal_base import OpsModalScreen, format_modal_option_row
 
 logger = get_logger(__name__)
 
@@ -33,7 +34,7 @@ _KNOWN_PROVIDERS: tuple[str, ...] = (
 )
 
 
-class AuthManagerScreen(ModalScreen[None]):
+class AuthManagerScreen(OpsModalScreen[None]):
     """Modal listing providers and their credential status.
 
     Reachable via /login, /auth, /connect. Dismisses with None.
@@ -59,45 +60,32 @@ class AuthManagerScreen(ModalScreen[None]):
         Binding("delete", "delete_selected", "Delete key", show=False, priority=True),
     ]
 
-    CSS = """
-    AuthManagerScreen {
-        align: center middle;
-    }
+    DIALOG_CLASSES: ClassVar[str] = "-workspace"
 
-    AuthManagerScreen > Vertical {
-        width: 76;
-        max-width: 90%;
-        height: 80%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     AuthManagerScreen .auth-mgr-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     AuthManagerScreen .auth-mgr-desc {
-        height: auto;
-        color: $text-muted;
-        margin-bottom: 1;
+        display: none;
     }
 
     AuthManagerScreen OptionList {
         height: 1fr;
         min-height: 3;
         background: $background;
+        border: solid $primary 20%;
+    }
+
+    AuthManagerScreen OptionList > .option-list--option-highlighted {
+        background: $primary 18%;
+        color: $text;
+        text-style: bold;
     }
 
     AuthManagerScreen .auth-mgr-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        text-align: center;
-        margin-top: 1;
+        display: none;
     }
     """
 
@@ -105,24 +93,56 @@ class AuthManagerScreen(ModalScreen[None]):
         super().__init__()
         self._initial_provider = initial_provider
 
-    def compose(self) -> ComposeResult:
+    def compose_modal(self):
         options = self._build_options()
-        with Vertical():
-            yield Static("Manage API Keys", classes="auth-mgr-title")
-            yield Static(
-                "Select a provider to add, replace, or delete its API key. "
-                "Keys are stored in ~/.opscloud/.env.",
-                classes="auth-mgr-desc",
-            )
-            yield OptionList(*options, id="auth-mgr-options")
-            yield Static(
-                "↑/↓ navigate • Enter add/replace • Delete remove • Esc close",
-                classes="auth-mgr-help",
-            )
+        yield Static("Manage API Keys", classes="auth-mgr-title")
+        yield Static(
+            "Select a provider to add, replace, or delete its API key. "
+            "Keys are stored in ~/.opscloud/.env.",
+            classes="auth-mgr-desc",
+        )
+        yield OptionList(*options, id="auth-mgr-options")
+        yield Static(
+            "↑/↓ navigate • Enter add/replace • Delete remove • Esc close",
+            classes="auth-mgr-help",
+        )
 
     def on_mount(self) -> None:
-        """Highlight initial provider if specified (e.g. from /login anthropic)."""
+        super().on_mount()
+        glyphs = get_glyphs()
+        self.set_modal_title("API Key Manager", counter=f"{len(_KNOWN_PROVIDERS)} providers")
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("enter", "set key"),
+            ("del", "remove"),
+            ("esc", "close"),
+        ])
         self._highlight_initial_provider()
+        try:
+            self.query_one("#auth-mgr-options", OptionList).focus()
+        except Exception:
+            pass
+        self._last_row_width: int | None = None
+        self.call_after_refresh(self._reformat_options)
+
+    def on_resize(self) -> None:
+        width = self._option_content_width("#auth-mgr-options", fallback=70)
+        if width != getattr(self, "_last_row_width", None):
+            self._last_row_width = width
+            self.call_after_refresh(self._reformat_options)
+
+    def _reformat_options(self) -> None:
+        try:
+            ol = self.query_one("#auth-mgr-options", OptionList)
+        except Exception:
+            return
+        highlighted = ol.highlighted if ol.highlighted is not None else 0
+        w = self._option_content_width("#auth-mgr-options", fallback=70)
+        ol.clear_options()
+        for opt in self._build_options(width=w):
+            ol.add_option(opt)
+        if ol.option_count > 0 and 0 <= highlighted < ol.option_count:
+            ol.highlighted = highlighted
 
     def _highlight_initial_provider(self) -> None:
         if self._initial_provider is None:
@@ -135,20 +155,40 @@ class AuthManagerScreen(ModalScreen[None]):
         except Exception:
             pass
 
-    def _build_options(self) -> list[Option]:
+    def _build_options(self, width: int | None = None) -> list[Option]:
         """Build OptionList entries with credential status badges."""
         options = []
+        row_w = width if width is not None else self._option_content_width("#auth-mgr-options", fallback=70)
         for provider in _KNOWN_PROVIDERS:
             display_name = PROVIDER_DISPLAY_NAMES.get(provider, provider)
             if provider == "langsmith":
                 env_var = "LANGSMITH_API_KEY"
-                has_key = bool(os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY"))
+                has_key = bool(
+                    os.environ.get("LANGSMITH_API_KEY")
+                    or os.environ.get("LANGCHAIN_API_KEY")
+                )
             else:
-                env_var = get_credential_env_var(provider) or f"{provider.upper()}_API_KEY"
+                env_var = (
+                    get_credential_env_var(provider) or f"{provider.upper()}_API_KEY"
+                )
                 has_key = bool(os.environ.get(env_var))
-            badge = "[stored] ✓" if has_key else "[missing]"
-            label = f"{display_name}  {badge}"
-            options.append(Option(label, id=provider))
+
+            if has_key:
+                badges: list[tuple[str, str]] = [("STORED", "bold $success")]
+                status_text = "● Configured"
+                status_style = "bold $success"
+            else:
+                badges = [("MISSING", "dim")]
+                status_text = "○ Not set"
+                status_style = "dim"
+
+            content = format_modal_option_row(
+                label=display_name,
+                badges=badges,
+                status=(status_text, status_style),
+                width=row_w,
+            )
+            options.append(Option(content, id=provider))
         return options
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:

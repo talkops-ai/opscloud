@@ -1,7 +1,8 @@
 """Unit tests for ServerProcess, ServerConfig, stream item parsing, and RemoteAgent connection."""
 
+import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -136,17 +137,98 @@ async def test_remote_agent_acancel_active_runs():
         {"run_id": "run-done", "status": "success"},
     ])
     mock_runs.cancel = AsyncMock(return_value=None)
+    mock_runs.get = AsyncMock(return_value={"status": "interrupted"})
     mock_client.runs = mock_runs
     mock_graph._validate_client.return_value = mock_client
     agent._graph = mock_graph
+    agent._active_run_id = "run-active"
 
     config = {"configurable": {"thread_id": "thread-abc"}}
-    await agent.acancel_active_runs(config)
+    res = await agent.acancel_active_runs(config)
 
     # Only the active run must be cancelled with wait=True and action='interrupt'
     mock_runs.cancel.assert_awaited_once_with(
         "thread-abc", "run-active", wait=True, action="interrupt"
     )
+    assert res.success is True
+    assert res.cancelled_run_ids == ("run-active",)
+    assert res.terminal_statuses["run-active"] == "interrupted"
+    assert agent._active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_remote_agent_acancel_active_runs_keeps_run_id_on_failure():
+    """Verify active_run_id is retained if terminal status cannot be confirmed (DV-09)."""
+    agent = RemoteAgent(url="http://127.0.0.1:9999", graph_name="agent")
+    mock_graph = MagicMock()
+    mock_client = MagicMock()
+    mock_runs = AsyncMock()
+
+    mock_runs.list = AsyncMock(return_value=[{"run_id": "run-active", "status": "running"}])
+    mock_runs.cancel = AsyncMock(side_effect=TimeoutError("cancellation timeout"))
+    mock_runs.get = AsyncMock(return_value={"status": "running"})
+    mock_client.runs = mock_runs
+    mock_graph._validate_client.return_value = mock_client
+    agent._graph = mock_graph
+    agent._active_run_id = "run-active"
+
+    config = {"configurable": {"thread_id": "thread-abc"}}
+    res = await agent.acancel_active_runs(config)
+
+    assert res.success is False
+    assert "run-active" in res.failed_run_ids
+    # Active run ID MUST be preserved when terminal state is not confirmed!
+    assert agent._active_run_id == "run-active"
+
+
+def test_server_graph_import_performs_no_runtime_construction(monkeypatch):
+    """LangGraph import must not instantiate models, MCP clients, or graphs."""
+    import importlib
+    import sys
+
+    monkeypatch.setenv("OPSCLOUD_SERVER_PROCESS", "1")
+    sys.modules.pop("opscloud.server.server_graph", None)
+    with patch(
+        "opscloud.model.factory.create_model",
+        side_effect=AssertionError("runtime construction happened during import"),
+    ) as create_model:
+        importlib.import_module("opscloud.server.server_graph")
+
+    create_model.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_agent_factory_prepares_mcp_before_sync_compilation(tmp_path):
+    """Server construction keeps MCP I/O async and compiles Deep Agents once in a worker."""
+    from opscloud.agent.factory import create_opscloud_agent_async
+
+    project_context = MagicMock(user_cwd=tmp_path, project_root=tmp_path)
+    prepared = {"agent": ({}, [], [])}
+    graph = MagicMock()
+    backend = MagicMock()
+    manager = MagicMock()
+    manager.register_servers = MagicMock()
+
+    with (
+        patch("opscloud.agent.factory.list_subagents", return_value=[]),
+        patch("opscloud.plugins.adapters.mcp.prepare_subagents_mcp_async", new_callable=AsyncMock, return_value=prepared) as prepare_subagents,
+        patch("opscloud.mcp.discovery.discover_mcp_configs", return_value={"disabled": {"enabled": False}}),
+        patch("opscloud.mcp.preload.preload_mcp_metadata", new_callable=AsyncMock, return_value=[]) as preload,
+        patch("opscloud.mcp.preload.get_cached_mcp_server_infos", return_value=[]),
+        patch("opscloud.mcp.session_manager.MCPSessionManager.get_instance", return_value=manager),
+        patch("opscloud.mcp.session_manager.build_mcp_tools_from_server_infos", return_value=[]),
+        patch("opscloud.agent.factory.create_opscloud_agent", return_value=(graph, backend)) as compile_agent,
+    ):
+        result = await create_opscloud_agent_async(
+            model=MagicMock(),
+            cwd=tmp_path,
+            project_context=project_context,
+        )
+
+    assert result == (graph, backend)
+    prepare_subagents.assert_awaited_once()
+    preload.assert_awaited_once()
+    assert compile_agent.call_args.kwargs["_prepared_subagent_mcp"] == prepared
 
 
 def test_server_graph_factory_signature():
@@ -235,3 +317,146 @@ async def test_server_process_astart_success():
     proc.await_until_healthy.assert_awaited_once_with(timeout=10.0)
     proc.await_for_graph_ready.assert_awaited_once_with(timeout=10.0)
 
+
+def test_server_process_multi_workspace_isolation(tmp_path: Path):
+    """Verify concurrent instances in different workspaces get isolated runtime dirs and ports."""
+    from opscloud._constants import SERVER_RUNTIME_DIR
+
+    cfg = ServerConfig()
+    proc1 = ServerProcess(cfg, port=8123)
+    proc2 = ServerProcess(cfg, port=8124)
+
+    assert proc1.port != proc2.port
+    assert proc1.runtime_dir.name.startswith("inst_8123_")
+    assert proc2.runtime_dir.name.startswith("inst_8124_")
+    assert proc1.runtime_dir != proc2.runtime_dir
+    assert proc1.runtime_dir.parent == SERVER_RUNTIME_DIR
+
+    # Even two instances targeting the exact same port get isolated runtime dirs (IA-06)
+    proc1_same = ServerProcess(cfg, port=8123)
+    assert proc1_same.runtime_dir != proc1.runtime_dir
+    assert proc1_same.runtime_dir.name.startswith("inst_8123_")
+
+    # Custom runtime_dir override still respected and never deleted on stop (IA-09)
+    custom_dir = tmp_path / "custom_server"
+    custom_dir.mkdir(parents=True, exist_ok=True)
+    proc_custom = ServerProcess(cfg, port=8125, runtime_dir=custom_dir)
+    assert proc_custom.runtime_dir == custom_dir
+    assert proc_custom._owns_runtime_dir is False
+    assert proc1._owns_runtime_dir is True
+
+    # Stopping proc_custom must NEVER delete the caller-owned directory
+    proc_custom.stop()
+    assert custom_dir.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_server_process_astart_cancellation_calls_stop():
+    """Verify cancellation during astart() triggers stop() and cleans up the process (DV-04)."""
+    cfg = ServerConfig()
+    proc = ServerProcess(cfg, port=8123)
+
+    proc._prepare_launch = MagicMock(return_value=({}, ["dummy_cmd"]))
+    proc._spawn_process = MagicMock()
+    proc.await_until_healthy = AsyncMock(side_effect=asyncio.CancelledError())
+    proc.stop = MagicMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await proc.astart(timeout=5.0)
+
+    proc.stop.assert_called_once()
+
+
+def test_validate_server_ownership_never_signals_ambiguous_pids(tmp_path: Path):
+    """Verify _validate_server_ownership requires matching server.json and rejects ambiguous PIDs (DV-03)."""
+    from opscloud.server.server import _validate_server_ownership
+    import json
+    import os
+
+    # 1. No server.json exists -> MUST return False even if PID is alive
+    current_pid = os.getpid()
+    empty_dir = tmp_path / "empty_runtime"
+    empty_dir.mkdir()
+    assert _validate_server_ownership(empty_dir, current_pid) is False
+
+    # 2. server.json exists but PID differs -> False
+    mismatch_dir = tmp_path / "mismatch_runtime"
+    mismatch_dir.mkdir()
+    (mismatch_dir / "server.json").write_text(json.dumps({"pid": current_pid + 99999, "runtime_dir": str(mismatch_dir)}))
+    assert _validate_server_ownership(mismatch_dir, current_pid) is False
+
+    # 3. server.json exists with PID matching but runtime_dir differs -> False
+    other_dir = tmp_path / "other_runtime"
+    other_dir.mkdir()
+    bad_dir_runtime = tmp_path / "bad_dir_runtime"
+    bad_dir_runtime.mkdir()
+    (bad_dir_runtime / "server.json").write_text(json.dumps({"pid": current_pid, "runtime_dir": str(other_dir)}))
+    assert _validate_server_ownership(bad_dir_runtime, current_pid) is False
+
+
+def test_server_process_stop_escalates_to_killpg_when_descendant_ignores_sigterm():
+    """Verify _stop_process verifies process-group disappearance and escalates to SIGKILL for descendants ignoring SIGTERM (DV-06)."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    if os.name == "nt":
+        pytest.skip("Process groups via killpg are POSIX-only")
+
+    cfg = ServerConfig()
+    proc = ServerProcess(cfg, port=8199)
+
+    # Spawn a process group leader that launches a child descendant ignoring SIGTERM
+    script = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+        "time.sleep(60)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", script], start_new_session=True, text=True)
+    pgid = os.getpgid(p.pid)
+    proc.process = p
+    proc._pgid = pgid
+
+    # Give child descendant time to initialize and register SIG_IGN
+    time.sleep(0.3)
+    assert os.killpg(pgid, 0) is None  # Group is alive
+
+    # Stop should signal SIGTERM, detect group alive, escalate to SIGKILL, and wait for disappearance
+    proc.stop()
+
+    # The entire process group MUST now be dead
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)
+
+
+def test_concurrent_same_port_and_free_port_toctou_resilience():
+    """Verify concurrent same-port instances receive isolated runtime directories and free-port selection works (DV-11)."""
+    import socket
+    from opscloud.server import ServerConfig, ServerProcess, find_free_port
+
+    # 1. find_free_port returns open port
+    p1 = find_free_port()
+    assert isinstance(p1, int) and p1 > 1024
+
+    # 2. Hold a port bound to simulate race/occupation
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        occupied_port = s.getsockname()[1]
+        p2 = find_free_port()
+        # Free port returned must not be the occupied port
+        assert p2 != occupied_port
+
+    # 3. Concurrent same-port instances receive strictly isolated directories
+    cfg = ServerConfig()
+    procs = [ServerProcess(cfg, port=8999) for _ in range(5)]
+    runtime_dirs = {p.runtime_dir for p in procs}
+    instance_ids = {p.instance_id for p in procs}
+
+    # All 5 instances have isolated UUID paths and will never collide on server.pid
+    assert len(runtime_dirs) == 5
+    assert len(instance_ids) == 5
+    for p in procs:
+        assert str(p.port) in str(p.runtime_dir)
+        p.stop()

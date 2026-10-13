@@ -6,18 +6,22 @@ Dismissed on Escape, Enter, or backdrop click.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, ClassVar, Sequence
 
-from rich.text import Text
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.content import Content
+from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from opscloud.ui.widgets.modal_base import OpsModalScreen
 
-class WelcomeDetailPopup(ModalScreen[None]):
+
+class WelcomeDetailPopup(OpsModalScreen[None]):
     """Scrollable popup listing names + descriptions for skills or subagents."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
 
     BINDINGS = [
         Binding("escape", "dismiss_popup", "Close", show=False),
@@ -25,32 +29,13 @@ class WelcomeDetailPopup(ModalScreen[None]):
     ]
 
     DEFAULT_CSS = """
-    WelcomeDetailPopup {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.70);
-    }
-
-    WelcomeDetailPopup #welcome-detail-outer {
-        width: 72;
-        max-width: 90%;
-        height: auto;
-        max-height: 80%;
-        background: $surface;
-        border: round $primary;
-        padding: 1 2;
-    }
-
     WelcomeDetailPopup #welcome-detail-title {
-        text-style: bold;
-        color: $primary;
-        margin-bottom: 1;
-        height: auto;
+        display: none;
     }
 
     WelcomeDetailPopup #welcome-detail-scroll {
-        height: auto;
-        max-height: 24;
-        scrollbar-size: 1 1;
+        height: 1fr;
+        scrollbar-gutter: stable;
     }
 
     WelcomeDetailPopup .welcome-detail-row {
@@ -59,9 +44,7 @@ class WelcomeDetailPopup(ModalScreen[None]):
     }
 
     WelcomeDetailPopup #welcome-detail-hint {
-        height: auto;
-        margin-top: 1;
-        color: $text-muted;
+        display: none;
     }
     """
 
@@ -80,23 +63,24 @@ class WelcomeDetailPopup(ModalScreen[None]):
         self._title = title
         self._items = list(items)
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="welcome-detail-outer"):
-            yield Static(self._title, id="welcome-detail-title")
-            with VerticalScroll(id="welcome-detail-scroll"):
-                for name, desc in self._items:
-                    text = Text()
-                    text.append(f"  {name}", style="bold cyan")
-                    if desc:
-                        text.append(f"  —  {desc}", style="dim")
-                    yield Static(text, classes="welcome-detail-row")
-            hint = Text()
-            hint.append("\n  Press ", style="dim")
-            hint.append("Esc", style="bold")
-            hint.append(" or ", style="dim")
-            hint.append("Enter", style="bold")
-            hint.append(" to close", style="dim")
-            yield Static(hint, id="welcome-detail-hint")
+    def compose_modal(self) -> ComposeResult:
+        yield Static(self._title, id="welcome-detail-title")
+        with VerticalScroll(id="welcome-detail-scroll"):
+            for name, desc in self._items:
+                desc_part = f"  [dim]—  {escape(desc)}[/dim]" if desc else ""
+                yield Static(
+                    Content.from_markup(f"  [bold $primary]{escape(name)}[/bold $primary]{desc_part}"),
+                    classes="welcome-detail-row",
+                )
+        yield Static("", id="welcome-detail-hint")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.set_modal_title(self._title, counter=f"{len(self._items)} items")
+        self.set_modal_subtitle([
+            ("enter", "close"),
+            ("esc", "close"),
+        ])
 
     def action_dismiss_popup(self) -> None:
         self.dismiss(None)

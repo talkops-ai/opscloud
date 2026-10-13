@@ -19,7 +19,7 @@ class ResumeHandler(BaseCommandHandler):
 
     @property
     def aliases(self) -> tuple[str, ...]:
-        return ("/resume",)
+        return ("/resume", "/continue")
 
     @property
     def category(self) -> CommandCategory:

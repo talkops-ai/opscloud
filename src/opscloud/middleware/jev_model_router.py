@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 import os
+import threading
 from typing import Any, Awaitable, Callable, cast
 
 from langchain.agents.middleware.types import (
@@ -352,8 +353,17 @@ async def _ais_smart_mode(runtime: object, store: object = None) -> bool:
     if store is None:
         store = getattr(runtime, "store", None)
 
-    # 1. Direct flags in context or configurable
+    # 1. Direct explicit opt-out in context or configurable
+    if context.get("smart") is False:
+        return False
+
     raw_mode = context.get("approval_mode")
+    if isinstance(raw_mode, str) and raw_mode.lower() in ("manual", "auto"):
+        return False
+    if raw_mode in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+        return False
+
+    # 2. Direct flags in context or configurable for smart mode
     if (
         context.get("smart") is True
         or (isinstance(raw_mode, str) and raw_mode.lower() in ("smart", "jev"))
@@ -361,22 +371,26 @@ async def _ais_smart_mode(runtime: object, store: object = None) -> bool:
     ):
         return True
 
-    # 2. Check store lookup via approval policy resolver
+    # 3. Check store lookup via approval policy resolver
     try:
         from opscloud.security.approval_mode_source import _aresolve_approval_mode
 
         mode = await _aresolve_approval_mode(context, store)
         if mode == ApprovalMode.SMART:
             return True
+        if mode in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+            return False
     except Exception as exc:
         logger.debug("Failed resolving approval mode asynchronously from store: %s", exc)
 
-    # 3. Explicit mode check on context
+    # 4. Explicit mode check on context
     mode = ApprovalPolicyResolver._extract_explicit_mode(context)
     if mode == ApprovalMode.SMART:
         return True
+    if mode in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+        return False
 
-    # 4. Check global settings
+    # 5. Check global settings fallback only if not explicitly configured
     settings = get_settings()
     if settings is not None:
         if getattr(settings, "approval_mode", None) == "smart" or getattr(settings, "smart", False) is True:
@@ -395,8 +409,17 @@ def _is_smart_mode_sync(runtime: object, store: object = None) -> bool:
     if store is None:
         store = getattr(runtime, "store", None)
 
-    # 1. Direct flags in context or configurable
+    # 1. Direct explicit opt-out in context or configurable
+    if context.get("smart") is False:
+        return False
+
     raw_mode = context.get("approval_mode")
+    if isinstance(raw_mode, str) and raw_mode.lower() in ("manual", "auto"):
+        return False
+    if raw_mode in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+        return False
+
+    # 2. Direct flags in context or configurable for smart mode
     if (
         context.get("smart") is True
         or (isinstance(raw_mode, str) and raw_mode.lower() in ("smart", "jev"))
@@ -404,22 +427,26 @@ def _is_smart_mode_sync(runtime: object, store: object = None) -> bool:
     ):
         return True
 
-    # 2. Check store lookup via approval policy resolver
+    # 3. Check store lookup via approval policy resolver
     try:
         from opscloud.security.approval_mode_source import _resolve_approval_mode
 
         mode = _resolve_approval_mode(context, store)
         if mode == ApprovalMode.SMART:
             return True
+        if mode in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+            return False
     except Exception as exc:
         logger.debug("Failed resolving approval mode synchronously from store: %s", exc)
 
-    # 3. Explicit mode check on context
+    # 4. Explicit mode check on context
     mode = ApprovalPolicyResolver._extract_explicit_mode(context)
     if mode == ApprovalMode.SMART:
         return True
+    if mode in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+        return False
 
-    # 4. Check global settings
+    # 5. Check global settings fallback only if not explicitly configured
     settings = get_settings()
     if settings is not None:
         if getattr(settings, "approval_mode", None) == "smart" or getattr(settings, "smart", False) is True:
@@ -529,42 +556,79 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         self._subagent_name = subagent_name
         self._explicit_capabilities = list(capabilities) if capabilities else None
 
-        resolved_key = self._api_key
-        if not resolved_key:
-            settings_key = getattr(get_settings(), "typesafe_api_key", None)
-            resolved_key = settings_key or resolve_env_var("TYPESAFE_API_KEY", fallback_names=("JEV_API_KEY",))
-        if resolved_key and "TYPESAFE_API_KEY" not in os.environ:
-            os.environ["TYPESAFE_API_KEY"] = resolved_key
-        elif "TYPESAFE_API_KEY" not in os.environ:
-            # Placeholder prevents TypeSafeClassifier instantiation from failing when no key configured yet
-            os.environ.setdefault("TYPESAFE_API_KEY", "placeholder")
+        self._router: ModelRouterMiddleware | None = None
+        self._router_key: tuple[Any, ...] | None = None
+        self._router_lock = threading.Lock()
 
-        if choices is None:
-            choices = self.pool.get_model_choices(is_subagent=bool(subagent_name))
-
-        self.router = ModelRouterMiddleware(
-            choices=choices,
-            instructions=self._instructions,
+    def _resolved_api_key(self) -> str | None:
+        """Resolve the TypeSafe key without constructing a classifier."""
+        if self._api_key:
+            return self._api_key
+        settings_key = getattr(get_settings(), "typesafe_api_key", None)
+        return settings_key or resolve_env_var(
+            "TYPESAFE_API_KEY",
+            fallback_names=("JEV_API_KEY",),
         )
 
-        if resolved_key and resolved_key != "placeholder":
-            self.router.classifier = TypeSafeClassifier(api_key=resolved_key)
+    def _ensure_router(
+        self,
+        *,
+        base_spec: str | None = None,
+        is_subagent: bool | None = None,
+    ) -> ModelRouterMiddleware:
+        """Lazily create the Jev router only for an active Smart-mode turn."""
+        role_is_subagent = bool(self._subagent_name) if is_subagent is None else is_subagent
+        key: tuple[Any, ...]
+        if self._explicit_choices is not None:
+            key = ("explicit",)
+        else:
+            key = (base_spec, role_is_subagent)
+
+        if self._router is not None and self._router_key == key:
+            return self._router
+
+        with self._router_lock:
+            if self._router is not None and self._router_key == key:
+                return self._router
+
+            choices = self._explicit_choices or self.pool.get_model_choices(
+                base_spec=base_spec,
+                is_subagent=role_is_subagent,
+            )
+            resolved_key = self._resolved_api_key()
+            if resolved_key and "TYPESAFE_API_KEY" not in os.environ:
+                os.environ["TYPESAFE_API_KEY"] = resolved_key
+            elif "TYPESAFE_API_KEY" not in os.environ:
+                # The upstream router constructs its classifier eagerly. Keep
+                # that compatibility workaround off the startup path.
+                os.environ["TYPESAFE_API_KEY"] = "placeholder"
+
+            router = ModelRouterMiddleware(
+                choices=choices,
+                instructions=self._instructions,
+            )
+            if resolved_key and resolved_key != "placeholder":
+                router.classifier = TypeSafeClassifier(api_key=resolved_key)
+
+            self._router = router
+            self._router_key = key
+            return router
 
     @property
     def config(self) -> Any:
-        return self.router.config
+        return self._ensure_router().config
 
     @property
     def models(self) -> dict[str, Any]:
-        return self.router.models
+        return self._ensure_router().models
 
     @property
     def classifier(self) -> TypeSafeClassifier:
-        return self.router.classifier
+        return self._ensure_router().classifier
 
     @classifier.setter
     def classifier(self, value: TypeSafeClassifier) -> None:
-        self.router.classifier = value
+        self._ensure_router().classifier = value
 
     def is_available(self) -> bool:
         """Check whether TypeSafe API credentials are configured."""
@@ -654,16 +718,31 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         """Evaluate task and select model route asynchronously using TypeSafe Jev."""
         if not await _ais_smart_mode(runtime):
             logger.debug("Jev Dynamic Router: smart mode not active; skipping dynamic model routing.")
+            if isinstance(state, Mapping) and (state.get("model_route") is not None or state.get("_dynamic_model_route") is not None):
+                return {
+                    "model_route": None,
+                    "_dynamic_model_route": None,
+                }
             return None
 
         if not self.is_available():
             logger.debug("Smart mode active but TypeSafe API key not configured; skipping dynamic model routing.")
+            if isinstance(state, Mapping) and (state.get("model_route") is not None or state.get("_dynamic_model_route") is not None):
+                return {
+                    "model_route": None,
+                    "_dynamic_model_route": None,
+                }
             return None
 
         user_msg = self._latest_human_message(state)
         user_text = user_msg.content if isinstance(user_msg.content, str) else str(user_msg.content)
         if not user_text.strip():
             logger.debug("Jev Dynamic Router: no user message found in state; skipping dynamic routing.")
+            if isinstance(state, Mapping) and (state.get("model_route") is not None or state.get("_dynamic_model_route") is not None):
+                return {
+                    "model_route": None,
+                    "_dynamic_model_route": None,
+                }
             return None
 
         try:
@@ -678,21 +757,10 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
                 or ctx.get("subagent_name")
             )
 
-            # Dynamically build question choices out of the model pool for the active base_spec and role if not explicitly hardcoded
-            if self._explicit_choices is None:
-                active_choices = self.pool.get_model_choices(
-                    base_spec=base_spec,
-                    is_subagent=is_subagent,
-                )
-                from langchain_typesafe.experimental.middleware.model_router import _ModelRouterConfig
-
-                self.router.config = _ModelRouterConfig.model_validate(
-                    {"choices": active_choices, "instructions": self._instructions}
-                )
-                self.router.models = {
-                    route: _resolve_chat_model(choice.model)
-                    for route, choice in active_choices.items()
-                }
+            router = self._ensure_router(
+                base_spec=base_spec,
+                is_subagent=is_subagent,
+            )
 
             routing_state = _build_jev_routing_state(
                 user_msg=user_msg,
@@ -707,9 +775,9 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
                 _routing_questions,
             )
 
-            if hasattr(self.router, "abefore_agent") and type(self.router.abefore_agent).__name__ in ("AsyncMock", "MagicMock"):
+            if hasattr(router, "abefore_agent") and type(router.abefore_agent).__name__ in ("AsyncMock", "MagicMock"):
                 routing_res = await asyncio.wait_for(
-                    self.router.abefore_agent(cast(Any, routing_state), runtime),
+                    router.abefore_agent(cast(Any, routing_state), runtime),
                     timeout=self.timeout_seconds,
                 )
                 choice_answer: ChoiceAnswer = routing_res["model_route"]
@@ -718,11 +786,11 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
                     ClassifierRequest,
                     {
                         "state": routing_state,
-                        "questions": _routing_questions(self.router.config),
+                        "questions": _routing_questions(router.config),
                     },
                 )
                 res = await asyncio.wait_for(
-                    self.router.classifier.ainvoke(classification_payload),
+                    router.classifier.ainvoke(classification_payload),
                     timeout=self.timeout_seconds,
                 )
                 choice_answer: ChoiceAnswer = res.choices[_QUESTION_ID]
@@ -817,6 +885,11 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
                 "Jev Dynamic Router: classification failed (%s); falling back to base model",
                 exc,
             )
+            if isinstance(state, Mapping) and (state.get("model_route") is not None or state.get("_dynamic_model_route") is not None):
+                return {
+                    "model_route": None,
+                    "_dynamic_model_route": None,
+                }
             return None
 
     def before_agent(
@@ -826,6 +899,11 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
     ) -> dict[str, Any] | None:
         """Synchronous version of before_agent."""
         if not _is_smart_mode_sync(runtime) or not self.is_available():
+            if isinstance(state, Mapping) and (state.get("model_route") is not None or state.get("_dynamic_model_route") is not None):
+                return {
+                    "model_route": None,
+                    "_dynamic_model_route": None,
+                }
             return None
 
         try:
@@ -849,11 +927,12 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
     ) -> ModelResponse[ResponseT] | ExtendedModelResponse[ResponseT]:
         """Apply dynamic model and reasoning effort parameters to the outgoing model call."""
         runtime = getattr(request, "runtime", None)
+        if not await _ais_smart_mode(runtime):
+            return await handler(request)
+
         route_answer = request.state.get("model_route") if isinstance(request.state, dict) else None
         dyn_route = request.state.get("_dynamic_model_route") if isinstance(request.state, dict) else None
-
-        is_smart = (route_answer is not None) or (dyn_route is not None) or await _ais_smart_mode(runtime)
-        if not is_smart:
+        if route_answer is None and dyn_route is None:
             return await handler(request)
 
         selected_route = None
@@ -864,14 +943,24 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         elif dyn_route and isinstance(dyn_route, dict):
             selected_route = TIER_TO_ROUTE_MAP.get(dyn_route.get("tier", 1))
 
-        if not selected_route or selected_route not in self.models:
-            selected_route = "standard" if "standard" in self.models else next(iter(self.models.keys()))
-
-        selected_model = self.models[selected_route]
-        tier = ROUTE_TO_TIER_MAP.get(selected_route, 1)
-
         ctx = _extract_runtime_context(runtime)
         base_spec = self._get_base_spec(ctx)
+        is_subagent = bool(
+            self._subagent_name is not None
+            or ctx.get("ls_agent_type") == "subagent"
+            or ctx.get("checkpoint_ns")
+            or ctx.get("subagent_transcript_id")
+            or ctx.get("subagent_name")
+        )
+        models = self._ensure_router(
+            base_spec=base_spec,
+            is_subagent=is_subagent,
+        ).models
+        if not selected_route or selected_route not in models:
+            selected_route = "standard" if "standard" in models else next(iter(models))
+
+        selected_model = models[selected_route]
+        tier = ROUTE_TO_TIER_MAP.get(selected_route, 1)
         chat_model, selected_spec, final_effort, native_settings = self.pool.get_model_for_tier(
             tier,
             base_spec=base_spec,
@@ -885,13 +974,6 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             tier,
         )
 
-        is_subagent = bool(
-            self._subagent_name is not None
-            or ctx.get("ls_agent_type") == "subagent"
-            or ctx.get("checkpoint_ns")
-            or ctx.get("subagent_transcript_id")
-            or ctx.get("subagent_name")
-        )
         provider, model_name = _split_spec(selected_spec)
         event_payload = {
             "type": "model_routed",
@@ -933,11 +1015,12 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
     ) -> ModelResponse[ResponseT] | ExtendedModelResponse[ResponseT]:
         """Synchronous model call wrapper."""
         runtime = getattr(request, "runtime", None)
+        if not _is_smart_mode_sync(runtime):
+            return handler(request)
+
         route_answer = request.state.get("model_route") if isinstance(request.state, dict) else None
         dyn_route = request.state.get("_dynamic_model_route") if isinstance(request.state, dict) else None
-
-        is_smart = (route_answer is not None) or (dyn_route is not None) or _is_smart_mode_sync(runtime)
-        if not is_smart:
+        if route_answer is None and dyn_route is None:
             return handler(request)
 
         selected_route = None
@@ -948,14 +1031,24 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
         elif dyn_route and isinstance(dyn_route, dict):
             selected_route = TIER_TO_ROUTE_MAP.get(dyn_route.get("tier", 1))
 
-        if not selected_route or selected_route not in self.models:
-            selected_route = "standard" if "standard" in self.models else next(iter(self.models.keys()))
-
-        selected_model = self.models[selected_route]
-        tier = ROUTE_TO_TIER_MAP.get(selected_route, 1)
-
         ctx = _extract_runtime_context(runtime)
         base_spec = self._get_base_spec(ctx)
+        is_subagent = bool(
+            self._subagent_name is not None
+            or ctx.get("ls_agent_type") == "subagent"
+            or ctx.get("checkpoint_ns")
+            or ctx.get("subagent_transcript_id")
+            or ctx.get("subagent_name")
+        )
+        models = self._ensure_router(
+            base_spec=base_spec,
+            is_subagent=is_subagent,
+        ).models
+        if not selected_route or selected_route not in models:
+            selected_route = "standard" if "standard" in models else next(iter(models))
+
+        selected_model = models[selected_route]
+        tier = ROUTE_TO_TIER_MAP.get(selected_route, 1)
         chat_model, selected_spec, final_effort, native_settings = self.pool.get_model_for_tier(
             tier,
             base_spec=base_spec,
@@ -969,13 +1062,6 @@ class JevDynamicModelRouterMiddleware(AgentMiddleware[Any, Any]):
             tier,
         )
 
-        is_subagent = bool(
-            self._subagent_name is not None
-            or ctx.get("ls_agent_type") == "subagent"
-            or ctx.get("checkpoint_ns")
-            or ctx.get("subagent_transcript_id")
-            or ctx.get("subagent_name")
-        )
         provider, model_name = _split_spec(selected_spec)
         event_payload = {
             "type": "model_routed",

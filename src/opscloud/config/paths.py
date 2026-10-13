@@ -198,6 +198,7 @@ RELOADABLE_FIELDS: Final[frozenset[str]] = frozenset(
         "shell_allow_list",
         "theme",
         "read_project_dotenv",
+        "agent_pool",
     }
 )
 

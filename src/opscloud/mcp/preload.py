@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
 import fnmatch
 import hashlib
+import json
 import os
+from pathlib import Path
 import re
+import tempfile
+import threading
+import time
 from typing import Any
+
+try:
+    from filelock import FileLock
+except ImportError:  # pragma: no cover - dependency is declared by the project
+    FileLock = None  # type: ignore[assignment,misc]
 
 from opscloud.mcp.config import resolve_mcp_server_env, sync_mcp_env_aliases
 from opscloud.mcp.mcp_info import MCPServerInfo, MCPServerStatus, MCPToolInfo
@@ -24,6 +34,17 @@ _MAX_CONCURRENT_PROBES = 8
 _MCP_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _MCP_TOOL_NAME_MAX_LENGTH = 64
 _MCP_TOOL_NAME_HASH_LENGTH = 12
+
+
+def _config_fingerprint(config: Mapping[str, Any]) -> str:
+    """Return a stable digest so same-name config changes invalidate metadata."""
+    payload = json.dumps(
+        dict(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _mcp_tool_name(server_name: str, tool_name: str) -> str:
@@ -412,6 +433,176 @@ async def probe_one_mcp_server(
 
 
 _PROBED_CACHE: dict[str, MCPServerInfo] = {}
+_PROBED_CONFIG_FINGERPRINTS: dict[str, str] = {}
+_PERSISTED_ENTRIES: dict[str, dict[str, Any]] = {}
+_PERSISTENT_CACHE_LOADED = False
+_CACHE_LOCK = threading.RLock()
+_PERSISTENT_CACHE_VERSION = 1
+_DEFAULT_METADATA_CACHE_TTL = 24 * 60 * 60
+
+
+def _persistent_cache_enabled() -> bool:
+    if os.environ.get("OPSCLOUD_MCP_METADATA_CACHE_DISABLED") == "1":
+        return False
+    return not (
+        os.environ.get("PYTEST_CURRENT_TEST")
+        and not os.environ.get("OPSCLOUD_MCP_METADATA_CACHE")
+    )
+
+
+def _metadata_cache_path() -> Path:
+    override = os.environ.get("OPSCLOUD_MCP_METADATA_CACHE")
+    if override:
+        return Path(override).expanduser()
+    from opscloud.config.paths import STATE_DIR
+
+    return STATE_DIR / "mcp_metadata_cache.json"
+
+
+def _persistent_file_lock() -> Any:
+    """Return an inter-process lock for cache read/merge/write operations."""
+    if FileLock is None:
+        return nullcontext()
+    return FileLock(f"{_metadata_cache_path()}.lock", timeout=5)
+
+
+def _ensure_persistent_cache_loaded() -> None:
+    """Load the schema cache once without ever loading credentials from disk."""
+    global _PERSISTENT_CACHE_LOADED
+    if not _persistent_cache_enabled():
+        return
+    if _PERSISTENT_CACHE_LOADED:
+        return
+    with _CACHE_LOCK:
+        if _PERSISTENT_CACHE_LOADED:
+            return
+        _PERSISTENT_CACHE_LOADED = True
+        try:
+            with _persistent_file_lock():
+                payload = json.loads(_metadata_cache_path().read_text(encoding="utf-8"))
+                if payload.get("version") != _PERSISTENT_CACHE_VERSION:
+                    return
+                entries = payload.get("entries")
+                if isinstance(entries, dict):
+                    _PERSISTED_ENTRIES.update(
+                        (str(name), entry)
+                        for name, entry in entries.items()
+                        if isinstance(entry, dict)
+                    )
+        except (OSError, ValueError, TypeError, TimeoutError):
+            return
+
+
+def _server_info_from_persisted(
+    name: str,
+    config: Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> MCPServerInfo | None:
+    info = entry.get("info")
+    if not isinstance(info, Mapping) or info.get("status") != "ok":
+        return None
+    raw_tools = info.get("tools")
+    tools: list[MCPToolInfo] = []
+    if isinstance(raw_tools, list):
+        for raw_tool in raw_tools:
+            if not isinstance(raw_tool, Mapping) or not raw_tool.get("name"):
+                continue
+            schema = raw_tool.get("input_schema")
+            tools.append(
+                MCPToolInfo(
+                    name=str(raw_tool["name"]),
+                    description=str(raw_tool.get("description") or ""),
+                    input_schema=dict(schema) if isinstance(schema, Mapping) else {},
+                    original_name=(
+                        str(raw_tool["original_name"])
+                        if raw_tool.get("original_name") is not None
+                        else None
+                    ),
+                )
+            )
+
+    raw_disabled = config.get("disabled_tools") or config.get("disabledTools") or ()
+    raw_allowed = config.get("allowed_tools") or config.get("allowedTools") or ()
+    return MCPServerInfo(
+        name=name,
+        transport=_resolve_transport(config),
+        status="ok",
+        tools=tuple(tools),
+        enabled=bool(config.get("enabled", True)),
+        source=str(config.get("source", "project")),
+        url=config.get("url") or config.get("serverUrl"),
+        command=config.get("command"),
+        args=tuple(config.get("args") or ()),
+        headers=dict(config.get("headers") or {}),
+        env=dict(config.get("env") or {}),
+        disabled_tools=tuple(raw_disabled) if isinstance(raw_disabled, (list, tuple)) else (),
+        allowed_tools=tuple(raw_allowed) if isinstance(raw_allowed, (list, tuple)) else (),
+    )
+
+
+def _record_persisted_entry(
+    info: MCPServerInfo,
+    fingerprint: str,
+) -> None:
+    if info.status != "ok":
+        return
+    _PERSISTED_ENTRIES[info.name] = {
+        "fingerprint": fingerprint,
+        "cached_at": time.time(),
+        "info": {
+            "status": info.status,
+            "tools": [tool.to_dict() for tool in info.tools],
+        },
+    }
+
+
+def _write_persistent_cache() -> None:
+    """Atomically persist only fingerprints and non-secret tool schemas."""
+    if not _persistent_cache_enabled():
+        return
+    with _CACHE_LOCK:
+        path = _metadata_cache_path()
+        temp_path: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with _persistent_file_lock():
+                disk_entries: dict[str, Any] = {}
+                try:
+                    disk_payload = json.loads(path.read_text(encoding="utf-8"))
+                    raw_entries = disk_payload.get("entries")
+                    if isinstance(raw_entries, dict):
+                        disk_entries = {
+                            str(name): entry
+                            for name, entry in raw_entries.items()
+                            if isinstance(entry, dict)
+                        }
+                except (OSError, ValueError, TypeError):
+                    pass
+                # Entries generated by this process win over stale disk data,
+                # while unrelated entries from another process are preserved.
+                disk_entries.update(_PERSISTED_ENTRIES)
+                payload = {
+                    "version": _PERSISTENT_CACHE_VERSION,
+                    "entries": disk_entries,
+                }
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                    temp_path = Path(handle.name)
+                os.replace(temp_path, path)
+        except (OSError, TimeoutError) as exc:
+            logger.debug("Could not persist MCP metadata cache: %s", exc)
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def get_cached_mcp_server_infos() -> list[MCPServerInfo]:
@@ -419,19 +610,70 @@ def get_cached_mcp_server_infos() -> list[MCPServerInfo]:
     return list(_PROBED_CACHE.values())
 
 
-def set_cached_mcp_server_info(info: MCPServerInfo) -> None:
-    """Store or update a probed MCPServerInfo in the cache."""
+def is_mcp_server_info_cached(
+    name: str,
+    config: Mapping[str, Any],
+) -> bool:
+    """Return whether memory or persistent metadata matches this config."""
+    fingerprint = _config_fingerprint(config)
+    if (
+        name in _PROBED_CACHE
+        and _PROBED_CONFIG_FINGERPRINTS.get(name) == fingerprint
+    ):
+        return True
+
+    _ensure_persistent_cache_loaded()
+    entry = _PERSISTED_ENTRIES.get(name)
+    if not isinstance(entry, Mapping) or entry.get("fingerprint") != fingerprint:
+        return False
+    try:
+        ttl = float(
+            os.environ.get(
+                "OPSCLOUD_MCP_METADATA_CACHE_TTL",
+                str(_DEFAULT_METADATA_CACHE_TTL),
+            )
+        )
+        cached_at = float(entry.get("cached_at", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if ttl >= 0 and time.time() - cached_at > ttl:
+        return False
+
+    info = _server_info_from_persisted(name, config, entry)
+    if info is None:
+        return False
+    _PROBED_CACHE[name] = info
+    _PROBED_CONFIG_FINGERPRINTS[name] = fingerprint
+    return True
+
+
+def set_cached_mcp_server_info(
+    info: MCPServerInfo,
+    config: Mapping[str, Any] | None = None,
+) -> None:
+    """Store or update a probed server and its configuration identity."""
     _PROBED_CACHE[info.name] = info
+    if config is not None:
+        fingerprint = _config_fingerprint(config)
+        _PROBED_CONFIG_FINGERPRINTS[info.name] = fingerprint
+        with _CACHE_LOCK:
+            _record_persisted_entry(info, fingerprint)
 
 
 def evict_cached_mcp_server_info(name: str) -> None:
     """Evict a cached MCPServerInfo so it can be probed fresh."""
     _PROBED_CACHE.pop(name, None)
+    _PROBED_CONFIG_FINGERPRINTS.pop(name, None)
+    _PERSISTED_ENTRIES.pop(name, None)
 
 
 def clear_cached_mcp_server_infos() -> None:
-    """Clear all cached MCPServerInfo entries."""
+    """Clear process metadata and prevent stale disk rehydration this run."""
+    global _PERSISTENT_CACHE_LOADED
     _PROBED_CACHE.clear()
+    _PROBED_CONFIG_FINGERPRINTS.clear()
+    _PERSISTED_ENTRIES.clear()
+    _PERSISTENT_CACHE_LOADED = True
 
 
 async def preload_mcp_metadata(
@@ -443,14 +685,22 @@ async def preload_mcp_metadata(
     async def _bound_probe(name: str, conf: Mapping[str, Any]) -> MCPServerInfo:
         async with semaphore:
             info = await probe_one_mcp_server(name, conf)
-            set_cached_mcp_server_info(info)
+            set_cached_mcp_server_info(info, conf)
             return info
 
-    tasks = [_bound_probe(name, conf) for name, conf in configs.items()]
-    if not tasks:
-        return []
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-    return list(results)
+    tasks = [
+        _bound_probe(name, conf)
+        for name, conf in configs.items()
+        if not is_mcp_server_info_cached(name, conf)
+    ]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=False)
+        _write_persistent_cache()
+    return [
+        _PROBED_CACHE[name]
+        for name in configs
+        if name in _PROBED_CACHE
+    ]
 
 
 def format_mcp_status_response(server_infos: list[MCPServerInfo]) -> dict[str, Any]:
@@ -518,6 +768,7 @@ __all__ = [
     "evict_cached_mcp_server_info",
     "format_mcp_status_response",
     "get_cached_mcp_server_infos",
+    "is_mcp_server_info_cached",
     "preload_mcp_metadata",
     "preload_mcp_server_info",
     "probe_one_mcp_server",

@@ -56,9 +56,10 @@ class CommandResult:
         push_screen: str | None = None,
         notify: str | None = None,
         notify_severity: NotifySeverity = "information",
+        feedback_message: str | None = None,
     ) -> None:
         self.success = success
-        self.message = message
+        self.message = message if message is not None else feedback_message
         self.data = data if data is not None else {}
         self.mount_as_app_message = mount_as_app_message
         self.push_screen = push_screen

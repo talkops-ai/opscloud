@@ -5,81 +5,157 @@ Provides an interactive modal screen to browse, search, resume, create, and dele
 
 from __future__ import annotations
 
-from opscloud.utils.logger import get_logger
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from textual import events
+from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
+from rich.cells import cell_len
+from rich.markup import escape
+
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen
+from opscloud.utils.logger import get_logger
+
 logger = get_logger(__name__)
 
-DELETE_KEYS = ("ctrl+d", "delete", "backspace", "d")
+# Safe: deletion is an explicit command, never normal text editing.
+DELETE_KEYS = ("ctrl+d",)
+
+
+def _format_relative_time(timestamp: Any) -> str:
+    """Format timestamp into human-readable relative time."""
+    if not timestamp:
+        return ""
+    try:
+        now = datetime.now(timezone.utc)
+        if isinstance(timestamp, (int, float)):
+            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        elif isinstance(timestamp, str):
+            clean_str = timestamp.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(clean_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        elif isinstance(timestamp, datetime):
+            dt = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+        else:
+            return str(timestamp)
+
+        diff = (now - dt).total_seconds()
+        if diff < 60:
+            return "just now"
+        elif diff < 3600:
+            mins = int(diff / 60)
+            return f"{mins}m ago"
+        elif diff < 86400:
+            hours = int(diff / 3600)
+            return f"{hours}h ago"
+        elif diff < 172800:
+            return "yesterday"
+        else:
+            days = int(diff / 86400)
+            return f"{days}d ago"
+    except Exception:
+        return ""
 
 
 class CustomOptionList(OptionList):
-    """Custom OptionList that intercepts mouse click position, hover, and delete keys."""
+    """Thread result list."""
 
     last_click_x: int | None = None
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         self.last_click_x = event.x
 
-    async def _on_key(self, event: events.Key) -> None:
-        if event.key in DELETE_KEYS:
-            try:
-                screen = self.screen
-                if isinstance(screen, ThreadSelectorScreen):
-                    screen.action_delete_thread()
-                    event.prevent_default()
-                    event.stop()
-                    return
-            except Exception:
-                pass
-        await super()._on_key(event)
-
 
 class SearchInput(Input):
-    """Search input that forwards navigation keys (up/down/enter/delete) to OptionList."""
+    """Search input that forwards result navigation, not editing keys."""
 
     async def _on_key(self, event: events.Key) -> None:
-        if event.key in ("down", "up", "enter", *DELETE_KEYS):
-            try:
-                screen = self.screen
-                if isinstance(screen, ThreadSelectorScreen):
-                    if event.key == "down":
-                        screen.action_cursor_down()
-                        event.prevent_default()
-                        event.stop()
-                        return
-                    elif event.key == "up":
-                        screen.action_cursor_up()
-                        event.prevent_default()
-                        event.stop()
-                        return
-                    elif event.key == "enter":
-                        screen.action_select()
-                        event.prevent_default()
-                        event.stop()
-                        return
-                    elif event.key in DELETE_KEYS:
-                        screen.action_delete_thread()
-                        event.prevent_default()
-                        event.stop()
-                        return
-            except Exception:
-                pass
+        screen = self.screen
+        if isinstance(screen, ThreadSelectorScreen):
+            if event.key == "down":
+                screen.action_cursor_down()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "up":
+                screen.action_cursor_up()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "enter":
+                screen.action_select()
+                event.prevent_default()
+                event.stop()
+                return
+
+        # Textual handles characters, Backspace, Delete, Home, End, and arrows.
         await super()._on_key(event)
 
 
-class ThreadSelectorScreen(ModalScreen[str | None]):
+class DeleteThreadConfirmScreen(OpsModalScreen[bool]):
+    """Confirmation modal before deleting a conversation thread."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
+
+    DEFAULT_CSS = """
+    DeleteThreadConfirmScreen .confirm-message {
+        height: auto;
+        padding: 1 0;
+        text-align: center;
+    }
+
+    DeleteThreadConfirmScreen .confirm-actions {
+        height: auto;
+        align: center middle;
+        padding-top: 1;
+    }
+
+    DeleteThreadConfirmScreen .confirm-actions Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, target_thread_id: str) -> None:
+        super().__init__()
+        self.target_thread_id = target_thread_id
+
+    @property
+    def thread_id(self) -> str:
+        return self.target_thread_id
+
+    def compose_modal(self) -> ComposeResult:
+        yield Static(
+            f"Delete thread {self.target_thread_id[:8]}? This cannot be undone.",
+            classes="confirm-message",
+        )
+        with Horizontal(classes="confirm-actions"):
+            yield Button("Cancel", id="cancel", variant="default")
+            yield Button("Delete", id="confirm", variant="error")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.set_modal_title("Delete Thread")
+        self.set_modal_subtitle([("enter", "choose"), ("esc", "cancel")])
+        self.query_one("#cancel", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm")
+
+
+class ThreadSelectorScreen(OpsModalScreen[str | None]):
     """Modal dialog for browsing, searching, resuming, and deleting threads."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-workspace"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False),
@@ -87,62 +163,42 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         Binding("down", "cursor_down", "Down", show=False, priority=True),
         Binding("enter", "select", "Select", show=False, priority=True),
         Binding("ctrl+d", "delete_thread", "Delete", show=False, priority=True),
-        Binding("delete", "delete_thread", "Delete", show=False, priority=True),
-        Binding("backspace", "delete_thread", "Delete", show=False, priority=True),
-        Binding("d", "delete_thread", "Delete", show=False, priority=True),
     ]
 
     DEFAULT_CSS = """
-    ThreadSelectorScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    ThreadSelectorScreen > Vertical {
-        width: 110;
-        max-width: 95%;
-        height: 85%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
     ThreadSelectorScreen .thread-selector-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     ThreadSelectorScreen SearchInput {
         margin-bottom: 1;
-        border: solid $primary-lighten-2;
+        border: solid $primary 40%;
+    }
+
+    ThreadSelectorScreen SearchInput:focus {
+        border: solid $primary;
     }
 
     ThreadSelectorScreen CustomOptionList {
         height: 1fr;
         background: $background;
-        border: solid $accent;
+        border: solid $primary 20%;
     }
 
     ThreadSelectorScreen CustomOptionList > .option-list--option-highlighted {
-        background: $primary-darken-2;
+        background: $primary 18%;
         color: $text;
         text-style: bold;
     }
 
     ThreadSelectorScreen CustomOptionList > .option-list--option-hover {
-        background: $primary-darken-2;
+        background: $primary 14%;
         color: $text;
         text-style: bold;
     }
 
     ThreadSelectorScreen .thread-selector-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -157,21 +213,61 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         self._current_thread_id = current_thread_id
         self._filter_query = ""
         self._highlighted_index: int = 0
+        self._last_row_width: int | None = None
 
-    def compose(self):
+    def compose_modal(self):
         title = f"Select Thread (current: {self._current_thread_id or 'none'})"
-        with Vertical():
-            yield Static(title, classes="thread-selector-title")
-            yield SearchInput(placeholder="Type to search threads...", id="thread-filter")
-            yield CustomOptionList(*self._build_options(), id="thread-options")
-            yield Static("↑/↓ navigate  •  Enter select  •  Ctrl+D / Delete  •  Esc cancel", classes="thread-selector-help")
+        yield Static(title, classes="thread-selector-title")
+        yield SearchInput(placeholder="Type to search threads...", id="thread-filter")
+        yield CustomOptionList(*self._build_options(), id="thread-options")
+        yield Static(
+            "↑/↓ navigate  •  Enter select  •  Ctrl+D / Delete  •  Esc cancel",
+            classes="thread-selector-help",
+        )
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self._update_modal_chrome()
+        self.call_after_refresh(self._refresh_options, preserve_highlight=True)
+        try:
+            self.query_one("#thread-filter", SearchInput).focus()
+        except Exception:
+            pass
+
+    def on_resize(self) -> None:
+        width = self._get_row_width()
+        if width != self._last_row_width:
+            self._last_row_width = width
+            self.call_after_refresh(self._refresh_options, preserve_highlight=True)
+
+    def _update_modal_chrome(self) -> None:
+        glyphs = get_glyphs()
+        active_str = f"active: {self._current_thread_id[:8]}" if self._current_thread_id else "no active thread"
+        self.set_modal_title("Conversation Threads", counter=f"{len(self._threads)} threads · {active_str}")
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("enter", "resume"),
+            ("ctrl+d", "delete"),
+            ("esc", "cancel"),
+        ])
+
+    def _get_row_width(self) -> int:
+        try:
+            opt_list = self.query_one("#thread-options", CustomOptionList)
+            w = opt_list.scrollable_content_region.width
+            if w > 20:
+                return w
+        except Exception:
+            pass
+        return 82
 
     def _build_options(self) -> list[Option]:
+        width = self._get_row_width()
         options = [Option("+ Start New Thread", id="__new__")]
         for idx, t in enumerate(self._threads, start=1):
             tid = t.get("thread_id", "unknown")
             msg_cnt = t.get("message_count", 0)
-            init_prompt = t.get("initial_prompt") or "(No initial prompt)"
+            init_prompt = (t.get("initial_prompt") or "(No initial prompt)").replace("\n", " ")
 
             # Apply filter query
             if self._filter_query:
@@ -179,22 +275,42 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
                 if q not in tid.lower() and q not in init_prompt.lower():
                     continue
 
-            is_curr = " (active)" if tid == self._current_thread_id else ""
+            is_curr = " [bold $success](active)[/bold $success]" if tid == self._current_thread_id else ""
+            is_highlighted = (self._highlighted_index == len(options))
 
-            msg_str = f"{msg_cnt:>3} msgs"
-            tid_short = f"{tid[:8]}"
-            prompt_trunc = init_prompt if len(init_prompt) <= 45 else init_prompt[:42] + "..."
+            short_id = tid[:8]
+            rel_time = _format_relative_time(t.get("updated_at") or t.get("created_at"))
 
-            prefix = f"{msg_str} │ `{tid_short}` │ {prompt_trunc}{is_curr}"
-
-            # Display right-padded [del] text ONLY on hovered/highlighted row
-            if self._highlighted_index == len(options):
-                pad_len = max(2, 70 - len(prefix))
-                label = f"{prefix}{' ' * pad_len}[bold red][del][/bold red]"
+            # Build right-aligned part: [del] on highlighted row, relative time otherwise
+            if is_highlighted:
+                right_markup = " [bold red][del][/bold red]"
+                right_plain = " [del]"
             else:
-                label = prefix
+                right_markup = f" [dim]{rel_time}[/dim]" if rel_time else ""
+                right_plain = f" {rel_time}" if rel_time else ""
 
-            options.append(Option(label, id=tid))
+            left_markup = f"[dim]{msg_cnt:>3} msgs[/dim] │ `{short_id}` │ "
+            left_plain = f"{msg_cnt:>3} msgs │ `{short_id}` │ "
+
+            left_cells = cell_len(left_plain)
+            right_cells = cell_len(right_plain)
+            active_cells = cell_len(" (active)") if is_curr else 0
+
+            # Available budget for the prompt
+            budget = max(10, width - left_cells - right_cells - active_cells - 3)
+            if cell_len(init_prompt) > budget:
+                prompt_trunc = init_prompt[:max(0, budget - 3)] + "..."
+            else:
+                prompt_trunc = init_prompt
+
+            safe_prompt = escape(prompt_trunc)
+            core_markup = f"{left_markup}{safe_prompt}{is_curr}"
+            core_plain = f"{left_plain}{prompt_trunc}{' (active)' if is_curr else ''}"
+
+            gap = max(1, width - cell_len(core_plain) - right_cells - 2)
+            row_markup = f"{core_markup}{' ' * gap}{right_markup}"
+
+            options.append(Option(row_markup, id=tid))
         return options
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -222,8 +338,9 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         try:
             opt_list = self.query_one("#thread-options", CustomOptionList)
-            # Check if mouse click was on the delete action on the right (x >= 40)
-            if opt_list.last_click_x is not None and opt_list.last_click_x >= 40:
+            width = self._get_row_width()
+            # If mouse click was on the [del] action on the far right (within 10 cells of the right edge)
+            if opt_list.last_click_x is not None and opt_list.last_click_x >= (width - 10):
                 opt_list.last_click_x = None
                 self.action_delete_thread()
                 return
@@ -247,13 +364,21 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
     def action_delete_thread(self) -> None:
         try:
             opt_list = self.query_one("#thread-options", CustomOptionList)
-            if opt_list.highlighted is not None:
-                option = opt_list.get_option_at_index(opt_list.highlighted)
-                if option.id and option.id != "__new__":
-                    thread_id_to_delete = option.id
-                    self.run_worker(self._delete_thread_async(thread_id_to_delete))
+            if opt_list.highlighted is None:
+                return
+
+            option = opt_list.get_option_at_index(opt_list.highlighted)
+            thread_id = option.id
+            if not thread_id or thread_id == "__new__":
+                return
+
+            def after_confirm(confirmed: bool | None) -> None:
+                if confirmed:
+                    self.run_worker(self._delete_thread_async(thread_id))
+
+            self.app.push_screen(DeleteThreadConfirmScreen(thread_id), after_confirm)
         except Exception as exc:
-            logger.debug("Failed deleting thread: %s", exc)
+            logger.debug("Failed initiating thread deletion: %s", exc)
 
     async def _delete_thread_async(self, thread_id: str) -> None:
         try:
@@ -352,6 +477,7 @@ class ThreadSelector(Widget):
 
 __all__ = [
     "CustomOptionList",
+    "DeleteThreadConfirmScreen",
     "SearchInput",
     "ThreadSelector",
     "ThreadSelectorScreen",

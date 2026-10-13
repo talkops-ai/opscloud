@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 MAX_ARG_LENGTH = 80
 
@@ -114,21 +114,24 @@ def get_tool_display_name(tool_name: str) -> str:
         return "Tool"
 
     base_name, scope = parse_scoped_tool_name(tool_name)
-    raw_lower = base_name.lower()
-    if raw_lower in _CUSTOM_DISPLAY_NAMES:
-        display = _CUSTOM_DISPLAY_NAMES[raw_lower]
-    else:
-        # Convert snake_case or kebab-case to TitleCase
-        normalized = base_name.replace("-", "_")
-        parts = [part for part in normalized.split("_") if part]
-        if parts:
-            display = "".join(part.capitalize() for part in parts)
-        else:
-            display = base_name.capitalize()
+    display = _base_display_name(base_name)
 
     if scope:
         return f"{display} [{scope}]"
     return display
+
+
+def _base_display_name(base_name: str) -> str:
+    """Display label for an unscoped tool name (override or TitleCase)."""
+    raw_lower = base_name.lower()
+    if raw_lower in _CUSTOM_DISPLAY_NAMES:
+        return _CUSTOM_DISPLAY_NAMES[raw_lower]
+    # Convert snake_case or kebab-case to TitleCase
+    normalized = base_name.replace("-", "_")
+    parts = [part for part in normalized.split("_") if part]
+    if parts:
+        return "".join(part.capitalize() for part in parts)
+    return base_name.capitalize()
 
 
 # ── String & Path Formatting Helpers ───────────────────────
@@ -166,34 +169,59 @@ def abbreviate_path(path_str: str, max_length: int = 60) -> str:
 # ── Smart Tool Display Formatter ───────────────────────────
 
 
-def format_tool_display(
+class ToolDisplayParts(NamedTuple):
+    """Structured pieces of a tool-call header, for styled rendering.
+
+    Attributes:
+        name: Display label without the scope tag (e.g. ``"Execute"``).
+        scope: Plugin / MCP server / subagent scope, if the tool is scoped.
+        detail: Human-readable argument summary, without the legacy
+            parentheses or quotes (e.g. ``kubectl get pods``).
+        kind: Which heuristic produced ``detail``: ``task``, ``ask``,
+            ``path``, ``query``, ``command``, ``code``, ``url``, ``text``,
+            ``count``, ``value`` or ``none``.
+    """
+
+    name: str
+    scope: str | None
+    detail: str
+    kind: str
+
+
+_QUOTED_KINDS = frozenset({"command", "code", "url", "text"})
+"""Kinds whose ``detail`` the legacy header string wraps in quotes."""
+
+
+def format_tool_parts(
     tool_name: str,
     tool_args: dict[str, Any] | None = None,
-    prefix: str = "●",
-) -> str:
-    """Format any tool call into a clean Claude Code style header string.
+) -> ToolDisplayParts:
+    """Split a tool call into display name, scope and argument summary.
 
-    Automatically handles known tools as well as arbitrary future tools via
-    generic parameter inspection heuristics.
+    Uses the same heuristics as `format_tool_display` (which is built on top
+    of this), so the two never disagree about what a call is doing.
 
     Examples:
-        read_file(file_path="README.md") -> "● Read(README.md)"
-        deploy_helm_chart(chart="nginx") -> '● DeployHelmChart("nginx")'
+        execute(command="kubectl get pods") -> ("Execute", None, "kubectl get pods", "command")
+        read_file(file_path="README.md") -> ("Read", None, "README.md", "path")
     """
     args = tool_args or {}
     raw_name = tool_name if (tool_name and tool_name != "None") else "tool"
     base_name, scope = parse_scoped_tool_name(raw_name)
-    display_name = get_tool_display_name(raw_name)
+    name = _base_display_name(base_name)
+
+    def parts(detail: str, kind: str) -> ToolDisplayParts:
+        return ToolDisplayParts(name, scope, detail, kind)
 
     # 1. Dedicated formatters for core agent tools
     if base_name in {"task"}:
         sub_name = args.get("subagent_type") or args.get("agent_name") or args.get("subagent") or "subagent"
-        return f"{prefix} {display_name} [{sub_name}]"
+        return parts(str(sub_name), "task")
 
-    elif base_name == "ask_user":
+    if base_name == "ask_user":
         qs = args.get("questions")
         q_count = len(qs) if isinstance(qs, list) else 1
-        return f"{prefix} {display_name}({q_count} question{'s' if q_count > 1 else ''})"
+        return parts(f"{q_count} question{'s' if q_count > 1 else ''}", "ask")
 
     # 2. Generic Parameter Inspection Heuristics (Extensible for ANY tool)
     path_val = (
@@ -211,43 +239,60 @@ def format_tool_display(
     scope_val = args.get("search_path") or args.get("directory") or args.get("path")
 
     if path_val is not None and not query_val:
-        path_str = abbreviate_path(str(path_val))
-        return f"{prefix} {display_name}({path_str})"
+        return parts(abbreviate_path(str(path_val)), "path")
 
-    elif query_val is not None:
+    if query_val is not None:
         q_str = truncate_value(str(query_val).splitlines()[0] if str(query_val) else "", max_length=50)
         scope_str = f" in {abbreviate_path(str(scope_val))}" if scope_val else ""
-        return f'{prefix} {display_name}("{q_str}"{scope_str})'
+        return parts(f'"{q_str}"{scope_str}', "query")
 
-    elif cmd_val is not None:
+    if cmd_val is not None:
         first_line = str(cmd_val).strip().splitlines()[0] if str(cmd_val).strip() else ""
-        cmd_str = truncate_value(first_line, max_length=60)
-        return f'{prefix} {display_name}("{cmd_str}")'
+        return parts(truncate_value(first_line, max_length=60), "command")
 
-    elif code_val is not None:
+    if code_val is not None:
         first_line = str(code_val).strip().splitlines()[0] if str(code_val).strip() else ""
-        code_str = truncate_value(first_line, max_length=40)
-        return f'{prefix} {display_name}("{code_str}")'
+        return parts(truncate_value(first_line, max_length=40), "code")
 
-    elif url_val is not None:
-        u_str = truncate_value(str(url_val), max_length=60)
-        return f'{prefix} {display_name}("{u_str}")'
+    if url_val is not None:
+        return parts(truncate_value(str(url_val), max_length=60), "url")
 
     # 3. Fallback for any tool with arguments
     if args:
-        first_key, first_val = next(iter(args.items()))
+        _first_key, first_val = next(iter(args.items()))
         if isinstance(first_val, str):
             first_line = first_val.strip().splitlines()[0] if first_val.strip() else ""
-            val_str = truncate_value(first_line, max_length=40)
-            return f'{prefix} {display_name}("{val_str}")'
-        elif isinstance(first_val, list):
-            return f"{prefix} {display_name}({len(first_val)} items)"
-        elif isinstance(first_val, dict):
-            return f"{prefix} {display_name}({len(first_val)} keys)"
-        val_str = truncate_value(str(first_val), max_length=40)
-        return f"{prefix} {display_name}({val_str})"
+            return parts(truncate_value(first_line, max_length=40), "text")
+        if isinstance(first_val, list):
+            return parts(f"{len(first_val)} items", "count")
+        if isinstance(first_val, dict):
+            return parts(f"{len(first_val)} keys", "count")
+        return parts(truncate_value(str(first_val), max_length=40), "value")
 
-    return f"{prefix} {display_name}()"
+    return parts("", "none")
+
+
+def format_tool_display(
+    tool_name: str,
+    tool_args: dict[str, Any] | None = None,
+    prefix: str = "●",
+) -> str:
+    """Format any tool call into a clean Claude Code style header string.
+
+    Automatically handles known tools as well as arbitrary future tools via
+    generic parameter inspection heuristics.
+
+    Examples:
+        read_file(file_path="README.md") -> "● Read(README.md)"
+        deploy_helm_chart(chart="nginx") -> '● DeployHelmChart("nginx")'
+    """
+    p = format_tool_parts(tool_name, tool_args)
+    display_name = f"{p.name} [{p.scope}]" if p.scope else p.name
+    if p.kind == "task":
+        return f"{prefix} {display_name} [{p.detail}]"
+    if p.kind in _QUOTED_KINDS:
+        return f'{prefix} {display_name}("{p.detail}")'
+    return f"{prefix} {display_name}({p.detail})"
 
 
 # ── Smart Tool Result Summary Formatter ────────────────────
@@ -275,22 +320,22 @@ def format_tool_result_summary(tool_name: str, result: str) -> str:
 
     # Core tool specific formatters
     if raw_lower in {"read_file", "view_file", "read"}:
-        return f"⎿ Read {line_count} lines"
+        return f"⎿ Read {_plural(line_count, 'line')}"
     elif raw_lower in {"ls", "list_dir", "glob"}:
         if result.startswith("[") and result.endswith("]"):
             try:
                 items = json.loads(result.replace("'", '"'))
                 if isinstance(items, list):
-                    return f"⎿ {len(items)} items found"
+                    return f"⎿ {_plural(len(items), 'item')} found"
             except Exception:
                 pass
-        return f"⎿ {len(lines)} items found"
+        return f"⎿ {_plural(len(lines), 'item')} found"
     elif raw_lower in {"grep", "search"}:
-        return f"⎿ {len(lines)} matches found"
+        return f"⎿ {_plural(len(lines), 'match', 'matches')} found"
     elif raw_lower in {"execute", "exec", "bash"}:
-        return f"⎿ Command output ({line_count} lines)"
+        return f"⎿ Command output ({_plural(line_count, 'line')})"
     elif raw_lower in {"edit_file", "write_file", "edit", "write"}:
-        return f"⎿ Wrote {line_count} lines"
+        return f"⎿ Wrote {_plural(line_count, 'line')}"
 
     # Generic Fallback Heuristics for ANY future tool output
     trimmed = result.strip()
@@ -312,10 +357,18 @@ def format_tool_result_summary(tool_name: str, result: str) -> str:
     return f"⎿ {truncate_value(trimmed, max_length=50)}"
 
 
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    """``1 match`` / ``3 matches``."""
+    word = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {word}"
+
+
 __all__ = [
     "MAX_ARG_LENGTH",
+    "ToolDisplayParts",
     "abbreviate_path",
     "format_tool_display",
+    "format_tool_parts",
     "format_tool_result_summary",
     "get_tool_display_name",
     "parse_scoped_tool_name",

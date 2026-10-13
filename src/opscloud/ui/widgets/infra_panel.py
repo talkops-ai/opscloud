@@ -18,6 +18,8 @@ from textual.containers import VerticalScroll
 from textual.widget import Widget
 from textual.widgets import Button, Static
 
+from opscloud.ui.context_detection import detect_production
+
 
 class InfraStatePanel(Widget):
     """Infrastructure context sidebar panel."""
@@ -95,9 +97,12 @@ class InfraStatePanel(Widget):
 
         tf_workspace = os.environ.get("TF_WORKSPACE", "default")
 
-        is_prod = any(
-            "prod" in val.lower() or "production" in val.lower()
-            for val in (aws_profile, k8s_ctx, tf_workspace, git_branch)
+        # Shared definition of "production"; git branches are not consulted.
+        is_prod = (
+            detect_production(
+                aws_profile=aws_profile, k8s_context=k8s_ctx, tf_workspace=tf_workspace
+            )
+            is not None
         )
 
         return {

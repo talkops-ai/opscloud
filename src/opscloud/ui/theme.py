@@ -137,6 +137,29 @@ DC_LIGHT_STATUS_DANGER = "#dc2626"
 _HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
+def blend_hex(color: str, base: str, amount: float) -> str:
+    """Return ``color`` mixed into ``base`` by ``amount`` (0 = base, 1 = color).
+
+    Used to derive subtle theme-aware tints, e.g. a chip background that is
+    25% accent over the current background. Invalid inputs return ``color``.
+
+    Args:
+        color: Foreground hex colour (``#RRGGBB``).
+        base: Background hex colour (``#RRGGBB``).
+        amount: Mix ratio in ``[0, 1]``.
+
+    Returns:
+        Blended ``#RRGGBB`` hex string.
+    """
+    if not (_HEX_RE.match(color or "") and _HEX_RE.match(base or "")):
+        return color
+    amount = max(0.0, min(1.0, amount))
+    c = [int(color[i : i + 2], 16) for i in (1, 3, 5)]
+    b = [int(base[i : i + 2], 16) for i in (1, 3, 5)]
+    mixed = [round(bv + (cv - bv) * amount) for cv, bv in zip(c, b)]
+    return "#{:02X}{:02X}{:02X}".format(*mixed)
+
+
 @dataclass(frozen=True, slots=True)
 class ThemeColors:
     """Complete set of semantic colors for one theme variant."""

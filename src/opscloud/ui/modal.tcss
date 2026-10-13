@@ -1,0 +1,172 @@
+/* Modal dialog container and screen */
+
+OpsModalScreen {
+    align: center middle;
+    background: $background 70%;
+}
+
+/* Content-hugging is the safe default. */
+ModalDialog,
+.ops-modal-dialog {
+    width: 88;
+    max-width: 95%;
+    height: auto;
+    max-height: 85vh;
+    min-height: 12;
+    background: $surface;
+    border: round $primary 70%;
+    border-title-color: $primary;
+    border-title-style: bold;
+    border-subtitle-color: $text-muted;
+    border-subtitle-align: center;
+    padding: 1 2;
+}
+
+/* Browsers and managers with a scrolling body. */
+ModalDialog.-workspace,
+.ops-modal-dialog.-workspace {
+    width: 104;
+    max-width: 95%;
+    height: 85vh;
+    max-height: 90vh;
+}
+
+/* Small prompts, settings, and short option lists. */
+ModalDialog.-compact,
+.ops-modal-dialog.-compact {
+    width: 64;
+    max-width: 95%;
+    height: auto;
+    max-height: 70vh;
+    min-height: 8;
+}
+
+/* Header container (optional) */
+.ops-modal-header {
+    height: auto;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+/* ── Pill Tabs ─────────────────────────────────────────── */
+
+PillTabs {
+    height: auto;
+    width: 100%;
+    layout: horizontal;
+    margin-bottom: 1;
+}
+
+PillTab {
+    width: auto;
+    height: 1;
+    min-height: 1;
+    padding: 0 1;
+    margin-right: 1;
+    color: $text-muted;
+    background: transparent;
+    text-align: center;
+}
+
+PillTab:hover {
+    color: $foreground;
+    background: $surface-lighten-1;
+}
+
+PillTab.pill-tab--active {
+    background: $primary 18%;
+    color: $foreground;
+    text-style: bold;
+    border-left: wide $primary;
+}
+
+/* ── Modal Search Input ─────────────────────────────────── */
+
+ModalSearchInput {
+    height: auto;
+    width: 100%;
+    layout: horizontal;
+    margin-bottom: 1;
+    background: $background;
+    border-bottom: solid $primary 30%;
+}
+
+ModalSearchInput:focus-within {
+    border-bottom: solid $primary;
+}
+
+ModalSearchInput .modal-search-icon {
+    width: 3;
+    height: 1;
+    color: $text-muted;
+    padding-left: 1;
+}
+
+ModalSearchInput:focus-within .modal-search-icon {
+    color: $primary;
+}
+
+ModalSearchInput Input {
+    width: 1fr;
+    height: 1;
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+ModalSearchInput Input:focus {
+    background: transparent;
+    border: none;
+    background-tint: transparent;
+}
+
+/* ── OptionList inside ModalScreen ─────────────────────── */
+
+/* Lists hug content unless a screen opts into workspace behavior. */
+OpsModalScreen OptionList {
+    height: auto;
+    background: $background;
+    border: none;
+    padding: 0;
+    scrollbar-gutter: stable;
+}
+
+OpsModalScreen .ops-modal-dialog.-workspace OptionList {
+    height: 1fr;
+}
+
+OpsModalScreen OptionList:focus {
+    border: none;
+}
+
+OpsModalScreen OptionList > .option-list--option-highlighted,
+OpsModalScreen OptionList:focus > .option-list--option-highlighted {
+    background: $primary 12%;
+    color: $foreground;
+    text-style: none;
+}
+
+/* ── Select & SelectOverlay inside ModalScreen ─────────── */
+
+OpsModalScreen SelectOverlay,
+OpsModalScreen .ops-modal-dialog.-workspace SelectOverlay {
+    height: auto;
+    max-height: 12;
+    border: solid $primary;
+    background: $surface;
+    padding: 0 1;
+    overflow-x: hidden;
+}
+
+OpsModalScreen SelectOverlay:focus,
+OpsModalScreen .ops-modal-dialog.-workspace SelectOverlay:focus {
+    border: solid $primary;
+}
+
+OpsModalScreen SelectOverlay > .option-list--option-highlighted,
+OpsModalScreen SelectOverlay:focus > .option-list--option-highlighted {
+    background: $primary 35%;
+    color: $foreground;
+    text-style: bold;
+}
+

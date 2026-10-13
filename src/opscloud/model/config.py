@@ -2315,13 +2315,24 @@ _ollama_installed_models_cache: list[str] | None = None
 
 
 def clear_caches() -> None:
-    """Clear all dynamic provider, model, and profile caches."""
+    """Clear all dynamic provider, model, profile, model pool, and cloud caches."""
     global _BUILTIN_PROVIDERS_CACHE, _profiles_cache, _profiles_override_cache, _ollama_installed_models_cache
     _BUILTIN_PROVIDERS_CACHE = None
     _PROVIDER_PROFILES_CACHE.clear()
     _profiles_cache = None
     _profiles_override_cache = None
     _ollama_installed_models_cache = None
+    try:
+        from opscloud.model.pool import clear_pool_caches
+        clear_pool_caches()
+    except Exception:
+        pass
+    try:
+        from opscloud.config.cloud_profiles import invalidate_aws_profile_cache
+        invalidate_aws_profile_cache()
+    except Exception:
+        pass
+
 
 
 

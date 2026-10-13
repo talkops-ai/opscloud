@@ -34,6 +34,7 @@ async def start_server_and_get_agent(
     cwd: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
+    on_spawn: Callable[[ServerProcess], None] | None = None,
     **kwargs: Any,
 ) -> tuple[RemoteAgent, ServerProcess]:
     """Start a LangGraph dev server asynchronously and return a RemoteAgent client."""
@@ -62,6 +63,21 @@ async def start_server_and_get_agent(
         **kwargs,
     )
     server = ServerProcess(config, host=host, port=port)
+    if on_spawn is not None:
+        try:
+            on_spawn(server)
+        except Exception:
+            pass
+
+    # Schedule background database maintenance on launch (DV-08)
+    try:
+        from opscloud.state.session import SessionManager
+        import asyncio
+        loop = asyncio.get_running_loop()
+        loop.create_task(SessionManager.maintain_database())
+    except Exception:
+        pass
+
     url = await server.astart()
     agent = RemoteAgent(url=url, graph_name="agent")
     return agent, server

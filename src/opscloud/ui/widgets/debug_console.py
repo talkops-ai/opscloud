@@ -22,9 +22,10 @@ from textual.cache import LRUCache
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.geometry import Offset, Size
-from textual.screen import ModalScreen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen
 from textual.style import Style as TStyle
 from textual.widgets import Checkbox, Select, Static
 from textual.widgets._select import (  # noqa: PLC2701  # needed to keep Tab navigation inside the open Select overlay
@@ -644,8 +645,10 @@ class _SnapshotView(Static):
         self.styles.pointer = "default"
 
 
-class DebugConsoleScreen(ModalScreen[None]):
+class DebugConsoleScreen(OpsModalScreen[None]):
     """Modal showing a session snapshot and a live tail of recent log records."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-workspace"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "close", "Close", show=False),
@@ -662,25 +665,9 @@ class DebugConsoleScreen(ModalScreen[None]):
     the menu (a priority Escape would tear down the whole console instead), and
     `c` must not pre-empt the dropdown's type-to-search."""
 
-    CSS = """
-    DebugConsoleScreen {
-        align: center middle;
-    }
-
-    DebugConsoleScreen > Vertical {
-        width: 100;
-        max-width: 95%;
-        height: 85%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     DebugConsoleScreen .debug-console-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     DebugConsoleScreen .debug-console-snapshot {
@@ -713,21 +700,17 @@ class DebugConsoleScreen(ModalScreen[None]):
         min-height: 5;
         scrollbar-gutter: stable;
         background: $background;
-        border: solid $primary;
+        border: solid $primary 20%;
         overflow-x: hidden;
         overflow-y: scroll;
     }
 
     DebugConsoleScreen .debug-console-log:focus {
-        border: solid $primary-lighten-2;
+        border: solid $primary;
     }
 
     DebugConsoleScreen .debug-console-help {
-        height: 1;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -802,46 +785,50 @@ class DebugConsoleScreen(ModalScreen[None]):
                 urls[thread_id] = url
         return urls
 
-    def compose(self) -> ComposeResult:
-        """Lay out the title, snapshot, filter, log tail, and key-hint footer.
-
-        Yields:
-            The child widgets composing the console.
-        """
-        with Vertical():
-            yield Static("Debug Console", classes="debug-console-title")
-            snapshot_view = _SnapshotView(
-                self._copy_snapshot_value,
-                classes="debug-console-snapshot",
+    def compose_modal(self):
+        """Lay out the title, snapshot, filter, log tail, and key-hint footer."""
+        yield Static("Debug Console", classes="debug-console-title")
+        snapshot_view = _SnapshotView(
+            self._copy_snapshot_value,
+            classes="debug-console-snapshot",
+        )
+        snapshot_view.update(self._render_snapshot())
+        yield snapshot_view
+        with Horizontal(classes="debug-console-toolbar"):
+            yield Static("Level", classes="debug-console-filter-label")
+            yield _LogLevelSelect(
+                _filter_options(),
+                value="all",
+                allow_blank=False,
+                id=_FILTER_SELECT_ID,
+                compact=True,
             )
-            snapshot_view.update(self._render_snapshot())
-            yield snapshot_view
-            with Horizontal(classes="debug-console-toolbar"):
-                yield Static("Level", classes="debug-console-filter-label")
-                yield _LogLevelSelect(
-                    _filter_options(),
-                    value="all",
-                    allow_blank=False,
-                    id=_FILTER_SELECT_ID,
-                    compact=True,
-                )
-                yield Checkbox(
-                    "Click to copy",
-                    value=self._click_to_copy,
-                    id=_CLICK_TO_COPY_ID,
-                    compact=True,
-                    classes="debug-console-click-to-copy",
-                )
-            yield _DebugLogView(
-                self._copy_record,
-                widget_id="debug-log",
-                classes="debug-console-log",
-                click_to_copy=self._click_to_copy,
+            yield Checkbox(
+                "Click to copy",
+                value=self._click_to_copy,
+                id=_CLICK_TO_COPY_ID,
+                compact=True,
+                classes="debug-console-click-to-copy",
             )
-            yield Static(self._render_help(), classes="debug-console-help")
+        yield _DebugLogView(
+            self._copy_record,
+            widget_id="debug-log",
+            classes="debug-console-log",
+            click_to_copy=self._click_to_copy,
+        )
+        yield Static(self._render_help(), classes="debug-console-help")
 
     def on_mount(self) -> None:
         """Start the refresh timer and render the current buffer contents."""
+        super().on_mount()
+        glyphs = get_glyphs()
+        self.set_modal_title("Debug Console", counter="live tail")
+        self.set_modal_subtitle([
+            ("c", "copy"),
+            ("ctrl+l", "clear"),
+            ("ctrl+\\", "close"),
+            ("esc", "close"),
+        ])
         self.set_interval(_REFRESH_INTERVAL, self._on_refresh_tick)
         self._on_refresh_tick()
         self._resolve_langsmith_links()

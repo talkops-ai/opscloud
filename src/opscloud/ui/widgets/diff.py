@@ -22,6 +22,7 @@ _HUNK_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)")
 def compose_diff_lines(
     diff: str,
     max_lines: int | None = 100,
+    show_stats: bool = True,
 ) -> ComposeResult:
     """Yield per-line Static widgets for a unified diff.
 
@@ -32,6 +33,7 @@ def compose_diff_lines(
     Args:
         diff: Unified diff string.
         max_lines: Maximum number of diff lines to show (None for unlimited).
+        show_stats: Whether to render the +X -Y stats header widget.
 
     Yields:
         Static widgets — one per diff line — with appropriate CSS classes.
@@ -39,12 +41,13 @@ def compose_diff_lines(
     if not diff:
         yield Static(Content.styled("No changes detected", "dim"))
     else:
-        yield from _compose_diff_content(diff, max_lines)
+        yield from _compose_diff_content(diff, max_lines, show_stats=show_stats)
 
 
 def _compose_diff_content(
     diff: str,
     max_lines: int | None,
+    show_stats: bool = True,
 ) -> ComposeResult:
     """Yield styled diff line widgets for non-empty diff content.
 
@@ -81,7 +84,7 @@ def _compose_diff_content(
         if stats_parts:
             stats_parts.append(" ")
         stats_parts.append((f"-{deletions}", colors.error))
-    if stats_parts:
+    if show_stats and stats_parts:
         yield Static(Content.assemble(*stats_parts))
 
     width = max(3, len(str(max_line + len(lines))))

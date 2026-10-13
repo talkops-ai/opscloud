@@ -7,9 +7,11 @@ import json
 import os
 import signal
 import socket
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 import atexit
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,79 @@ def find_free_port(host: str = _DEFAULT_HOST) -> int:
         return s.getsockname()[1]
 
 
+def _is_our_server_process(pid: int) -> bool:
+    """Verify that a given PID actually belongs to an opscloud/langgraph server.
+
+    Prevents terminating an unrelated system process in the event of OS PID reuse (IA-05).
+    """
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    if sys.platform != "win32":
+        try:
+            res = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            cmdline = res.stdout.strip().lower()
+            return "langgraph" in cmdline or "opscloud" in cmdline
+        except Exception:
+            return False
+    return True
+
+
+def _validate_server_ownership(runtime_dir: Path, pid: int) -> bool:
+    """Validate process identity and metadata against server.json (DV-03).
+
+    Prevents signalling unrelated processes upon OS PID reuse.
+    """
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    json_file = runtime_dir / "server.json"
+    if not json_file.is_file():
+        # DV-03: Never signal when ownership metadata is missing/ambiguous
+        return False
+
+    try:
+        meta = json.loads(json_file.read_text(encoding="utf-8"))
+        if meta.get("pid") != pid:
+            return False
+        rec_dir = meta.get("runtime_dir")
+        if rec_dir and Path(rec_dir).resolve() != runtime_dir.resolve():
+            return False
+        meta_start = meta.get("start_time")
+        if meta_start is not None and sys.platform != "win32":
+            try:
+                res = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "etimes="],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                )
+                if res.returncode == 0 and res.stdout.strip().isdigit():
+                    elapsed = int(res.stdout.strip())
+                    actual_start = time.time() - elapsed
+                    if abs(actual_start - meta_start) > 10.0:
+                        return False
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+    return _is_our_server_process(pid)
+
+
 def generate_langgraph_json(
     output_dir: Path,
     graph_ref: str = "./server_graph.py:make_graph",
@@ -88,7 +163,44 @@ def generate_langgraph_json(
 """Persistent SQLite checkpointer for the LangGraph dev server."""
 
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
+
+# Watchdog to prevent orphaned background servers if parent process terminates abruptly (DV-03)
+_parent_pid_str = os.environ.get("OPSCLOUD_PARENT_PID")
+if _parent_pid_str and _parent_pid_str.isdigit():
+    _parent_pid = int(_parent_pid_str)
+
+    # 1. OS-backed parent-death signal on Linux (prctl PR_SET_PDEATHSIG)
+    try:
+        import ctypes
+        import signal
+        _libc = ctypes.CDLL(None)
+        _PR_SET_PDEATHSIG = 1
+        _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
+    except Exception:
+        pass
+
+    # 2. Thread watchdog verifying parent liveness and command identity
+    def _parent_watchdog():
+        while True:
+            time.sleep(2.0)
+            try:
+                os.kill(_parent_pid, 0)
+                # Verify parent process command line has not been recycled (IA-05 / DV-03)
+                if os.name != "nt":
+                    import subprocess
+                    res = subprocess.run(["ps", "-p", str(_parent_pid), "-o", "command="], capture_output=True, text=True, timeout=1.0)
+                    cmd = res.stdout.strip().lower()
+                    if not any(k in cmd for k in ("opscloud", "python", "pytest", "uv")):
+                        os._exit(0)
+            except Exception:
+                # Parent process terminated or was killed; exit cleanly to prevent orphan leak
+                os._exit(0)
+
+    _watchdog_thread = threading.Thread(target=_parent_watchdog, daemon=True, name="opscloud-parent-watchdog")
+    _watchdog_thread.start()
 
 
 @asynccontextmanager
@@ -118,15 +230,21 @@ class ServerProcess:
         *,
         host: str = _DEFAULT_HOST,
         port: int = DEFAULT_PORT,
+        runtime_dir: Path | None = None,
     ) -> None:
         self.config = config
         self.host = host
         self.port = port or find_free_port(host)
         self.process: subprocess.Popen[str] | None = None
         self.url = f"http://{self.host}:{self.port}"
-        self.runtime_dir = SERVER_RUNTIME_DIR
+        self.instance_id: str = uuid.uuid4().hex[:12]
+        self._owns_runtime_dir: bool = runtime_dir is None
+        # Multi-workspace isolation: isolate dev server runtime directory per unique instance UUID
+        # to ensure concurrent opscloud instances never collide on server.pid or .langgraph_ops.pckl.
+        self.runtime_dir = runtime_dir or (SERVER_RUNTIME_DIR / f"inst_{self.port}_{self.instance_id}")
         self.log_file = get_active_log_file()
         self._log_fp: Any = None
+        self._pgid: int | None = None
 
     def _read_log_tail(self) -> str:
         """Read the tail of the server log file for diagnostics."""
@@ -175,6 +293,8 @@ class ServerProcess:
         server_log_level = getattr(self.config, "server_log_level", "WARNING") or "WARNING"
         # Silence noisy startup/profiler heartbeats in LangGraph API by defaulting LOG_LEVEL to WARNING
         env.setdefault("LOG_LEVEL", server_log_level)
+        # Pass parent PID so the background server can exit if this parent process terminates
+        env["OPSCLOUD_PARENT_PID"] = str(os.getpid())
 
         cmd = [
             sys.executable,
@@ -196,9 +316,83 @@ class ServerProcess:
 
         return env, cmd
 
+    def _sweep_dead_instances(self) -> None:
+        """Clean up orphaned instance directories from previous runs that are no longer active."""
+        if not SERVER_RUNTIME_DIR.is_dir():
+            return
+        try:
+            curr_inst = self.runtime_dir.resolve()
+        except Exception:
+            curr_inst = None
+
+        now = time.time()
+        try:
+            for inst_dir in SERVER_RUNTIME_DIR.glob("inst_*"):
+                if not inst_dir.is_dir():
+                    continue
+                try:
+                    if curr_inst and inst_dir.resolve() == curr_inst:
+                        # Never sweep the runtime directory of this active instance
+                        continue
+                except Exception:
+                    pass
+
+                pid_file = inst_dir / "server.pid"
+                if not pid_file.is_file():
+                    try:
+                        # Protect directories created within the last 60s (active launch in progress)
+                        if now - inst_dir.stat().st_mtime < 60.0:
+                            continue
+                    except Exception:
+                        pass
+                    shutil.rmtree(inst_dir, ignore_errors=True)
+                    continue
+                try:
+                    pid_str = pid_file.read_text(encoding="utf-8").strip()
+                    if pid_str.isdigit():
+                        pid = int(pid_str)
+                        if _validate_server_ownership(inst_dir, pid):
+                            # Active server process in another workspace — do not touch!
+                            continue
+                        else:
+                            # Process is dead or PID was reused by another unrelated application;
+                            # clean up orphaned runtime directory.
+                            shutil.rmtree(inst_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _cleanup_stale_process(self) -> None:
+        """Terminate any previously spawned server recorded in server.pid."""
+        self._sweep_dead_instances()
+        pid_file = self.runtime_dir / "server.pid"
+        if not pid_file.is_file():
+            return
+        try:
+            pid_str = pid_file.read_text(encoding="utf-8").strip()
+            if pid_str.isdigit():
+                stale_pid = int(pid_str)
+                if stale_pid != os.getpid() and _validate_server_ownership(self.runtime_dir, stale_pid):
+                    logger.warning("Cleaning up stale server process PID %d", stale_pid)
+                    if os.name != "nt":
+                        try:
+                            pgid = os.getpgid(stale_pid)
+                            os.killpg(pgid, signal.SIGTERM)
+                        except Exception:
+                            os.kill(stale_pid, signal.SIGTERM)
+                    else:
+                        os.kill(stale_pid, signal.SIGTERM)
+        except Exception:
+            pass
+        finally:
+            pid_file.unlink(missing_ok=True)
+            (self.runtime_dir / "server.json").unlink(missing_ok=True)
+
     def _spawn_process(self, env: dict[str, str], cmd: list[str]) -> subprocess.Popen[str]:
         """Spawn the langgraph server subprocess."""
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_process()
+        generate_langgraph_json(self.runtime_dir)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self._log_fp = open(self.log_file, "a", encoding="utf-8")
         logger.info("Spawning server: %s (url=%s, server_log=%s)", " ".join(cmd), self.url, self.log_file)
@@ -217,6 +411,28 @@ class ServerProcess:
             popen_kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
 
         self.process = subprocess.Popen(cmd, **popen_kwargs)
+        if os.name != "nt":
+            try:
+                self._pgid = os.getpgid(self.process.pid)
+            except Exception:
+                self._pgid = self.process.pid
+        else:
+            self._pgid = None
+
+        try:
+            (self.runtime_dir / "server.pid").write_text(str(self.process.pid), encoding="utf-8")
+            meta = {
+                "instance_id": self.instance_id,
+                "pid": self.process.pid,
+                "port": self.port,
+                "host": self.host,
+                "cmd": cmd,
+                "start_time": time.time(),
+                "runtime_dir": str(self.runtime_dir),
+            }
+            (self.runtime_dir / "server.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
         atexit.register(self.stop)
         return self.process
 
@@ -228,7 +444,7 @@ class ServerProcess:
         try:
             await self.await_until_healthy(timeout=timeout)
             await self.await_for_graph_ready(timeout=timeout)
-        except Exception:
+        except BaseException:
             self.stop()
             raise
 
@@ -242,7 +458,7 @@ class ServerProcess:
         try:
             self.wait_until_healthy(timeout=timeout)
             self.wait_for_graph_ready(timeout=timeout)
-        except Exception:
+        except BaseException:
             self.stop()
             raise
 
@@ -393,34 +609,88 @@ class ServerProcess:
         raise RuntimeError(f"Server graph '{graph_name}' did not initialize within {timeout}s:\n{err}")
 
     def _stop_process(self) -> None:
-        """Stop only the server subprocess and its log file handle."""
-        if self.process and self.process.poll() is None:
-            logger.info("Stopping server process PID %d", self.process.pid)
-            pgid = None
-            if os.name != "nt":
+        """Stop only the server subprocess and its log file handle (DV-06)."""
+        proc = self.process
+        pgid = getattr(self, "_pgid", None)
+        if pgid is None and proc is not None and os.name != "nt":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = proc.pid
+
+        if proc is not None or (pgid is not None and os.name != "nt"):
+            if proc is not None and proc.poll() is None:
+                logger.info("Stopping server process PID %d (pgid=%s)", proc.pid, pgid)
+            elif pgid is not None:
+                logger.info("Reaping surviving descendants in process group %d", pgid)
+
+            # 1. Send SIGTERM to entire process group or single process
+            if pgid is not None and os.name != "nt":
                 try:
-                    pgid = os.getpgid(self.process.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                except Exception:
+                    if proc is not None and proc.poll() is None:
+                        proc.terminate()
+            elif proc is not None and proc.poll() is None:
+                proc.terminate()
+
+            # 2. Wait up to 2.5s for direct child to exit
+            if proc is not None:
+                try:
+                    proc.wait(timeout=2.5)
                 except Exception:
                     pass
 
-            try:
-                if pgid is not None:
-                    os.killpg(pgid, signal.SIGTERM)
-                else:
-                    self.process.terminate()
-                self.process.wait(timeout=3.0)
-            except Exception:
-                if pgid is not None and os.name != "nt":
+            # 3. DV-06: Verify process-group disappearance.
+            # If the process group still exists (e.g. descendant ignored SIGTERM, or leader died first),
+            # escalate immediately to SIGKILL on the entire group.
+            if pgid is not None and os.name != "nt":
+                group_survived = False
+                try:
+                    os.killpg(pgid, 0)
+                    group_survived = True
+                except ProcessLookupError:
+                    group_survived = False
+                except Exception:
+                    pass
+
+                if group_survived:
+                    logger.warning("Process group %d still active after SIGTERM; escalating to SIGKILL (DV-06)", pgid)
                     try:
                         os.killpg(pgid, signal.SIGKILL)
                     except Exception:
                         pass
-                else:
+
+                    # Poll for process group disappearance
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        try:
+                            os.killpg(pgid, 0)
+                            time.sleep(0.05)
+                        except ProcessLookupError:
+                            break
+                        except Exception:
+                            break
+
+            # 4. Final reap of direct child
+            if proc is not None:
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
                     try:
-                        self.process.kill()
+                        proc.kill()
+                        proc.wait(timeout=1.0)
                     except Exception:
                         pass
+
             self.process = None
+            self._pgid = None
+
+        try:
+            (self.runtime_dir / "server.pid").unlink(missing_ok=True)
+            (self.runtime_dir / "server.json").unlink(missing_ok=True)
+        except Exception:
+            pass
 
         if self._log_fp and not getattr(self._log_fp, "closed", True):
             try:
@@ -428,6 +698,17 @@ class ServerProcess:
             except Exception:
                 pass
             self._log_fp = None
+
+        # IA-09: Clean up isolated instance directory ONLY if dynamically allocated and owned
+        if (
+            self._owns_runtime_dir
+            and self.runtime_dir != SERVER_RUNTIME_DIR
+            and self.runtime_dir.is_dir()
+        ):
+            try:
+                shutil.rmtree(self.runtime_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     def stop(self) -> None:
         """Gracefully terminate server and child process group, escalating to kill if needed."""

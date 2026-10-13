@@ -184,19 +184,42 @@ class SlashCommandController:
             return 0.0
         name = cmd.lstrip("/").lower()
         lower_desc = desc.lower()
+        is_alias = lower_desc.startswith("alias for ") or lower_desc.startswith("alias ")
+
+        # 1. Exact match on canonical command
+        if name == search:
+            return 250.0 if not is_alias else 185.0
+
+        # 2. Direct colon-subcommands of search (e.g. /agent:foo when searching "agent" or "ag")
+        if (
+            name.startswith(f"{search}:")
+            or (":" in name and name.split(":", 1)[0] == search)
+            or (search in ("ag", "age", "agen") and name.startswith("agent:"))
+            or (search in ("work", "workf", "workfl", "workflo") and name.startswith("workflow:"))
+        ):
+            return 230.0
+
+        # 3. Canonical commands matching prefix
         if name.startswith(search):
-            return 200.0
+            return 210.0 if not is_alias else 170.0
+
+        # 4. Substring in name
         if search in name:
-            return 150.0
+            return 150.0 if not is_alias else 130.0
+
+        # 5. Keywords match
         if keywords and len(search) >= _MIN_DESC_SEARCH_LEN:
             for kw in keywords.lower().split():
                 if kw.startswith(search) or search in kw:
                     return 120.0
+
+        # 6. Description match
         if len(search) >= _MIN_DESC_SEARCH_LEN and search in lower_desc:
             idx = lower_desc.find(search)
             if idx == 0 or lower_desc[idx - 1] == " ":
                 return 110.0
             return 90.0
+
         name_ratio = SequenceMatcher(None, search, name).ratio()
         desc_ratio = SequenceMatcher(None, search, lower_desc).ratio()
         best = max(name_ratio * 60, desc_ratio * 30)
@@ -214,7 +237,39 @@ class SlashCommandController:
 
         search = text[1:cursor_index].lower()
 
+        # Handle parameterized subcommands like "/agent <name>" or "/workflow <name>"
         if " " in search:
+            cmd_part, _, sub_search = search.partition(" ")
+            if cmd_part in ("agent", "agents", "workflow"):
+                prefix = "/agent:" if cmd_part in ("agent", "agents") else "/workflow:"
+                sub_clean = sub_search.strip()
+                matching_entries = [
+                    entry for entry in self._commands
+                    if entry.name.lower().startswith(prefix)
+                    and (
+                        not sub_clean
+                        or sub_clean in entry.name.lower()
+                        or (getattr(entry, "display_name", "") and sub_clean in entry.display_name.lower())
+                        or sub_clean in entry.description.lower()
+                    )
+                ]
+                if matching_entries:
+                    self._suggestions = [
+                        (
+                            entry.display_name if getattr(entry, "display_name", "") else entry.name,
+                            entry.description,
+                        )
+                        for entry in matching_entries[:MAX_SUGGESTIONS]
+                    ]
+                    self._suggestion_names = [
+                        entry.display_name if getattr(entry, "display_name", "") else entry.name
+                        for entry in matching_entries[:MAX_SUGGESTIONS]
+                    ]
+                    self._selected_index = 0
+                    self._view.render_completion_suggestions(
+                        self._suggestions, self._selected_index
+                    )
+                    return
             self.reset()
             return
 
@@ -242,7 +297,10 @@ class SlashCommandController:
                 )
                 for entry in selected
             ]
-            self._suggestion_names = [entry.name for entry in selected]
+            self._suggestion_names = [
+                entry.display_name if getattr(entry, "display_name", "") else entry.name
+                for entry in selected
+            ]
             self._selected_index = 0
             self._view.render_completion_suggestions(
                 self._suggestions, self._selected_index

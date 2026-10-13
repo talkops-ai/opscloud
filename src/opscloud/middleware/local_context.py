@@ -20,6 +20,7 @@ from typing import (
     Any,
     NotRequired,
     Protocol,
+    Sequence,
     cast,
     runtime_checkable,
 )
@@ -43,7 +44,7 @@ logger = get_logger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from deepagents.backends.protocol import ExecuteResponse
+    from deepagents.backends.protocol import BackendProtocol, ExecuteResponse
     from deepagents.middleware.summarization import SummarizationEvent
     from langgraph.runtime import Runtime
 
@@ -297,12 +298,12 @@ class LocalContextMiddleware(AgentMiddleware):
 
     def __init__(
         self,
-        backend: _ExecutableBackend | _AsyncExecutableBackend | None = None,
+        backend: BackendProtocol | _ExecutableBackend | _AsyncExecutableBackend | Any | None = None,
         *,
         working_dir: Any = None,
         tracing_project: str | None = None,
         user_tracing_project: str | None = None,
-        mcp_servers: list[Any] | None = None,
+        mcp_servers: Sequence[Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()

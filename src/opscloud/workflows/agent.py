@@ -97,7 +97,6 @@ def create_workflow_agent(
         mcp_config: MCP server configuration.
         mcp_tools: Loaded MCP tools.
     """
-    from deepagents.middleware import FilesystemMiddleware
     from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
     from langchain.agents import create_agent
     from langchain.agents.middleware import TodoListMiddleware
@@ -131,12 +130,23 @@ def create_workflow_agent(
         include_telemetry=False,
     )
 
-    middleware: list[Any] = [
+    raw_middleware: list[Any] = [
         TodoListMiddleware(),
-        FilesystemMiddleware(backend=backend),
         *cli_middleware,
         PatchToolCallsMiddleware(),
     ]
+    # Defensively drop duplicate middleware instances by name so langchain create_agent does not raise AssertionError
+    middleware: list[Any] = []
+    seen_names: set[str] = set()
+    for mw in raw_middleware:
+        mw_name = getattr(mw, "name", None)
+        if mw_name and mw_name in seen_names:
+            logger.warning("Dropping duplicate middleware '%s' (%s) in workflow agent", mw_name, type(mw).__name__)
+            continue
+        if mw_name:
+            seen_names.add(mw_name)
+        middleware.append(mw)
+
     return create_agent(
         model=model,
         tools=agent_tools,

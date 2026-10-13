@@ -53,19 +53,20 @@ class HelpHandler(BaseCommandHandler):
 
         nl_shortcut = newline_shortcut()
         help_body = (
-            f"Commands: {commands_str}\n\n"
-            "Interactive Features:  \n"
-            "  Enter           Submit your message  \n"
-            f"  {nl_shortcut:<15} Insert newline  \n"
-            "  Ctrl+X          Open prompt in external editor  \n"
-            "  Ctrl+N          Review pending notifications  \n"
-            "  Ctrl+\\          Toggle the debug console  \n"
-            "  Shift+Tab       Toggle auto-approve mode  \n"
-            "  @filename       Auto-complete files and inject content  \n"
-            "  /command        Slash commands (/help, /clear, /quit)  \n"
-            "  !command        Run shell commands directly  \n"
-            "  !!command       Run shell commands without adding command/output to model context\n\n"
-            "Docs: https://opscloud.dev/docs"
+            "### OpsCloud Commands & Shortcuts\n\n"
+            f"**Slash Commands:**\n{commands_str}\n\n"
+            "**Keyboard Shortcuts:**\n"
+            "- **`Enter`**: Submit message\n"
+            f"- **`{nl_shortcut}`**: Insert newline\n"
+            "- **`Ctrl+X`**: Open prompt in external editor\n"
+            "- **`Ctrl+N`**: Review notifications\n"
+            "- **`Ctrl+\\`**: Toggle debug console\n"
+            "- **`Shift+Tab`**: Toggle auto-approve mode\n"
+            "- **`@filename`**: Complete files and inject content\n"
+            "- **`/command`**: Slash commands (`/help`, `/doctor`, `/reload`, `/workflow`, `/agent`)\n"
+            "- **`!command`**: Run shell command directly\n"
+            "- **`!!command`**: Run shell command without adding output to context\n\n"
+            "_Documentation: https://opscloud.dev/docs_"
         )
 
         return CommandResult(success=True, message=help_body)

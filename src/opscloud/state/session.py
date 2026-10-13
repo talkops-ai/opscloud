@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import sqlite3
+import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
@@ -79,9 +80,11 @@ async def _drain_aiosqlite_worker(conn: Any) -> None:
 
 
 async def _guard_sqlite_handle(conn: Any) -> None:
-    """Apply connection safety settings."""
+    """Apply connection safety settings (IA-11)."""
     with contextlib.suppress(Exception):
-        await conn.execute("PRAGMA busy_timeout = 5000")
+        await conn.execute("PRAGMA journal_mode = WAL")
+        await conn.execute("PRAGMA synchronous = NORMAL")
+        await conn.execute("PRAGMA busy_timeout = 15000")
 
 
 _db_path: Path | None = None
@@ -770,7 +773,11 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
         """Create a new OpsCloudCheckpointer instance from a connection string."""
         import aiosqlite
 
-        async with aiosqlite.connect(conn_string) as conn:
+        async with aiosqlite.connect(conn_string, timeout=30.0) as conn:
+            with contextlib.suppress(Exception):
+                await conn.execute("PRAGMA journal_mode = WAL")
+                await conn.execute("PRAGMA synchronous = NORMAL")
+                await conn.execute("PRAGMA busy_timeout = 15000")
             yield cls(conn)
 
     async def aget_iter(self, config: RunnableConfig) -> AsyncIterator[CheckpointTuple]:
@@ -858,22 +865,79 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
             await self.conn.commit()
 
     async def aprune(
-        self, thread_ids: Sequence[str], *, strategy: str = "keep_latest"
+        self,
+        thread_ids: Sequence[str] | None = None,
+        *,
+        strategy: str = "keep_latest",
+        prune_subagents: bool = True,
     ) -> None:
-        """Asynchronously prune checkpoints for the given threads according to the strategy.
+        """Asynchronously compact thread checkpoint history (destructive compaction).
 
-        Supports 'delete_all' / 'delete' and 'keep_latest' thread history pruning.
+        WARNING (IA-04): 'keep_latest' is a destructive history compaction strategy designed
+        to bound database storage. Older checkpoints and intermediate writes are deleted.
+        Non-terminal checkpoints with pending human-in-the-loop interrupts (__interrupt__)
+        are explicitly preserved to safeguard thread resumability and approvals.
         """
         if strategy in ("delete_all", "delete"):
-            for tid in thread_ids:
-                await self.adelete_thread(tid)
+            if thread_ids is not None:
+                for tid in thread_ids:
+                    await self.adelete_thread(tid)
+            else:
+                await self.setup()
+                async with self.lock, self.conn.cursor() as cur:
+                    await cur.execute("DELETE FROM writes")
+                    await cur.execute("DELETE FROM checkpoints")
+                    await self.conn.commit()
             return
         if strategy != "keep_latest":
             raise ValueError(f"Unknown prune strategy: {strategy}")
 
         await self.setup()
         async with self.lock, self.conn.cursor() as cur:
-            for tid in thread_ids:
+            tids = list(thread_ids) if thread_ids is not None else None
+            if tids is None:
+                await cur.execute("SELECT DISTINCT thread_id FROM checkpoints")
+                tids = [row[0] for row in await cur.fetchall()]
+
+            # STEP 1 (DV-01): Identify ALL checkpoints across ALL namespaces (root, tools:*, subagent:*)
+            # that have pending interrupts (channel = '__interrupt__').
+            # This MUST be discovered BEFORE deleting any subagent or historical namespace!
+            preserved_interrupts_by_thread: dict[str, set[tuple[str, str]]] = {tid: set() for tid in tids}
+            for tid in tids:
+                await cur.execute(
+                    "SELECT DISTINCT checkpoint_ns, checkpoint_id FROM writes "
+                    "WHERE thread_id = ? AND channel = '__interrupt__'",
+                    (tid,),
+                )
+                for ns, cid in await cur.fetchall():
+                    if cid:
+                        preserved_interrupts_by_thread[tid].add((ns or "", cid))
+
+            # STEP 2 (DV-01): Prune dead subagent namespaces (tools:* and subagent:*),
+            # but NEVER delete a subagent checkpoint that contains a pending HITL interrupt!
+            if prune_subagents:
+                for tid in tids:
+                    await cur.execute(
+                        "SELECT DISTINCT checkpoint_ns, checkpoint_id FROM checkpoints "
+                        "WHERE thread_id = ? AND (checkpoint_ns LIKE 'tools:%' OR checkpoint_ns LIKE 'subagent:%')",
+                        (tid,),
+                    )
+                    sub_rows = await cur.fetchall()
+                    for sub_ns, sub_cid in sub_rows:
+                        # If this subagent checkpoint is an active interrupt, preserve it!
+                        if (sub_ns or "", sub_cid) in preserved_interrupts_by_thread[tid]:
+                            continue
+                        await cur.execute(
+                            "DELETE FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
+                            (tid, sub_ns, sub_cid),
+                        )
+                        await cur.execute(
+                            "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
+                            (tid, sub_ns, sub_cid),
+                        )
+
+            # STEP 3: For each retained namespace, keep the latest checkpoint PLUS all preserved interrupt checkpoints
+            for tid in tids:
                 await cur.execute(
                     "SELECT checkpoint_ns, MAX(checkpoint_id) FROM checkpoints "
                     "WHERE thread_id = ? GROUP BY checkpoint_ns",
@@ -883,15 +947,31 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
                 for checkpoint_ns, latest_cid in latest_rows:
                     if latest_cid is None:
                         continue
+                    ns_key = checkpoint_ns or ""
+                    # Checkpoints to keep in this specific namespace: latest + any interrupts in this namespace
+                    cids_to_keep = {latest_cid}
+                    for p_ns, p_cid in preserved_interrupts_by_thread[tid]:
+                        if p_ns == ns_key:
+                            cids_to_keep.add(p_cid)
+
+                    placeholders = ",".join("?" for _ in cids_to_keep)
                     await cur.execute(
-                        "DELETE FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id != ?",
-                        (tid, checkpoint_ns, latest_cid),
+                        f"DELETE FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id NOT IN ({placeholders})",
+                        (tid, checkpoint_ns, *cids_to_keep),
                     )
                     await cur.execute(
-                        "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id != ?",
-                        (tid, checkpoint_ns, latest_cid),
+                        f"DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id NOT IN ({placeholders})",
+                        (tid, checkpoint_ns, *cids_to_keep),
                     )
             await self.conn.commit()
+
+    async def avacuum(self) -> None:
+        """Run VACUUM to reclaim deleted page space."""
+        await self.setup()
+        async with self.lock:
+            await self.conn.commit()
+            with contextlib.suppress(Exception):
+                await self.conn.execute("VACUUM")
 
 
 @asynccontextmanager
@@ -947,6 +1027,88 @@ class SessionManager:
     @staticmethod
     def get_checkpointer() -> Any:
         return get_checkpointer()
+
+    @staticmethod
+    async def prune_thread(thread_id: str, *, strategy: str = "keep_latest") -> None:
+        """Prune intermediate history and subagent checkpoints for a thread."""
+        try:
+            async with get_checkpointer() as saver:
+                await saver.aprune([thread_id], strategy=strategy, prune_subagents=True)
+        except Exception:
+            logger.debug("Failed to prune thread %s", thread_id, exc_info=True)
+
+    @staticmethod
+    async def maintain_database(db_path: Path | None = None, *, size_threshold_mb: float = 50.0) -> dict[str, Any]:
+        """Compact obsolete checkpoints, flush WAL pages, and vacuum database if size exceeds threshold (IA-12/DV-08).
+
+        Uses an advisory non-blocking file lease (.maint_lock) to prevent concurrent maintenance
+        from overlapping active server writers or other instances.
+        """
+        try:
+            target_path = db_path or get_db_path()
+            if not target_path.exists():
+                return {"performed": False, "reason": "db_not_found"}
+
+            # Check footprint before acquiring lease
+            total_bytes = target_path.stat().st_size
+            wal_path = target_path.with_name(target_path.name + "-wal")
+            shm_path = target_path.with_name(target_path.name + "-shm")
+            if wal_path.exists():
+                total_bytes += wal_path.stat().st_size
+            if shm_path.exists():
+                total_bytes += shm_path.stat().st_size
+
+            size_mb = total_bytes / (1024 * 1024)
+            if size_mb < size_threshold_mb:
+                return {"performed": False, "reason": "below_threshold", "initial_mb": size_mb}
+
+            lock_file = target_path.with_name(target_path.name + ".maint_lock")
+            lock_fp = None
+            if sys.platform != "win32":
+                try:
+                    import fcntl
+
+                    lock_fp = open(lock_file, "w")
+                    fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    logger.debug("Database maintenance lease held by another process; skipping")
+                    if lock_fp:
+                        lock_fp.close()
+                    return {"performed": False, "reason": "lease_busy", "initial_mb": size_mb}
+
+            try:
+                logger.info("Maintaining sessions database (current size: %.1f MB)", size_mb)
+                async with get_checkpointer() as saver:
+                    with contextlib.suppress(Exception):
+                        await saver.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    await saver.aprune(None, strategy="keep_latest", prune_subagents=True)
+                    await saver.avacuum()
+                    with contextlib.suppress(Exception):
+                        await saver.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+                new_total = target_path.stat().st_size
+                if wal_path.exists():
+                    new_total += wal_path.stat().st_size
+                if shm_path.exists():
+                    new_total += shm_path.stat().st_size
+                new_size_mb = new_total / (1024 * 1024)
+                logger.info("Sessions database maintenance complete: %.1f MB -> %.1f MB", size_mb, new_size_mb)
+                return {
+                    "performed": True,
+                    "reason": "completed",
+                    "initial_mb": size_mb,
+                    "final_mb": new_size_mb,
+                }
+            finally:
+                if lock_fp:
+                    with contextlib.suppress(Exception):
+                        import fcntl
+
+                        fcntl.flock(lock_fp, fcntl.LOCK_UN)
+                        lock_fp.close()
+        except Exception as exc:
+            logger.warning("Database maintenance encountered an error", exc_info=True)
+            return {"performed": False, "reason": "error", "error": str(exc)}
 
 
 __all__ = [

@@ -40,7 +40,7 @@ class MemoryHandler(BaseCommandHandler):
 
     @property
     def aliases(self) -> tuple[str, ...]:
-        return ("/remember",)
+        return ()
 
     @property
     def category(self) -> CommandCategory:
@@ -285,3 +285,30 @@ def _detect_project_root() -> Path | None:
         if (parent / ".git").exists() or (parent / ".opscloud").exists():
             return parent
     return None
+
+
+class RememberHandler(BaseCommandHandler):
+    """Save useful context to memory or skills via /skill:remember."""
+
+    @property
+    def name(self) -> str:
+        return "/remember"
+
+    @property
+    def category(self) -> CommandCategory:
+        return CommandCategory.POWER
+
+    @property
+    def safety_level(self) -> SafetyLevel:
+        return SafetyLevel.LOW_RISK
+
+    @property
+    def bypass_tier(self) -> BypassTier:
+        return BypassTier.QUEUED
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        memory_handler = MemoryHandler()
+        return await memory_handler._handle_skill_remember(ctx, ctx.args.strip())
+
+
+__all__ = ["MemoryHandler", "RememberHandler"]

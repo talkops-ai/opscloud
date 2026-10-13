@@ -112,37 +112,39 @@ class GenericApprovalWidget(ToolApprovalWidget):
 
 
 class WriteFileApprovalWidget(ToolApprovalWidget):
-    """Approval widget for write_file / write_to_file - shows file content with syntax highlighting."""
+    """Approval widget for write_file / write_to_file - shows file content with diff and line highlights."""
 
     def compose(self) -> ComposeResult:
-        """Compose the file content display with syntax highlighting."""
+        """Compose the file content display with diff and line highlights."""
         file_path = self.data.get("file_path", "")
+        diff_lines = self.data.get("diff_lines", [])
         content = format_display_content(self.data.get("content", ""))
-        file_extension = self.data.get("file_extension", "text")
 
         # Never render the contents of credential files (e.g. `.env`).
         if is_sensitive_file_path(file_path):
             yield from _file_header(file_path)
             yield Static(Content.styled(_CREDENTIAL_NOTICE, "dim"))
-        else:
-            lines = content.split("\n")
-            total_lines = len(lines)
+            return
 
-            yield from _file_header(file_path, additions=total_lines if content else 0)
+        from opscloud.ui.widgets.diff import compose_diff_lines
 
-            if total_lines > _MAX_LINES:
-                shown_lines = lines[:_MAX_LINES]
-                remaining = total_lines - _MAX_LINES
-                truncated_content = (
-                    "\n".join(shown_lines) + f"\n... ({remaining} more lines)"
-                )
-                yield Markdown(f"```{file_extension}\n{truncated_content}\n```")
-            else:
-                yield Markdown(f"```{file_extension}\n{content}\n```")
+        if diff_lines:
+            additions, deletions = _count_diff_stats(diff_lines, "", "")
+            yield from _file_header(file_path, additions=additions, deletions=deletions)
+            yield from compose_diff_lines("\n".join(diff_lines), max_lines=_MAX_DIFF_LINES, show_stats=False)
+            return
+
+        lines = content.splitlines()
+        total_lines = len(lines)
+        yield from _file_header(file_path, additions=total_lines if content else 0)
+
+        # Show line-numbered addition preview
+        preview_diff = [f"@@ -0,0 +1,{total_lines} @@"] + [f"+{line}" for line in lines]
+        yield from compose_diff_lines("\n".join(preview_diff), max_lines=_MAX_LINES, show_stats=False)
 
 
 class EditFileApprovalWidget(ToolApprovalWidget):
-    """Approval widget for edit_file / replace_file_content - shows clean diff with colors."""
+    """Approval widget for edit_file / replace_file_content - shows clean diff with colors and line numbers."""
 
     def compose(self) -> ComposeResult:
         """Compose the diff display with colored additions and deletions."""
@@ -160,7 +162,8 @@ class EditFileApprovalWidget(ToolApprovalWidget):
         elif not diff_lines and not old_string and not new_string:
             yield Static("No changes to display", classes="approval-description")
         elif diff_lines:
-            yield from self._render_diff_lines_only(diff_lines)
+            from opscloud.ui.widgets.diff import compose_diff_lines
+            yield from compose_diff_lines("\n".join(diff_lines), max_lines=_MAX_DIFF_LINES, show_stats=False)
         else:
             yield from self._render_strings_only(old_string, new_string)
 

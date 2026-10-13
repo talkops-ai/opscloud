@@ -113,3 +113,138 @@ async def test_checkpointer_aprune():
         # Prune delete_all
         await saver.aprune(["thread-prune"], strategy="delete_all")
         assert await saver.aget_tuple(c3_cfg) is None
+
+
+@pytest.mark.asyncio
+async def test_checkpointer_aprune_subagents_and_vacuum():
+    """Verify aprune drops subagent namespaces and avacuum works."""
+    async with OpsCloudCheckpointer.from_conn_string(":memory:") as saver:
+        await saver.setup()
+        main_cfg: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-sub",
+                "checkpoint_ns": "",
+                "checkpoint_id": "cp-main-001",
+            }
+        }
+        sub_cfg: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-sub",
+                "checkpoint_ns": "tools:call_123",
+                "checkpoint_id": "cp-sub-001",
+            }
+        }
+        await saver.aput(main_cfg, _make_checkpoint("cp-main-001"), cast(CheckpointMetadata, {}), {})
+        await saver.aput(sub_cfg, _make_checkpoint("cp-sub-001"), cast(CheckpointMetadata, {}), {})
+
+        assert await saver.aget_tuple(sub_cfg) is not None
+
+        await saver.aprune(["thread-sub"], strategy="keep_latest", prune_subagents=True)
+
+        assert await saver.aget_tuple(main_cfg) is not None
+        assert await saver.aget_tuple(sub_cfg) is None
+
+        # Verify avacuum executes cleanly
+        await saver.avacuum()
+
+
+@pytest.mark.asyncio
+async def test_checkpointer_aprune_preserves_interrupt_checkpoints():
+    """Verify aprune preserves non-terminal checkpoints containing pending HITL interrupts (IA-04)."""
+    async with OpsCloudCheckpointer.from_conn_string(":memory:") as saver:
+        await saver.setup()
+        # Create cp-001 (historical regular)
+        cfg1: RunnableConfig = {"configurable": {"thread_id": "thread-hitl", "checkpoint_ns": "", "checkpoint_id": "cp-001"}}
+        await saver.aput(cfg1, _make_checkpoint("cp-001"), cast(CheckpointMetadata, {}), {})
+
+        # Create cp-002 (interrupted HITL checkpoint with __interrupt__ write)
+        cfg2: RunnableConfig = {"configurable": {"thread_id": "thread-hitl", "checkpoint_ns": "", "checkpoint_id": "cp-002"}}
+        stored_cfg2 = await saver.aput(cfg2, _make_checkpoint("cp-002"), cast(CheckpointMetadata, {}), {})
+        await saver.aput_writes(stored_cfg2, [("__interrupt__", {"approval_requested": True})], task_id="task-hitl")
+
+        # Create cp-003 (latest regular)
+        cfg3: RunnableConfig = {"configurable": {"thread_id": "thread-hitl", "checkpoint_ns": "", "checkpoint_id": "cp-003"}}
+        await saver.aput(cfg3, _make_checkpoint("cp-003"), cast(CheckpointMetadata, {}), {})
+
+        # Compact thread
+        await saver.aprune(["thread-hitl"], strategy="keep_latest")
+
+        # cp-001 must be pruned (historical regular)
+        assert await saver.aget_tuple(cfg1) is None
+        # cp-002 MUST be preserved (contains pending HITL interrupt)
+        tup2 = await saver.aget_tuple(cfg2)
+        assert tup2 is not None
+        assert tup2.pending_writes is not None
+        assert tup2.pending_writes[0][1] == "__interrupt__"
+        # cp-003 must be preserved (latest checkpoint)
+        assert await saver.aget_tuple(cfg3) is not None
+
+
+@pytest.mark.asyncio
+async def test_checkpointer_aprune_preserves_subagent_interrupt_checkpoints():
+    """Verify aprune preserves subagent checkpoints that contain active HITL interrupts (DV-01)."""
+    async with OpsCloudCheckpointer.from_conn_string(":memory:") as saver:
+        await saver.setup()
+        # 1. Main agent checkpoint
+        main_cfg: RunnableConfig = {"configurable": {"thread_id": "thread-sub-hitl", "checkpoint_ns": "", "checkpoint_id": "cp-main"}}
+        await saver.aput(main_cfg, _make_checkpoint("cp-main"), cast(CheckpointMetadata, {}), {})
+
+        # 2. Regular completed subagent (should be pruned)
+        sub_dead_cfg: RunnableConfig = {"configurable": {"thread_id": "thread-sub-hitl", "checkpoint_ns": "tools:call_dead", "checkpoint_id": "cp-sub-dead"}}
+        await saver.aput(sub_dead_cfg, _make_checkpoint("cp-sub-dead"), cast(CheckpointMetadata, {}), {})
+
+        # 3. Interrupted subagent with pending __interrupt__ write (MUST be preserved)
+        sub_hitl_cfg: RunnableConfig = {"configurable": {"thread_id": "thread-sub-hitl", "checkpoint_ns": "tools:call_active_hitl", "checkpoint_id": "cp-sub-hitl"}}
+        stored_sub = await saver.aput(sub_hitl_cfg, _make_checkpoint("cp-sub-hitl"), cast(CheckpointMetadata, {}), {})
+        await saver.aput_writes(stored_sub, [("__interrupt__", {"tool_approval": "terraform apply"})], task_id="task-sub-1")
+
+        # 4. Another interrupted subagent under subagent:ns
+        sub_agent_cfg: RunnableConfig = {"configurable": {"thread_id": "thread-sub-hitl", "checkpoint_ns": "subagent:cloud_sec", "checkpoint_id": "cp-subagent-hitl"}}
+        stored_agent = await saver.aput(sub_agent_cfg, _make_checkpoint("cp-subagent-hitl"), cast(CheckpointMetadata, {}), {})
+        await saver.aput_writes(stored_agent, [("__interrupt__", {"escalation_needed": True})], task_id="task-sub-2")
+
+        # Prune with prune_subagents=True
+        await saver.aprune(["thread-sub-hitl"], strategy="keep_latest", prune_subagents=True)
+
+        # Main checkpoint preserved
+        assert await saver.aget_tuple(main_cfg) is not None
+        # Dead subagent was pruned
+        assert await saver.aget_tuple(sub_dead_cfg) is None
+        # Interrupted subagent in tools:* MUST be preserved
+        sub_tup = await saver.aget_tuple(sub_hitl_cfg)
+        assert sub_tup is not None
+        assert sub_tup.pending_writes is not None
+        assert sub_tup.pending_writes[0][1] == "__interrupt__"
+        # Interrupted subagent in subagent:* MUST be preserved
+        agent_tup = await saver.aget_tuple(sub_agent_cfg)
+        assert agent_tup is not None
+        assert agent_tup.pending_writes is not None
+        assert agent_tup.pending_writes[0][1] == "__interrupt__"
+
+
+@pytest.mark.asyncio
+async def test_session_manager_maintain_database_lease_contention(tmp_path):
+    """Verify maintain_database respects size threshold and skips when lease is held (DV-08)."""
+    import fcntl
+    import sys
+    from opscloud.state.session import SessionManager
+
+    db_path = tmp_path / "sessions.db"
+    # Create empty DB file
+    db_path.write_bytes(b"0" * 1024)
+
+    # 1. Below threshold
+    res = await SessionManager.maintain_database(db_path=db_path, size_threshold_mb=10.0)
+    assert res["performed"] is False
+    assert res["reason"] == "below_threshold"
+
+    if sys.platform != "win32":
+        # Simulate active lease held by another process
+        lock_file = db_path.with_name(db_path.name + ".maint_lock")
+        with open(lock_file, "w") as lock_fp:
+            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # 2. Above threshold (size_threshold_mb=0) but lease held -> must report lease_busy
+            busy_res = await SessionManager.maintain_database(db_path=db_path, size_threshold_mb=0.0)
+            assert busy_res["performed"] is False
+            assert busy_res["reason"] == "lease_busy"
+            fcntl.flock(lock_fp, fcntl.LOCK_UN)

@@ -49,14 +49,39 @@ class ReloadHandler(BaseCommandHandler):
         changes = ctx.settings.reload_from_environment() if ctx.settings is not None else []
         try:
             from opscloud.model.config import clear_caches
+
             clear_caches()
         except Exception:
             pass
+
+        from opscloud.config.cloud_profiles import get_active_aws_profile, get_active_aws_region
+        from opscloud.config.toml_config import format_agent_pool_summary, load_agent_pool
+
+        active_prof = (
+            get_active_aws_profile()
+            or (getattr(ctx.settings, "aws_profile", None) if ctx.settings else None)
+            or "default"
+        )
+        active_reg = (
+            get_active_aws_region()
+            or (getattr(ctx.settings, "aws_region", None) if ctx.settings else None)
+            or "us-east-1"
+        )
+        pool = load_agent_pool()
+        pool_str = format_agent_pool_summary(pool)
+
+        msg_lines = ["### Reload Complete", ""]
         if changes:
-            msg = "Configuration reloaded. Changes:\n" + "\n".join(f"  - {c}" for c in changes)
+            msg_lines.append("**Configuration reloaded. Changes:**")
+            msg_lines.extend(f"- `{c}`" for c in changes)
         else:
-            msg = "Configuration reloaded. No changes detected."
-        return CommandResult(success=True, message=msg, mount_as_app_message=True)
+            msg_lines.append("• **Configuration reloaded. No changes detected.**")
+        msg_lines.append(f"• **AWS configuration:** profile `{active_prof}` ({active_reg})")
+        msg_lines.append(f"• **Agent model pool:** {pool_str}")
+        msg_lines.append("• **Model config caches cleared.**")
+
+        return CommandResult(success=True, message="\n".join(msg_lines), mount_as_app_message=True)
+
 
 
 # ── /restart ─────────────────────────────────────────────

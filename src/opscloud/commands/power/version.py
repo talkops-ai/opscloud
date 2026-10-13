@@ -41,10 +41,11 @@ class VersionHandler(BaseCommandHandler):
             or "default"
         )
         msg = (
-            f"opscloud-code version: {__version__}\n"
-            f"opscloud (SDK) version: {__version__}\n"
-            f"Python version: {py_ver}\n"
-            f"Active model: {model_str}"
+            "### OpsCloud Version & Runtime\n\n"
+            f"- **OpsCloud CLI:** `{__version__}`\n"
+            f"- **OpsCloud SDK:** `{__version__}`\n"
+            f"- **Python:** `{py_ver}`\n"
+            f"- **Active Model:** `{model_str}`"
         )
         return CommandResult(success=True, message=msg)
 

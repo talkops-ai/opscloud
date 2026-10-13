@@ -42,6 +42,7 @@ from opscloud.mcp.preload import (
     _mcp_tool_name,
     clear_cached_mcp_server_infos,
     get_cached_mcp_server_infos,
+    is_mcp_server_info_cached,
     preload_mcp_metadata,
     preload_mcp_server_info,
     probe_one_mcp_server,
@@ -88,6 +89,8 @@ def test_interpolate_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_resolve_mcp_server_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_PROFILE_NAME", "production")
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     raw_config = {
         "command": "uvx",
         "args": ["mcp-server-aws", "--profile", "${AWS_PROFILE_NAME:-default}"],
@@ -493,6 +496,77 @@ async def test_preload_mcp_server_info_integration(tmp_path: Path) -> None:
 
     cached = get_cached_mcp_server_infos()
     assert any(c.name == "dummy-server" for c in cached)
+
+
+@pytest.mark.asyncio
+async def test_persistent_schema_cache_avoids_restarting_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm process rebuilds tools from disk without probing the MCP server."""
+    import opscloud.mcp.preload as preload_module
+
+    cache_path = tmp_path / "mcp-metadata.json"
+    monkeypatch.setenv("OPSCLOUD_MCP_METADATA_CACHE", str(cache_path))
+    config = {
+        "transport": "stdio",
+        "command": "example-mcp",
+        "env": {"SECRET_TOKEN": "must-not-be-persisted"},
+        "headers": {"Authorization": "must-not-be-persisted"},
+    }
+    info = MCPServerInfo(
+        name="persistent",
+        transport="stdio",
+        status="ok",
+        tools=(
+            MCPToolInfo(
+                name="persistent_list",
+                original_name="list",
+                input_schema={"type": "object"},
+            ),
+        ),
+    )
+
+    preload_module._PROBED_CACHE.clear()
+    preload_module._PROBED_CONFIG_FINGERPRINTS.clear()
+    preload_module._PERSISTED_ENTRIES.clear()
+    preload_module._PERSISTENT_CACHE_LOADED = False
+    with patch.object(preload_module, "probe_one_mcp_server", new=AsyncMock(return_value=info)) as probe:
+        first = await preload_module.preload_mcp_metadata({"persistent": config})
+    probe.assert_awaited_once()
+    assert first[0].tool_count == 1
+    persisted_text = cache_path.read_text(encoding="utf-8")
+    assert "must-not-be-persisted" not in persisted_text
+
+    # Simulate a fresh process and fail the test if a transport probe occurs.
+    preload_module._PROBED_CACHE.clear()
+    preload_module._PROBED_CONFIG_FINGERPRINTS.clear()
+    preload_module._PERSISTED_ENTRIES.clear()
+    preload_module._PERSISTENT_CACHE_LOADED = False
+    with patch.object(
+        preload_module,
+        "probe_one_mcp_server",
+        new=AsyncMock(side_effect=AssertionError("warm cache unexpectedly probed")),
+    ) as probe:
+        second = await preload_module.preload_mcp_metadata({"persistent": config})
+    probe.assert_not_awaited()
+    assert second[0].tools[0].original_name == "list"
+
+
+@pytest.mark.asyncio
+async def test_mcp_metadata_cache_is_bound_to_exact_config() -> None:
+    """A reused server name must not return metadata for a changed command."""
+    clear_cached_mcp_server_infos()
+    first = {"shared": {"transport": "stdio", "command": "first", "enabled": False}}
+    changed = {"shared": {"transport": "stdio", "command": "second", "enabled": False}}
+
+    await preload_mcp_metadata(first)
+
+    assert is_mcp_server_info_cached("shared", first["shared"]) is True
+    assert is_mcp_server_info_cached("shared", changed["shared"]) is False
+
+    await preload_mcp_metadata(changed)
+    assert is_mcp_server_info_cached("shared", changed["shared"]) is True
 
 
 # ── Semantic Profiler ─────────────────────────────────────────────────────────

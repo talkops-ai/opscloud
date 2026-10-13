@@ -56,6 +56,7 @@ from opscloud.config.settings import (
 from opscloud.ui.widgets.loading import format_duration
 from opscloud.ui.widgets.tool_display import (
     format_tool_display,
+    format_tool_parts,
 )
 EXECUTE_HEADER_MAX_LENGTH = 100
 
@@ -233,6 +234,29 @@ def _strip_success_exit_line(text: str) -> str:
         Text with the success exit-code trailer removed, if present.
     """
     return _SUCCESS_EXIT_RE.sub("", text)
+
+
+def _arg_shown_in_header(value: object, shown: str) -> bool:
+    """Whether ``value`` is the argument already rendered on the tool header.
+
+    Args:
+        value: A raw tool-call argument value.
+        shown: The header's argument summary (`ToolDisplayParts.detail`),
+            possibly truncated with a trailing ellipsis.
+
+    Returns:
+        True when the header already displays this value, in full or as its
+        truncated prefix.
+    """
+    if not shown or isinstance(value, (dict, list, tuple, set)):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    if text == shown:
+        return True
+    # `truncate_value` always appends a literal "…" regardless of ASCII mode.
+    return shown.endswith("\u2026") and text.startswith(shown[:-1])
 
 
 # Visual width of the prompt prefix (glyph + trailing space, e.g. "> ", "$ ").
@@ -426,30 +450,27 @@ class ToolCallMessage(Vertical):
     ToolCallMessage {
         height: auto;
         padding: 0 1;
-        margin: 0 0 1 0;
+        margin: 1 0 0 0;
         background: transparent;
-        border-left: wide $tool;
     }
 
     ToolCallMessage .tool-header {
         height: auto;
-        color: $tool;
-        text-style: bold;
     }
 
     ToolCallMessage .tool-task-desc {
         color: $text-muted;
-        margin-left: 3;
+        margin-left: 2;
         text-style: italic;
     }
 
     ToolCallMessage .tool-args {
         color: $text-muted;
-        margin-left: 3;
+        margin-left: 2;
     }
 
     ToolCallMessage .tool-status {
-        margin-left: 3;
+        margin-left: 2;
     }
 
     ToolCallMessage .tool-status.pending {
@@ -469,8 +490,7 @@ class ToolCallMessage(Vertical):
     }
 
     ToolCallMessage .tool-reject-reason {
-        margin-left: 3;
-        margin-top: 0;
+        margin: 0 0 0 2;
         height: auto;
         color: $text-muted;
     }
@@ -479,6 +499,7 @@ class ToolCallMessage(Vertical):
         layout: horizontal;
         height: auto;
         width: 1fr;
+        margin: 0 0 0 2;
     }
 
     /* Fixed gutter holds the output glyph so soft-wrapped content lines stay
@@ -490,32 +511,31 @@ class ToolCallMessage(Vertical):
     }
 
     ToolCallMessage .tool-output {
-        margin-left: 0;
-        margin-top: 0;
+        margin: 0;
         padding: 0;
         height: auto;
         width: 1fr;
     }
 
     ToolCallMessage .tool-output-preview {
-        margin-left: 0;
-        margin-top: 0;
+        margin: 0;
         width: 1fr;
     }
 
     ToolCallMessage .tool-output-hint {
-        margin-left: 0;
+        margin: 0 0 0 4;
         color: $text-muted;
     }
 
-    /* Terminal outcome tints the row: green success, red error, amber
-       rejected/skipped. A faint background keeps text readable across
-       light/dark/ansi themes while the border carries the primary signal. */
-    ToolCallMessage.-status-success {
-        border-left: wide $success;
-        background: transparent;
+    /* Expanded group members nest under their summary line. */
+    ToolCallMessage.-grouped {
+        margin: 0;
+        padding: 0 1 0 3;
     }
 
+    /* Success and running rows stay unframed: the coloured status glyph on
+       the header carries the outcome. Failures get a bar so they are hard to
+       miss when scrolling back: red error, amber rejected/skipped. */
     ToolCallMessage.-status-error {
         border-left: wide $error;
         background: transparent;
@@ -526,12 +546,8 @@ class ToolCallMessage(Vertical):
         border-left: wide $warning;
         background: transparent;
     }
-
-    ToolCallMessage:hover {
-        border-left: wide $tool-hover;
-    }
     """
-    """Left border tracks tool lifecycle; hover brightens for interactivity."""
+    """Header glyph tracks tool lifecycle; failures add a coloured bar."""
 
     _PREVIEW_LINES = 6
     """Maximum number of lines to show in preview mode."""
@@ -623,8 +639,9 @@ class ToolCallMessage(Vertical):
         Yields:
             Widgets for header, arguments, status, and output display.
         """
-        tool_label = format_tool_display(self._tool_name, self._args)
-        self._header_widget = Static(tool_label, markup=False, classes="tool-header", id="tool-header")
+        self._header_widget = Static(
+            self._header_content(), classes="tool-header", id="tool-header"
+        )
         yield self._header_widget
         # Task: dedicated description line (dim, truncated). A long description
         # collapses to a truncated preview that expands on click or Ctrl+O.
@@ -645,17 +662,25 @@ class ToolCallMessage(Vertical):
         # Only show args for tools where header doesn't capture the key info
         if self._tool_name not in _TOOLS_WITH_HEADER_INFO:
             args = self._filtered_args()
+            # The header already shows one argument (e.g. `ap-south-1`);
+            # don't repeat it in the dim args line below.
+            shown = format_tool_parts(self._tool_name, self._args).detail
             if args:
                 inline_items = {}
                 for k, v in list(args.items())[:_MAX_INLINE_ARGS]:
                     if k in {"code", "script"} or (isinstance(v, str) and "\n" in v):
                         continue
+                    if _arg_shown_in_header(v, shown):
+                        continue
                     inline_items[k] = v
+                remaining = sum(
+                    1 for v in args.values() if not _arg_shown_in_header(v, shown)
+                )
                 if inline_items:
                     args_str = ", ".join(
                         f"{k}={v!r}" for k, v in inline_items.items()
                     )
-                    if len(args) > len(inline_items):
+                    if remaining > len(inline_items):
                         args_str += ", ..."
                     yield Static(
                         Content.from_markup("[dim]($args)[/dim]", args=args_str),
@@ -745,7 +770,6 @@ class ToolCallMessage(Vertical):
         self._deferred_reject_reason = None
 
         # Restore based on status (don't restart animations for running tools)
-        colors = theme.get_theme_colors(self)
         match status:
             case "success":
                 self._status = "success"
@@ -762,45 +786,25 @@ class ToolCallMessage(Vertical):
                 self._output = output
                 self._apply_status_class("error")
                 if self._status_widget:
-                    self._status_widget.add_class("error")
-                    error_icon = get_glyphs().error
-                    self._status_widget.update(
-                        Content.styled(f"{error_icon} Error", colors.error)
-                    )
-                    self._status_widget.display = True
+                    self._status_widget.display = False
                 self._update_output_display()
             case "rejected":
                 self._status = "rejected"
                 self._apply_status_class("rejected")
-                if self._status_widget:
-                    self._status_widget.add_class("rejected")
-                    error_icon = get_glyphs().error
-                    self._status_widget.update(
-                        Content.styled(f"{error_icon} Rejected", colors.warning)
-                    )
-                    self._status_widget.display = True
+                self._show_terminal_label("Rejected", "rejected")
                 self._update_reject_reason_display()
             case "skipped":
                 self._status = "skipped"
                 self._apply_status_class("skipped")
-                if self._status_widget:
-                    self._status_widget.add_class("rejected")
-                    self._status_widget.update(Content.styled("- Skipped", "dim"))
-                    self._status_widget.display = True
+                self._show_terminal_label("Skipped", "rejected")
             case "running":
-                # For running tools, show static "Running..." without animation
-                # (animations shouldn't be restored for archived tools)
+                # For running tools, show a static spinner frame without
+                # animation (animations shouldn't be restored for archived tools)
                 self._status = "running"
-                if self._status_widget:
-                    self._status_widget.add_class("pending")
-                    frame = get_glyphs().spinner_frames[0]
-                    self._status_widget.update(
-                        Content.styled(f"{frame} Running...", colors.warning)
-                    )
-                    self._status_widget.display = True
             case _:
                 # pending or unknown - leave as default
                 pass
+        self._refresh_header()
 
     def set_running(self) -> None:
         """Mark the tool as running (approved and executing).
@@ -813,31 +817,18 @@ class ToolCallMessage(Vertical):
         self._status = "running"
         self._duration = None
         self._start_time = time.time()
-        if self._status_widget:
-            self._status_widget.add_class("pending")
-            self._status_widget.display = True
+        # The spinner and elapsed time live on the header line; the separate
+        # status line stays hidden while running.
         self._update_running_animation()
         self._animation_timer = self.set_interval(0.1, self._update_running_animation)
 
     def _update_running_animation(self) -> None:
-        """Update the running spinner animation."""
-        if self._status != "running" or self._status_widget is None:
+        """Advance the header spinner (and elapsed time once the tool is slow)."""
+        if self._status != "running":
             return
-
-        spinner_frames = get_glyphs().spinner_frames
-        frame = spinner_frames[self._spinner_position]
-        self._spinner_position = (self._spinner_position + 1) % len(spinner_frames)
-
-        elapsed = ""
-        if self._start_time is not None:
-            elapsed_secs = int(time.time() - self._start_time)
-            if elapsed_secs >= self._RUNNING_TIMER_THRESHOLD_SECS:
-                elapsed = f" ({format_duration(elapsed_secs)})"
-
-        text = f"{frame} Running...{elapsed}"
-        self._status_widget.update(
-            Content.styled(text, theme.get_theme_colors(self).warning)
-        )
+        frames = get_glyphs().spinner_frames
+        self._spinner_position = (self._spinner_position + 1) % len(frames)
+        self._refresh_header()
 
     def pause_running(self) -> None:
         """Pause the running spinner while the tool awaits a user decision.
@@ -855,6 +846,7 @@ class ToolCallMessage(Vertical):
         if self._status_widget:
             self._status_widget.remove_class("pending")
             self._status_widget.display = False
+        self._refresh_header()
 
     def _stop_animation(self) -> None:
         """Stop the running animation."""
@@ -878,6 +870,81 @@ class ToolCallMessage(Vertical):
         class_name = f"-status-{status}"
         if class_name in _STATUS_CLASSES:
             self.add_class(class_name)
+
+    _SUBAGENT_LABEL: ClassVar[str] = "Subagent"
+    """Header label for `task` dispatches (the raw display name is `task`)."""
+
+    def _header_content(self) -> Content:
+        """Build the styled one-line header for the current lifecycle state.
+
+        ``<status glyph> <Name> <scope>  <argument>  · <elapsed>``
+
+        The glyph carries the outcome so the row needs no separate status
+        line: a teal spinner while running, green check on success, red cross
+        on error, amber cross when rejected and an amber hollow circle while
+        pending (awaiting approval). Errors also turn the tool name red.
+        """
+        glyphs = get_glyphs()
+        status = self._status
+        if status == "running":
+            frames = glyphs.spinner_frames
+            mark, mark_style = frames[self._spinner_position % len(frames)], "$primary"
+        elif status == "success":
+            mark, mark_style = glyphs.checkmark, "bold $success"
+        elif status == "error":
+            mark, mark_style = glyphs.error, "bold $error"
+        elif status == "rejected":
+            mark, mark_style = glyphs.error, "bold $warning"
+        elif status == "skipped":
+            mark, mark_style = glyphs.circle_empty, "dim"
+        else:
+            mark, mark_style = glyphs.circle_empty, "$warning"
+
+        parts = format_tool_parts(self._tool_name, self._args)
+        name = self._SUBAGENT_LABEL if parts.kind == "task" else parts.name
+        name_style = "bold $error" if status == "error" else "bold"
+        pieces: list[tuple[str, str] | str] = [(f"{mark} ", mark_style), (name, name_style)]
+        if parts.scope:
+            pieces.append((f" {parts.scope}", "dim"))
+        if parts.detail:
+            pieces.append("  ")
+            if parts.kind == "command":
+                pieces.append(("$ ", "dim"))
+            elif parts.kind == "task":
+                pieces.append((parts.detail, "$secondary"))
+            if parts.kind != "task":
+                pieces.append(parts.detail)
+
+        meta = self._header_meta()
+        if meta:
+            pieces.append((f"  {glyphs.separator} {meta}", "dim"))
+        return Content.assemble(*pieces)
+
+    def _header_meta(self) -> str:
+        """Elapsed time for slow running tools, or run time for timed ones."""
+        if self._status == "running" and self._start_time is not None:
+            elapsed = int(time.time() - self._start_time)
+            if elapsed >= self._RUNNING_TIMER_THRESHOLD_SECS:
+                return format_duration(elapsed)
+        elif self._status == "success" and self._duration is not None:
+            if self._duration >= 1:
+                return format_duration(int(self._duration))
+        return ""
+
+    def _refresh_header(self) -> None:
+        """Re-render the header line for the current state."""
+        if self._header_widget is not None:
+            self._header_widget.update(self._header_content())
+
+    def _show_terminal_label(self, label: str, css_class: str) -> None:
+        """Show a short terminal label (e.g. ``Rejected``) under the header."""
+        if self._status_widget is None:
+            return
+        self._status_widget.remove_class("pending")
+        self._status_widget.add_class(css_class)
+        style = "dim" if label == "Skipped" else "$warning"
+        self._status_widget.update(Content.styled(label, style))
+        self._status_widget.display = True
 
     def defer_success(self, output: AskUserRowSummary) -> None:
         """Record a terminal success this row earned but has not yet rendered.
@@ -1009,41 +1076,30 @@ class ToolCallMessage(Vertical):
     def _show_timed_success_status(self, duration: float) -> None:
         """Render the preserved duration for a completed timed tool call.
 
+        The run time now sits on the header line (``✓ Execute  ...  · 4s``),
+        so the separate status line is hidden.
+
         Args:
             duration: Elapsed tool run time in seconds.
         """
-        if self._status_widget is None:
-            return
-        self._status_widget.remove_class("pending")
-        self._status_widget.update(
-            Content.styled(f"Took {format_duration(int(duration))}", "dim")
-        )
-        self._status_widget.display = True
+        self._duration = duration
+        if self._status_widget is not None:
+            self._status_widget.remove_class("pending")
+            self._status_widget.display = False
+        self._refresh_header()
 
     def _show_success_status(self) -> None:
         """Render the status marker for a completed successful call.
 
-        When the call produces visible output it speaks for itself and the
-        status stays hidden; otherwise show a "Success!" marker so a completed
-        call (e.g. `edit_file`) isn't left without any outcome indicator.
+        The green check on the header line is the outcome indicator, so a
+        completed call (e.g. `edit_file`) is never left without one and the
+        separate status line stays hidden.
         """
-        if self._status_widget is None:
-            return
-        self._status_widget.remove_class("pending")
-        if (
-            self._tool_name != "edit_file"
-            and self._format_output(
-                self._output, is_preview=False
-            ).content.plain.strip()
-        ):
+        if self._status_widget is not None:
+            self._status_widget.remove_class("pending")
             self._status_widget.remove_class("success")
             self._status_widget.display = False
-            return
-        glyph = get_glyphs().checkmark
-        colors = theme.get_theme_colors(self)
-        self._status_widget.add_class("success")
-        self._status_widget.update(Content.styled(f"{glyph} Success!", colors.success))
-        self._status_widget.display = True
+        self._refresh_header()
 
     def set_error(self, error: str) -> None:
         """Mark the tool call as failed.
@@ -1076,21 +1132,24 @@ class ToolCallMessage(Vertical):
         self._stop_animation()
         self._status = "error"
         self._apply_status_class("error")
-        # For shell commands, prepend the full command so users can see what failed
+        # For shell commands, prepend the full command so users can see what
+        # failed -- unless the header already shows it in full (single line,
+        # not truncated), in which case the echo would just repeat it.
         command = self._args.get("command") if self._tool_name == "execute" else None
         if command and isinstance(command, str) and command.strip():
-            self._output = f"$ {command}\n\n{error}"
+            shown = format_tool_parts(self._tool_name, self._args).detail
+            if shown == command.strip():
+                self._output = error
+            else:
+                self._output = f"$ {command}\n\n{error}"
         else:
             self._output = error
         if self._status_widget:
+            # The red cross and red tool name on the header carry the outcome.
             self._status_widget.remove_class("pending")
             self._status_widget.add_class("error")
-            error_icon = get_glyphs().error
-            colors = theme.get_theme_colors(self)
-            self._status_widget.update(
-                Content.styled(f"{error_icon} Error", colors.error)
-            )
-            self._status_widget.display = True
+            self._status_widget.display = False
+        self._refresh_header()
         # Always show full error - errors should be visible
         self._expanded = True
         self._update_output_display()
@@ -1117,41 +1176,36 @@ class ToolCallMessage(Vertical):
         self._apply_status_class("rejected")
         if reason and reason.strip():
             self._reject_reason = reason.strip()
-        if self._status_widget:
-            self._status_widget.remove_class("pending")
-            self._status_widget.add_class("rejected")
-            error_icon = get_glyphs().error
-            text = f"{error_icon} Rejected"
-            colors = theme.get_theme_colors(self)
-            self._status_widget.update(Content.styled(text, colors.warning))
-            self._status_widget.display = True
+        self._show_terminal_label("Rejected", "rejected")
+        self._refresh_header()
         self._update_reject_reason_display()
 
     def _update_reject_reason_display(self) -> None:
-        """Render the rejection reason line if a reason is set."""
+        """Render the rejection reason, folded onto the ``Rejected`` line.
+
+        ``Rejected · not during business hours`` reads as one decision, so the
+        reason joins the status line instead of taking a row of its own.
+        """
         if self._reject_reason_widget is None:
             return
-        if self._reject_reason:
-            self._reject_reason_widget.update(
-                Content.from_markup(
-                    "[dim italic]Reason: $reason[/dim italic]",
-                    reason=self._reject_reason,
+        self._reject_reason_widget.display = False
+        if self._reject_reason and self._status_widget is not None:
+            sep = get_glyphs().separator
+            self._status_widget.update(
+                Content.assemble(
+                    ("Rejected", "$warning"),
+                    (f" {sep} {self._reject_reason}", "dim"),
                 )
             )
-            self._reject_reason_widget.display = True
-        else:
-            self._reject_reason_widget.display = False
+            self._status_widget.display = True
 
     def set_skipped(self) -> None:
         """Mark the tool call as skipped (due to another rejection)."""
         self._stop_animation()
         self._status = "skipped"
         self._apply_status_class("skipped")
-        if self._status_widget:
-            self._status_widget.remove_class("pending")
-            self._status_widget.add_class("rejected")  # Use same styling as rejected
-            self._status_widget.update(Content.styled("- Skipped", "dim"))
-            self._status_widget.display = True
+        self._show_terminal_label("Skipped", "rejected")  # Same styling as rejected
+        self._refresh_header()
 
     def set_awaiting_approval(self) -> None:
         """Hide the tool call while an approval prompt mirrors its content.
@@ -1970,7 +2024,7 @@ class ToolCallMessage(Vertical):
     def _format_shell_output(
         self, output: str, *, is_preview: bool = False
     ) -> FormattedOutput:
-        """Format shell command output.
+        """Format shell command output with DevOps-aware highlighting.
 
         Returns:
             FormattedOutput with shell output and optional truncation info.
@@ -1985,13 +2039,39 @@ class ToolCallMessage(Vertical):
         shown, chars_used, char_truncated = self._truncate_to_budget(
             lines, max_lines=max_lines, char_budget=char_budget
         )
-        # Dim the leading `$ command` echo; only the first row can carry it.
-        parts = [
-            Content.styled(line, "dim")
-            if index == 0 and line.startswith("$ ")
-            else Content(line)
-            for index, line in enumerate(shown)
-        ]
+
+        command = (
+            self._args.get("command")
+            or self._args.get("cmd")
+            or self._args.get("command_line")
+            or self._args.get("CommandLine")
+        )
+        command_str = command.strip() if isinstance(command, str) else ""
+        if not command_str and lines and lines[0].startswith("$ "):
+            command_str = lines[0][2:].strip()
+
+        from opscloud.ui.widgets.devops_renderers import detect_devops_renderer
+
+        renderer = detect_devops_renderer(output, command=command_str)
+        colors = (
+            theme.get_theme_colors(self)
+            if self.is_attached
+            else theme.get_theme_colors(None)
+        )
+
+        # Dim the leading `$ command` echo; render subsequent lines with DevOps renderer if matched.
+        parts: list[Content] = []
+        for index, line in enumerate(shown):
+            if index == 0 and line.startswith("$ "):
+                parts.append(Content.styled(line, "dim"))
+            elif renderer is not None:
+                try:
+                    parts.append(renderer.render_line(line, colors=colors))
+                except Exception:
+                    parts.append(Content(line))
+            else:
+                parts.append(Content(line))
+
         content = Content("\n").join(parts) if parts else Content("")
 
         truncation = self._build_truncation_hint(
@@ -2282,7 +2362,7 @@ class ToolCallMessage(Vertical):
             if self._has_expandable_output():
                 self._hint_widget.update(
                     Content.styled(
-                        f"{self._output_hint_keys()} to collapse", "dim italic"
+                        f"{self._output_hint_keys()} to collapse", "dim"
                     )
                 )
                 self._hint_widget.display = True
@@ -2303,14 +2383,21 @@ class ToolCallMessage(Vertical):
                 self._tool_name in _COLLAPSE_OUTPUT_BY_DEFAULT
                 or (self._tool_name == "edit_file" and self._status == "success")
             ):
-                self._preview_row.display = False
-                ellipsis = get_glyphs().ellipsis
-                self._hint_widget.update(
-                    Content.styled(
-                        f"{ellipsis} {self._output_hint_keys()} to expand", "dim italic"
+                # Show a one-line result summary in the output gutter
+                # ("⎿ 1 match · click or Ctrl+O to expand") so the row still
+                # says what came back without echoing the body.
+                sep = get_glyphs().separator
+                summary = format_tool_result_summary(self._tool_name, self._output)
+                summary = summary.removeprefix("⎿").strip()
+                self._preview_widget.update(
+                    Content.assemble(
+                        (summary, "dim") if summary else "",
+                        (f" {sep} " if summary else "", "dim"),
+                        (f"{self._output_hint_keys()} to expand", "dim"),
                     )
                 )
-                self._hint_widget.display = True
+                self._preview_row.display = True
+                self._hint_widget.display = False
                 return
             # Truncate the preview only when the output is large enough to
             # warrant it; `_ALWAYS_PREVIEW_TOOLS` use their compact preview
@@ -2330,11 +2417,12 @@ class ToolCallMessage(Vertical):
             # promising an expansion that reveals nothing is misleading.
             if result.truncation:
                 ellipsis = get_glyphs().ellipsis
+                sep = get_glyphs().separator
                 self._hint_widget.update(
                     Content.styled(
-                        f"{ellipsis} {result.truncation} — "
+                        f"{ellipsis} {result.truncation} {sep} "
                         f"{self._output_hint_keys()} to expand",
-                        "dim italic",
+                        "dim",
                     )
                 )
                 self._hint_widget.display = True
@@ -2825,7 +2913,7 @@ class ToolGroupSummary(Static):
     ToolGroupSummary {
         height: auto;
         padding: 0 1;
-        margin: 0 0 1 0;
+        margin: 1 0 0 0;
         color: $text-muted;
         pointer: pointer;
     }
@@ -3174,7 +3262,7 @@ class ToolGroupSummary(Static):
             frames = glyphs.spinner_frames
             spinner = frames[self._spinner_pos % len(frames)]
             self.update(
-                Content(f"{spinner} {self._present_text}{glyphs.ellipsis}"),
+                self._live_line(spinner, completed, pending),
                 layout=layout or summary_changed,
             )
         else:
@@ -3187,7 +3275,53 @@ class ToolGroupSummary(Static):
                 self._past_text = summarize_tool_group(
                     [tool.tool_name for tool in self._tools], tense="past"
                 )
-            self.update(Content(f"{mark} {self._past_text}"), layout=layout)
+            self.update(
+                Content.assemble(
+                    (f"{mark} ", "$primary"), *_emphasize_counts(self._past_text)
+                ),
+                layout=layout,
+            )
+
+    @staticmethod
+    def _live_line(spinner: str, completed: list[str], pending: list[str]) -> Content:
+        """Live line: finished work muted, the in-flight segment in teal.
+
+        e.g. ``⠹ Read 1 file, running 1 agent, running 1 shell command…`` where
+        only "running 1 agent, running 1 shell command…" is highlighted, so
+        the eye lands on what is happening right now.
+        """
+        ellipsis = get_glyphs().ellipsis
+        pieces: list[tuple[str, str] | str] = [(f"{spinner} ", "$primary")]
+        done = summarize_tool_group(completed, tense="past") if completed else ""
+        active = summarize_tool_group(pending, tense="present") if pending else ""
+        if done:
+            pieces.extend(_emphasize_counts(done))
+        if active:
+            if done:
+                pieces.append(", ")
+                active = f"{active[0].lower()}{active[1:]}"
+            pieces.append((f"{active}{ellipsis}", "$primary"))
+        return Content.assemble(*pieces)
+
+
+_COUNT_RE = re.compile(r"\b\d+\b")
+
+
+def _emphasize_counts(text: str) -> list[tuple[str, str] | str]:
+    """Split ``text`` so bare numbers render in teal ("Read **2** files").
+
+    Everything else inherits the widget colour (muted, brighter on hover).
+    """
+    pieces: list[tuple[str, str] | str] = []
+    last = 0
+    for match in _COUNT_RE.finditer(text):
+        if match.start() > last:
+            pieces.append(text[last : match.start()])
+        pieces.append((match.group(), "$primary"))
+        last = match.end()
+    if last < len(text):
+        pieces.append(text[last:])
+    return pieces
 
 
 
@@ -3198,21 +3332,18 @@ class ToolGroupSummary(Static):
 
 
 
-class _MutedRichMarkdown:
-    """Render Rich markdown to match `AppMessage`'s muted-italic base.
+class _RichMarkdownWrapper:
+    """Render Rich markdown for both muted system base and vibrant command output cards.
 
-    Plain `AppMessage` strings render as `dim italic` via `Content.styled`
-    plus the widget's CSS. Rich's default markdown theme paints h2-h4
-    magenta and table headers/borders cyan, and doesn't apply `dim` to
-    paragraphs, so markdown blocks look visually distinct. This wrapper:
-
-    - Applies a `rich.theme.Theme` while rendering that strips the stock
-        colors while keeping structural emphasis (bold/underline/italic), and
-    - Layers `dim` over the whole document via `rich.styled.Styled` so
-        body text matches the `dim italic` baseline used elsewhere.
+    When `is_command=True`:
+      - Applies OpsCloud theme colors (Teal #2dd4bf for h1/h3, Cyan #7AA2F7 for h2,
+        Purple #BB9AF7 for code/h4, Green for success glyphs, subtle dark borders for tables).
+      - Body text is rendered with full foreground brightness.
+    When `is_command=False`:
+      - Maintains classic muted/dimmed system notification style.
     """
 
-    _THEME_OVERRIDES: ClassVar[dict[str, str]] = {
+    _MUTED_THEME_OVERRIDES: ClassVar[dict[str, str]] = {
         "markdown.h1": "bold underline",
         "markdown.h2": "bold underline",
         "markdown.h3": "bold",
@@ -3223,7 +3354,21 @@ class _MutedRichMarkdown:
         "markdown.code_inline": "bold",
     }
 
-    def __init__(self, markup: str) -> None:
+    _COMMAND_THEME_OVERRIDES: ClassVar[dict[str, str]] = {
+        "markdown.h1": "bold #2dd4bf underline",
+        "markdown.h2": "bold #7AA2F7",
+        "markdown.h3": "bold #2dd4bf",
+        "markdown.h4": "bold #BB9AF7",
+        "markdown.table.header": "bold #2dd4bf",
+        "markdown.table.border": "#3B3E52",
+        "markdown.code": "bold #BB9AF7",
+        "markdown.code_inline": "bold #2dd4bf",
+        "markdown.bullet": "bold #2dd4bf",
+        "markdown.link": "underline #7AA2F7",
+        "markdown.hr": "#3B3E52",
+    }
+
+    def __init__(self, markup: str, *, is_command: bool = False) -> None:
         from rich.markdown import (
             Markdown as RichMarkdown,
             MarkdownElement,
@@ -3253,6 +3398,7 @@ class _MutedRichMarkdown:
 
         self._markdown = _FoldingMarkdown(markup)
         self._markup = markup
+        self._is_command = is_command
 
     def __rich_console__(  # noqa: PLW3201  # Rich renderable protocol
         self, console: RichConsole, options: ConsoleOptions
@@ -3260,15 +3406,23 @@ class _MutedRichMarkdown:
         from rich.styled import Styled
         from rich.theme import Theme
 
-        theme = Theme(self._THEME_OVERRIDES, inherit=True)
+        overrides = (
+            self._COMMAND_THEME_OVERRIDES
+            if self._is_command
+            else self._MUTED_THEME_OVERRIDES
+        )
+        theme = Theme(overrides, inherit=True)
         try:
             with console.use_theme(theme):
-                yield from self._markdown.__rich_console__(
-                    console, options
-                )
+                if self._is_command:
+                    yield from self._markdown.__rich_console__(
+                        console, options
+                    )
+                else:
+                    yield from self._markdown.__rich_console__(
+                        console, options
+                    )
         except Exception:
-            # Rich markdown or theme application blew up on malformed input.
-            # Fall back to the raw source so the chat view keeps rendering.
             logger.warning(
                 "Rich markdown rendering failed; falling back to plain text",
                 exc_info=True,
@@ -3276,6 +3430,9 @@ class _MutedRichMarkdown:
             yield from Styled(self._markup, "").__rich_console__(
                 console, options
             )
+
+
+_MutedRichMarkdown = _RichMarkdownWrapper
 
 
 # Floor for markdown layout width so a not-yet-sized widget still renders a
@@ -3290,28 +3447,13 @@ _markdown_style_conversion_warned = [False]
 
 
 def _markdown_to_content(
-    markup: str, width: int, console: RichConsole | None = None
+    markup: str,
+    width: int,
+    console: RichConsole | None = None,
+    *,
+    is_command: bool = False,
 ) -> Content:
-    """Render muted markdown to selectable `Content` at a fixed width.
-
-    Textual's mouse text-selection only works over widgets whose rendered
-    visual is `Content` or Rich `Text`; a raw Rich renderable (such as
-    `_MutedRichMarkdown`) renders as a `RichVisual`, which carries none of the
-    per-cell offset metadata selection relies on, so its text can be neither
-    highlighted nor copied. Rendering the markdown to segments and rebuilding
-    them as `Content` preserves the visual (tables, rules, emphasis) while
-    making the text selectable.
-
-    Args:
-        markup: The markdown source to render.
-        width: Target render width in cells; the markdown is laid out to fit.
-        console: Console used to render segments; a default is created when
-            `None`.
-
-    Returns:
-        `Content` visually equivalent to the rendered markdown, with trailing
-            whitespace trimmed from each line so copies stay clean.
-    """
+    """Render markdown to selectable `Content` at a fixed width."""
     from rich.console import Console
     from rich.segment import Segment
     from textual.content import Span
@@ -3321,7 +3463,8 @@ def _markdown_to_content(
     if console is None:
         console = Console(width=render_width)
     segments = console.render(
-        _MutedRichMarkdown(markup), console.options.update_width(render_width)
+        _RichMarkdownWrapper(markup, is_command=is_command),
+        console.options.update_width(render_width),
     )
     content_lines: list[Content] = []
     for line in Segment.split_lines(segments):
@@ -3363,15 +3506,22 @@ def _markdown_to_content(
 
 
 class UserMessage(Static):
-    """A user message rendered with prompt prefix and border-left styling."""
+    """A user message styled by input mode.
+
+    - **prompt** (normal text): subtle violet strip with a violet ``❯`` rail,
+      so the user's voice is distinct from the teal agent.
+    - **slash command** (``/plugins``): compact command chip, no strip, so it
+      reads as an action taken rather than a question asked.
+    - **shell** (``!cmd``): green ``$`` rail; incognito shell is muted.
+    """
 
     DEFAULT_CSS = """
     UserMessage {
         height: auto;
         padding: 0 1;
         margin: 1 0;
-        background: $primary 15%;
-        border-left: wide $primary;
+        background: $accent 7%;
+        border-left: wide $accent;
         pointer: text;
         link-color: $text;
         link-style: not underline;
@@ -3380,17 +3530,36 @@ class UserMessage(Static):
         link-style-hover: not bold not underline;
     }
 
+    UserMessage.-mode-command {
+        background: transparent;
+        border-left: none;
+        padding: 0 1 0 2;
+    }
+
+    UserMessage.-mode-shell {
+        background: $success 6%;
+        border-left: wide $mode-bash;
+    }
+
+    UserMessage.-mode-shell_incognito {
+        background: $panel 50%;
+        border-left: wide $mode-incognito;
+    }
+
     UserMessage.-cancelled {
         opacity: 0.6;
     }
     """
 
     def __init__(self, content: str) -> None:
+        from opscloud.ui.widgets.chat_input import detect_input_mode
+
         self._raw_content = content
         self._timestamp = time.strftime("%H:%M:%S")
         self._show_timestamp = False
+        self._mode = detect_input_mode(content)
         # Pass empty string — render() provides the live content on every repaint.
-        super().__init__("")
+        super().__init__("", classes=f"-mode-{self._mode}")
 
     @property
     def raw_text(self) -> str:
@@ -3405,25 +3574,39 @@ class UserMessage(Static):
         self._show_timestamp = visible
         self.refresh(layout=True)
 
-    def _prefix_and_body(self) -> tuple[tuple[str, str], str]:
-        """Compute the styled prefix and body with its trigger stripped."""
-        from opscloud.ui.theme import get_theme_colors
-        from opscloud.ui.widgets.chat_input import detect_input_mode, MODE_PREFIXES, MODE_DISPLAY_GLYPHS
+    def _parts(self) -> list[str | tuple[str, str]]:
+        """Build the styled segments for the current mode and theme.
+
+        Styles reference Textual theme variables (``$accent``,
+        ``$text-muted``) so they resolve against the live theme and the
+        terminal's real background rather than precomputed hex values.
+        """
+        from opscloud.ui.widgets.chat_input import MODE_PREFIXES
 
         content = self._raw_content
-        mode = detect_input_mode(content)
-        colors = get_theme_colors(self)
+        mode = self._mode
 
-        if mode != "normal":
-            prefix_text = MODE_PREFIXES.get(mode, "")
-            glyph = MODE_DISPLAY_GLYPHS.get(mode, prefix_text)
+        if mode == "command":
+            name, _, args = content.partition(" ")
+            parts: list[str | tuple[str, str]] = [
+                ("› ", "dim"),
+                (name, "bold $accent"),
+            ]
+            if args.strip():
+                parts.append((f"  {args.strip()}", "dim"))
+            return parts
 
-            return (
-                (f"{glyph} ", f"bold {colors.primary}"),
-                content[len(prefix_text):]
-            )
+        if mode in ("shell", "shell_incognito"):
+            body = content[len(MODE_PREFIXES[mode]):]
+            if mode == "shell":
+                return [("$ ", "bold $mode-bash"), body]
+            return [
+                ("$ ", "bold $mode-incognito"),
+                body,
+                ("  incognito", "italic dim"),
+            ]
 
-        return ("> ", f"bold {colors.primary}"), content
+        return [("❯ ", "bold $accent"), content]
 
     def render(self) -> Content:
         """Render the styled user message with live theme colors.
@@ -3435,11 +3618,104 @@ class UserMessage(Static):
         Returns:
             Styled ``Content`` with mode prefix and message body.
         """
-        prefix, body = self._prefix_and_body()
-        parts: list[str | tuple[str, str]] = [prefix, body]
+        parts = self._parts()
         if self._show_timestamp:
             parts.append((f"  [{self._timestamp}]", "dim italic"))
         return Content.assemble(*parts)
+
+_ASSISTANT_MARKDOWN_CLS: type[Markdown] | None = None
+"""Lazily-built ``Markdown`` subclass used for assistant replies."""
+
+
+def _assistant_markdown_class() -> type[Markdown]:
+    """Return the ``Markdown`` subclass used inside ``AssistantMessage``.
+
+    Built lazily so importing this module stays cheap (``textual.widgets``
+    markdown machinery is only loaded once a reply is rendered).  The only
+    behavioural difference from stock ``Markdown`` is that fenced code
+    blocks carry their language as a border title (``bash``, ``hcl`` ...).
+    """
+    global _ASSISTANT_MARKDOWN_CLS
+    if _ASSISTANT_MARKDOWN_CLS is not None:
+        return _ASSISTANT_MARKDOWN_CLS
+
+    from textual.widgets import Markdown
+    from textual.widgets._markdown import MarkdownFence
+
+    class AssistantFence(MarkdownFence):
+        """Code fence that shows its language label and opens file paths on click."""
+
+        def _get_target_path(self, line_index: int | None = None) -> str | None:
+            from opscloud.editor import extract_file_path
+
+            if line_index is not None:
+                lines = (self.code or "").splitlines()
+                if 0 <= line_index < len(lines):
+                    path = extract_file_path(lines[line_index])
+                    if path:
+                        return path
+            return extract_file_path(self.code or "")
+
+        def _apply_language_title(self) -> None:
+            lang = (self.lexer or "").strip().split(" ", 1)[0]
+            self.border_title = lang or None
+            path = self._get_target_path()
+            if path:
+                self.add_class("-is-file-link")
+                self.border_subtitle = "click to open"
+                try:
+                    from pathlib import Path
+
+                    tip = f"Open file in editor (click): {Path(path).name}"
+                    self.tooltip = tip
+                    try:
+                        self.query_one("#code-content").tooltip = tip
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            else:
+                self.remove_class("-is-file-link")
+                self.border_subtitle = None
+                self.tooltip = None
+                try:
+                    self.query_one("#code-content").tooltip = None
+                except Exception:
+                    pass
+
+        def on_mount(self) -> None:
+            self._apply_language_title()
+
+        def _copy_context(self, block: Any) -> None:
+            super()._copy_context(block)
+            self._apply_language_title()
+
+        async def _update_from_block(self, block: Any) -> None:
+            await super()._update_from_block(block)
+            self._apply_language_title()
+
+        async def on_click(self, event: Any) -> None:
+            """Open file if this code fence contains an existing file path."""
+            line_idx = getattr(event, "y", None)
+            path = self._get_target_path(line_idx) or self._get_target_path()
+            if path and self.app is not None:
+                event.stop()
+                from opscloud.editor import open_file_in_editor
+
+                open_file_in_editor(path, app=self.app)
+
+    class AssistantMarkdown(Markdown):
+        """Markdown renderer for assistant replies."""
+
+        BLOCKS = {
+            **Markdown.BLOCKS,
+            "fence": AssistantFence,
+            "code_block": AssistantFence,
+        }
+
+    _ASSISTANT_MARKDOWN_CLS = AssistantMarkdown
+    return AssistantMarkdown
+
 
 class AssistantMessage(Vertical):
     """Widget displaying an assistant message with markdown support.
@@ -3464,15 +3740,128 @@ class AssistantMessage(Vertical):
         padding: 0;
         margin: 0;
         pointer: text;
+        link-color: $primary;
+        link-style: underline;
+        link-color-hover: $primary;
+        link-background-hover: $primary 15%;
+        link-style-hover: bold underline;
+    }
+
+    /* First block hugs the marker row.  Note: a lone ``margin-top`` would
+       reset the whole margin in Textual, so full margins are spelled out. */
+    AssistantMessage Markdown > MarkdownH1:first-child,
+    AssistantMessage Markdown > MarkdownH2:first-child,
+    AssistantMessage Markdown > MarkdownFence:first-child,
+    AssistantMessage Markdown > MarkdownBlockQuote:first-child {
+        margin: 0 0 1 0;
+    }
+
+    AssistantMessage Markdown > MarkdownH3:first-child,
+    AssistantMessage Markdown > MarkdownH4:first-child,
+    AssistantMessage Markdown > MarkdownH5:first-child,
+    AssistantMessage Markdown > MarkdownH6:first-child {
+        margin: 0;
     }
 
     AssistantMessage Markdown > *:last-child {
         margin-bottom: 0;
     }
 
+    /* Headings: colour + weight carry hierarchy; no underlines or centring */
+    AssistantMessage MarkdownH1 {
+        content-align: left middle;
+        color: $primary;
+        background: transparent;
+        text-style: bold;
+        margin: 1 0 1 0;
+    }
+
+    AssistantMessage MarkdownH2 {
+        color: $primary;
+        background: transparent;
+        text-style: bold;
+        margin: 1 0 1 0;
+    }
+
+    AssistantMessage MarkdownH3 {
+        color: $secondary;
+        background: transparent;
+        text-style: bold;
+        margin: 1 0 0 0;
+    }
+
+    AssistantMessage MarkdownH4,
+    AssistantMessage MarkdownH5,
+    AssistantMessage MarkdownH6 {
+        color: $foreground;
+        background: transparent;
+        text-style: bold;
+        margin: 1 0 0 0;
+    }
+
+    /* Lists: brand-coloured markers */
+    AssistantMessage MarkdownBullet {
+        color: $primary;
+    }
+
+    /* Inline code: amber text on a faint tint of the same hue */
+    AssistantMessage Markdown MarkdownBlock > .code_inline {
+        color: $text-warning;
+        background: $warning 8%;
+    }
+
+    /* Code fences: hairline frame with the language as its title */
     AssistantMessage MarkdownFence {
+        margin: 1 0;
+        padding: 0 1;
+        background: transparent;
+        border: round $foreground 18%;
+        border-title-color: $text-muted;
+        border-title-align: left;
         scrollbar-size-horizontal: 0;
         scrollbar-size-vertical: 0;
+    }
+
+    AssistantMessage MarkdownFence.-is-file-link {
+        border: round $primary 50%;
+        border-title-color: $primary;
+        border-subtitle-color: $primary;
+        border-subtitle-align: right;
+    }
+
+    AssistantMessage MarkdownFence.-is-file-link:hover {
+        border: round $primary;
+        border-subtitle-color: $primary;
+        background: $primary 8%;
+    }
+
+    AssistantMessage MarkdownFence > Label {
+        padding: 0;
+    }
+
+    /* Block quotes: callout rail in the brand colour, no fill */
+    AssistantMessage MarkdownBlockQuote {
+        background: transparent;
+        border-left: outer $primary 60%;
+        color: $text-muted;
+        text-style: italic;
+        margin: 1 0;
+        padding: 0 1;
+    }
+
+    /* Tables: quiet grid, bold brand-coloured header */
+    AssistantMessage MarkdownTableContent {
+        keyline: thin $foreground 14%;
+    }
+
+    AssistantMessage MarkdownTableContent > .header {
+        color: $primary;
+        text-style: bold;
+    }
+
+    /* Horizontal rule: a hairline, not a full-strength accent bar */
+    AssistantMessage MarkdownHorizontalRule {
+        border-bottom: solid $foreground 18%;
     }
     """
 
@@ -3497,15 +3886,20 @@ class AssistantMessage(Vertical):
         self._content_parts = [value] if value else []
 
     def compose(self) -> ComposeResult:
-        from textual.widgets import Markdown
-        yield Markdown("", id="assistant-content", open_links=False)
+        yield _assistant_markdown_class()("", id="assistant-content", open_links=False)
 
     def on_mount(self) -> None:
         from textual.widgets import Markdown
+        from opscloud.ui.widgets._links import autolink_file_paths
+
         self._markdown = self.query_one("#assistant-content", Markdown)
         # If constructed with initial content (history replay), render it now.
         if self._content_parts and not self._is_streaming:
-            self.run_worker(self._markdown.update(self._content), exclusive=True, thread=False)
+            self.run_worker(
+                self._markdown.update(autolink_file_paths(self._content)),
+                exclusive=True,
+                thread=False,
+            )
 
     @property
     def content_text(self) -> str:
@@ -3581,8 +3975,12 @@ class AssistantMessage(Vertical):
                 pass
             self._stream = None
         try:
+            from opscloud.ui.widgets._links import autolink_file_paths
+
             md = self._get_markdown()
-            self.run_worker(md.update(text), exclusive=True, thread=False)
+            self.run_worker(
+                md.update(autolink_file_paths(text)), exclusive=True, thread=False
+            )
         except Exception:
             pass
 
@@ -3599,8 +3997,54 @@ class AssistantMessage(Vertical):
                 if self._stream is not None:
                     await self._stream.stop()
                     self._stream = None
-                await self._get_markdown().update(self._content)
+                from opscloud.ui.widgets._links import autolink_file_paths
+
+                await self._get_markdown().update(autolink_file_paths(self._content))
             self.run_worker(_finalize(), exclusive=True, thread=False)
+
+    async def on_markdown_link_clicked(self, event: Any) -> None:
+        """Open link in browser or file in user's default editor."""
+        event.stop()
+        from opscloud.ui.widgets._links import open_link_or_file_async
+
+        href = getattr(event, "href", "")
+        if href and self.app is not None:
+            await open_link_or_file_async(href, app=self.app, notify_on_success=True)
+
+    async def on_click(self, event: Any) -> None:
+        """Handle click anywhere in message that targets an existing file path."""
+        from opscloud.editor import extract_file_path, open_file_in_editor
+
+        # 1. Check if clicked inside a code fence
+        from textual.widgets._markdown import MarkdownFence
+
+        w = getattr(event, "widget", None)
+        while w is not None and w is not self:
+            if isinstance(w, MarkdownFence):
+                path = extract_file_path(getattr(w, "code", ""))
+                if path and self.app is not None:
+                    event.stop()
+                    open_file_in_editor(path, app=self.app)
+                    return
+            w = getattr(w, "parent", None)
+
+        # 2. Check text of the clicked widget
+        target = getattr(event, "widget", None)
+        text = ""
+        if hasattr(target, "_content"):
+            c = getattr(target, "_content")
+            text = c.text if hasattr(c, "text") else str(c)
+        elif hasattr(target, "renderable"):
+            text = str(getattr(target, "renderable"))
+        elif hasattr(target, "code"):
+            text = str(getattr(target, "code"))
+
+        path = extract_file_path(text)
+        if path and self.app is not None:
+            event.stop()
+            open_file_in_editor(path, app=self.app)
+
+
 
 class DiffMessage(Static):
     """Inline diff display widget."""
@@ -3890,14 +4334,11 @@ class ErrorMessage(Static):
 class SystemMessage(Static):
     """A system/command-response info message.
 
-    Styled muted+italic to visually distinguish command output from the
-    purple ``UserMessage`` glyph/border in command mode.  Markdown content
-    (e.g. ``/rubric`` usage with code blocks) is rendered lazily via
-    ``_markdown_to_content`` so it reflows on width changes.  Plain one-liner
-    messages receive a ``● `` bullet prefix; multi-line or markdown messages
-    are passed through as-is.
+    - Single-line system messages (e.g. notices, queue notifications) render as
+      muted notices with a ``● `` bullet prefix.
+    - Multi-line, structured markdown, or command responses render in an elevated
+      card container with an accent rail (border-left: wide $primary) and theme colors.
     """
-
 
     DEFAULT_CSS = """
     SystemMessage {
@@ -3907,17 +4348,39 @@ class SystemMessage(Static):
         color: $text;
         pointer: text;
     }
+
+    SystemMessage.-card,
+    SystemMessage.-command-output,
+    CommandOutputMessage {
+        height: auto;
+        padding: 1 2;
+        margin: 1 0 1 0;
+        background: $surface 45%;
+        border-left: wide $primary;
+        color: $foreground;
+        pointer: text;
+    }
     """
 
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, *, command: str | None = None) -> None:
         self._raw_content = content
         self._timestamp = time.strftime("%H:%M:%S")
         self._show_timestamp = False
         self._markdown_cache: tuple[int, Content] | None = None
+        self.command = command
         super().__init__("")
         # Disable auto_links: the Reactive setter avoids the flicker loop caused
         # by Style.__add__ generating a fresh random _link_id on every render.
         self.auto_links = False
+
+        is_multiline = "\n" in content
+        is_markdown = any(tok in content for tok in ("```", "**", "__", "#", "- ", "* ", "|", "•", "✓", "⚠", "✗", "1. "))
+        if is_multiline or is_markdown or command:
+            self.add_class("-card")
+            self.add_class("-command-output")
+
+    def _is_command_mode(self) -> bool:
+        return self.has_class("-command-output") or self.has_class("-card") or bool(self.command)
 
     def set_timestamp_visible(self, visible: bool) -> None:
         self._show_timestamp = visible
@@ -3925,24 +4388,22 @@ class SystemMessage(Static):
         self.refresh(layout=True)
 
     def _build_display_text(self) -> str:
-        """Return display text, adding bullet prefix for single-line plain messages.
-
-        Multi-line content or content that already has markdown structure
-        (``**``, `` ``` ``, ``/``) is left untouched so rendered markdown
-        headings and code blocks are not contaminated by a leading bullet.
-        """
+        """Return display text, adding bullet prefix for single-line plain messages."""
         content = self._raw_content
         if self._show_timestamp:
             content = f"{content}  *[{self._timestamp}]*"
-        # Only prepend ● for short single-line messages that are not already
-        # markdown-formatted (code blocks, bold, or slash-command references).
+
         is_multiline = "\n" in content
-        is_markdown = any(tok in content for tok in ("```", "**", "__", "# ", "- ", "  /"))
-        already_bulleted = content.startswith("● ")
-        if not already_bulleted and not is_multiline and not is_markdown:
+        is_markdown = any(tok in content for tok in ("```", "**", "__", "#", "- ", "* ", "|", "•", "✓", "⚠", "✗", "1. "))
+        already_bulleted = content.startswith("● ") or content.startswith("• ")
+        if not already_bulleted and not is_multiline and not is_markdown and not self._is_command_mode():
             content = f"● {content}"
-        # Ensure single newlines in non-codeblock text are treated as hard line breaks
-        if "```" not in content and "\n" in content:
+
+        is_structured_markdown = any(
+            line.lstrip().startswith(("#", "-", "*", "1.", "|", ">", "•", "✓", "⚠", "✗"))
+            for line in content.splitlines()
+        )
+        if "```" not in content and "\n" in content and not is_structured_markdown:
             content = "\n".join(
                 line if line.endswith("  ") or not line else f"{line}  "
                 for line in content.splitlines()
@@ -3973,12 +4434,107 @@ class SystemMessage(Static):
                 console = self.app.console
             except Exception:
                 console = None
-            content = _markdown_to_content(text, width, console)
+            is_cmd = self._is_command_mode()
+            content = _markdown_to_content(text, width, console, is_command=is_cmd)
             self._markdown_cache = (width, content)
         return self._markdown_cache[1]
 
 
+class CommandOutputMessage(SystemMessage):
+    """A formatted command execution result widget matching OpsCloud TUI aesthetics."""
+
+    DEFAULT_CSS = """
+    CommandOutputMessage {
+        height: auto;
+        padding: 1 2;
+        margin: 1 0 1 0;
+        background: $surface 45%;
+        border-left: wide $primary;
+        color: $foreground;
+        pointer: text;
+    }
+    """
+
+    def __init__(self, content: str, *, command: str | None = None) -> None:
+        super().__init__(content, command=command)
+        self.add_class("-card")
+        self.add_class("-command-output")
+
+    def _is_command_mode(self) -> bool:
+        return True
+
+
 AppMessage = SystemMessage
+
+
+def _format_turn_duration(seconds: float) -> str:
+    """Format a turn's wall time compactly (``4.2s``, ``2m 05s``, ``1h 02m``)."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total = int(round(seconds))
+    if total < 3600:
+        minutes, secs = divmod(total, 60)
+        return f"{minutes}m {secs:02d}s"
+    hours, rem = divmod(total, 3600)
+    return f"{hours}h {rem // 60:02d}m"
+
+
+class TurnSummary(Static):
+    """One-line footer under a completed agent turn.
+
+    Renders e.g. ``✓ Done in 12.4s · 4 tools · 3.2K tokens · $0.02``.
+    The check mark uses the success colour (same health semantic as the
+    welcome banner); the metrics are dimmed so the footer never competes
+    with the reply itself.  Zero-valued metrics are omitted.
+    """
+
+    ALLOW_SELECT = False
+
+    DEFAULT_CSS = """
+    TurnSummary {
+        height: auto;
+        padding: 0 1;
+        margin: 1 0 0 0;
+        background: transparent;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        elapsed_seconds: float,
+        tool_count: int = 0,
+        tokens: int = 0,
+        cost_usd: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.elapsed_seconds = max(0.0, elapsed_seconds)
+        self.tool_count = max(0, tool_count)
+        self.tokens = max(0, tokens)
+        self.cost_usd = max(0.0, cost_usd)
+
+    def summary_text(self) -> str:
+        """Plain-text form of the footer (used for rendering and tests)."""
+        from opscloud.utils.session_stats import format_cost, format_token_count
+
+        glyphs = get_glyphs()
+        parts = [f"Done in {_format_turn_duration(self.elapsed_seconds)}"]
+        if self.tool_count:
+            parts.append(f"{self.tool_count} tool{'s' if self.tool_count != 1 else ''}")
+        if self.tokens:
+            parts.append(f"{format_token_count(self.tokens)} tokens")
+        if self.cost_usd > 0:
+            parts.append(format_cost(self.cost_usd))
+        return f" {glyphs.separator} ".join(parts)
+
+    def render(self) -> Content:
+        glyphs = get_glyphs()
+        return Content.assemble(
+            (f"{glyphs.checkmark} ", "bold $success"),
+            (self.summary_text(), "dim"),
+        )
 
 
 class MessageList(VerticalScroll):
@@ -3997,6 +4553,8 @@ class MessageList(VerticalScroll):
         self._current_thinking: ThinkingMessage | None = None
         self._accumulated_thinking: str = ""
         self._tool_calls: dict[str, ToolCallMessage] = {}
+        self._tool_call_total: int = 0
+        """Monotonic count of tool-call widgets created (per-turn deltas)."""
         self._active_tool_group: ToolGroupSummary | None = None
         self._auto_scroll_locked = True
 
@@ -4035,23 +4593,39 @@ class MessageList(VerticalScroll):
         if self._auto_scroll_locked:
             self._scroll_to_end()
 
-    def add_thinking_message(self, content: str = "", duration_seconds: float = 0.0) -> ThinkingMessage:
+    def add_thinking_message(
+        self, content: str = "", duration_seconds: float = 0.0, *, live: bool = False
+    ) -> ThinkingMessage:
         """Add a thinking message widget to the conversation."""
-        msg = ThinkingMessage(content=content, duration_seconds=duration_seconds)
+        msg = ThinkingMessage(content=content, duration_seconds=duration_seconds, live=live)
         self._mount_child(msg)
         if self._auto_scroll_locked:
             self._scroll_to_end()
         return msg
 
     def append_thinking_token(self, token: str, duration_seconds: float = 0.0) -> None:
-        """Append a token to the current thinking message."""
+        """Append a token to the current (live) thinking message."""
         if self._current_thinking is None:
-            self._current_thinking = self.add_thinking_message("", duration_seconds)
+            self._current_thinking = self.add_thinking_message("", duration_seconds, live=True)
             self._accumulated_thinking = ""
         self._accumulated_thinking += token
         self._current_thinking.update_thinking(self._accumulated_thinking, duration_seconds)
         if self._auto_scroll_locked:
             self._scroll_to_end()
+
+    def _end_thinking(self) -> None:
+        """Collapse the live thinking block, if any.
+
+        Called when reply text, a tool call or the end of the turn arrives,
+        so later reasoning in the same turn starts a fresh block below.
+        """
+        current = self._current_thinking
+        self._current_thinking = None
+        if current is not None:
+            try:
+                current.finish()
+            except Exception:
+                logger.exception("Failed to finish thinking block")
 
     def close_active_tool_group(self) -> None:
         """Close the active inline tool group so subsequent tool calls form a new group."""
@@ -4159,7 +4733,7 @@ class MessageList(VerticalScroll):
 
     def append_assistant_token(self, token: str) -> None:
         """Append a token to current assistant message."""
-        self._current_thinking = None  # Reset thinking state when text starts
+        self._end_thinking()  # Collapse thinking when reply text starts
         if self._current_assistant is None:
             self.start_assistant_message()
         if self._current_assistant is not None:
@@ -4169,6 +4743,7 @@ class MessageList(VerticalScroll):
 
     def update_assistant_message(self, text: str) -> None:
         """Replace current assistant message text with full state."""
+        self._end_thinking()
         if self._current_assistant is None:
             self.start_assistant_message()
         if self._current_assistant is not None:
@@ -4178,7 +4753,7 @@ class MessageList(VerticalScroll):
 
     def finish_assistant_message(self) -> None:
         """Finalize assistant message."""
-        self._current_thinking = None
+        self._end_thinking()
         if self._current_assistant:
             self._current_assistant.finish()
             self._current_assistant = None
@@ -4188,7 +4763,9 @@ class MessageList(VerticalScroll):
         self, name: str, call_id: str, args: dict[str, Any], live: bool = True
     ) -> None:
         """Add a tool-call widget."""
+        self._end_thinking()
         msg = ToolCallMessage(name, args)
+        self._tool_call_total += 1
         if live:
             msg.set_running()
         self._tool_calls[call_id] = msg
@@ -4218,6 +4795,7 @@ class MessageList(VerticalScroll):
         else:
             msg_name = name if (name and name != "None") else "tool"
             msg = ToolCallMessage(msg_name, {})
+            self._tool_call_total += 1
             if call_id:
                 self._tool_calls[call_id] = msg
             from contextlib import nullcontext
@@ -4261,6 +4839,7 @@ class MessageList(VerticalScroll):
         """Clear all child widgets."""
         self.remove_children()
         self._current_assistant = None
+        self._current_thinking = None
         self._tool_calls.clear()
         self._active_tool_group = None
 
@@ -4277,75 +4856,219 @@ class MessageList(VerticalScroll):
         if self._auto_scroll_locked:
             self.scroll_end(animate=False)
 
+_THINKING_HEADING_RE = re.compile(r"^\s*(?:\*\*(.+?)\*\*|#{1,6}\s+(.+?))\s*$")
+"""Matches a reasoning-summary heading line (``**Title**`` or ``## Title``)."""
+
+
+def _thinking_heading(line: str) -> str | None:
+    """Return the heading text if ``line`` is a reasoning heading, else None."""
+    match = _THINKING_HEADING_RE.match(line)
+    if not match:
+        return None
+    return (match.group(1) or match.group(2) or "").strip() or None
+
+
+def _clean_thinking_line(line: str) -> str:
+    """Strip light markdown from a reasoning line for one-line display."""
+    heading = _thinking_heading(line)
+    if heading:
+        return heading
+    return line.strip().replace("**", "").replace("`", "")
+
+
 class ThinkingMessage(Static):
-    """Collapsible widget displaying internal model reasoning / thinking content matching Claude Code style."""
+    """Model reasoning, shown in two states.
+
+    * **Live** (tokens streaming): an animated spinner, ``Thinking · 4s`` and
+      a one-line preview of the latest reasoning line.
+    * **Done**: a single dim ``▸ Thought for 6s · <topic>`` line, where the
+      topic is the first reasoning-summary heading.  Click (or Ctrl+O) to
+      expand the full reasoning, indented under the header.
+
+    The widget measures its own duration per thinking block; the adapter's
+    turn-scoped timer would otherwise over-count later blocks in a turn.
+    """
 
     DEFAULT_CSS = """
     ThinkingMessage {
         height: auto;
         padding: 0 1;
-        margin: 0 0 1 0;
-        color: $text-muted;
+        margin: 1 0 0 0;
+        pointer: pointer;
     }
     ThinkingMessage:hover {
-        color: $text;
+        background: $foreground 4%;
     }
     """
 
-    def __init__(self, content: str = "", duration_seconds: float = 0.0) -> None:
+    _TICK_SECONDS: ClassVar[float] = 0.1
+
+    def __init__(
+        self,
+        content: str = "",
+        duration_seconds: float = 0.0,
+        *,
+        live: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
         self._content = content
-        self._duration_seconds = duration_seconds
+        self._duration_seconds = max(0.0, duration_seconds)
         self._expanded = False
-        super().__init__(self._build_display())
+        self._live = live
+        self._started = time.monotonic()
+        self._frame = 0
+        self._timer: Any = None
+
+    # ── State ────────────────────────────────────────────
+
+    @property
+    def is_live(self) -> bool:
+        """Whether reasoning tokens are still streaming into this widget."""
+        return self._live
+
+    @property
+    def topic(self) -> str | None:
+        """First reasoning-summary heading, used as the collapsed topic."""
+        for line in self._content.splitlines():
+            heading = _thinking_heading(line)
+            if heading:
+                return heading
+        return None
+
+    @property
+    def preview(self) -> str:
+        """Latest reasoning paragraph, flattened to one line.
+
+        Source text is often hard-wrapped, so the last *line* is usually a
+        sentence fragment; the last *paragraph* reads naturally.
+        """
+        paragraphs = re.split(r"\n\s*\n", self._content.strip())
+        for para in reversed(paragraphs):
+            words = " ".join(
+                _clean_thinking_line(line) for line in para.splitlines() if line.strip()
+            ).strip()
+            if words:
+                return words
+        return ""
 
     def update_thinking(self, content: str, duration_seconds: float | None = None) -> None:
-        """Update content and duration dynamically during stream."""
+        """Replace the accumulated reasoning text.
+
+        ``duration_seconds`` is honoured only for non-live widgets (history
+        replay); live widgets time themselves.
+        """
         self._content = content
-        if duration_seconds is not None:
-            self._duration_seconds = duration_seconds
+        if duration_seconds is not None and not self._live:
+            self._duration_seconds = max(0.0, duration_seconds)
         if self.is_attached:
-            self.update(self._build_display())
+            self.refresh(layout=True)
 
-    def _build_display(self) -> Text:
-        glyphs = get_glyphs()
-        arrow = glyphs.disclosure_expanded if self._expanded else glyphs.disclosure_collapsed
-        dur_str = f" for {int(self._duration_seconds)}s" if self._duration_seconds > 0 else ""
-        display = Text(f"Thought{dur_str} {arrow}", style="dim bold")
+    def finish(self) -> None:
+        """End the live state and collapse to ``Thought for Ns``."""
+        if not self._live:
+            return
+        self._live = False
+        self._duration_seconds = time.monotonic() - self._started
+        self._stop_timer()
+        if self.is_attached:
+            self.refresh(layout=True)
 
-        if self._expanded and self._content:
-            display.append("\n\n")
-            for line in self._content.strip().splitlines():
-                stripped = line.strip()
-                if stripped.startswith("**") and stripped.endswith("**"):
-                    title = stripped.strip("*").strip()
-                    display.append(f"{title}\n", style="bold dim")
-                elif stripped.startswith("### "):
-                    display.append(f"{stripped[4:]}\n", style="bold dim")
-                elif stripped.startswith("## "):
-                    display.append(f"{stripped[3:]}\n", style="bold dim")
-                elif stripped.startswith("# "):
-                    display.append(f"{stripped[2:]}\n", style="bold dim")
-                else:
-                    display.append(f"{line}\n", style="dim")
-        return display
+    def toggle_details(self) -> None:
+        """Expand/collapse the full reasoning (bound to click and Ctrl+O)."""
+        if self._live or not self._content.strip():
+            return
+        self._expanded = not self._expanded
+        self.refresh(layout=True)
+
+    # ── Lifecycle ────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        if self._live:
+            self._timer = self.set_interval(self._TICK_SECONDS, self._tick)
+
+    def on_unmount(self) -> None:
+        self._stop_timer()
+
+    def _stop_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    def _tick(self) -> None:
+        self._frame += 1
+        self.refresh()
 
     def on_click(self, event: events.Click) -> None:
         """Toggle expand/collapse on click."""
         event.stop()
-        self._expanded = not self._expanded
-        self.update(self._build_display())
+        self.toggle_details()
+
+    # ── Rendering ────────────────────────────────────────
+
+    def _truncate(self, text: str, reserve: int = 0, *, keep_tail: bool = False) -> str:
+        width = (self.size.width or 100) - reserve
+        width = max(20, width)
+        if len(text) <= width:
+            return text
+        ellipsis = get_glyphs().ellipsis
+        if keep_tail:
+            tail = text[-(width - 1):]
+            head, sep, rest = tail.partition(" ")
+            if sep and len(head) < 20:
+                tail = rest  # start the ticker on a whole word
+            return ellipsis + tail.lstrip()
+        return text[: width - 1].rstrip() + ellipsis
+
+    def render(self) -> Content:
+        glyphs = get_glyphs()
+        sep = glyphs.separator
+
+        if self._live:
+            frames = glyphs.spinner_frames
+            frame = frames[self._frame % len(frames)]
+            elapsed = int(time.monotonic() - self._started)
+            parts: list[tuple[str, str] | str] = [
+                (f"{frame} ", "$primary"),
+                ("Thinking", "bold $primary"),
+                (f" {sep} {elapsed}s", "dim"),
+            ]
+            preview = self.preview
+            if preview:
+                parts.append("\n")
+                parts.append(("  " + self._truncate(preview, reserve=2, keep_tail=True), "dim italic"))
+            return Content.assemble(*parts)
+
+        arrow = glyphs.disclosure_expanded if self._expanded else glyphs.disclosure_collapsed
+        dur = int(round(self._duration_seconds))
+        label = f"Thought for {dur}s" if dur > 0 else "Thought"
+        parts = [(f"{arrow} ", "dim"), (label, "dim bold")]
+        topic = self.topic
+        if topic and not self._expanded:
+            reserve = len(label) + len(sep) + 6
+            parts.append((f" {sep} {self._truncate(topic, reserve=reserve)}", "dim italic"))
+
+        if self._expanded and self._content.strip():
+            parts.append("\n")
+            for line in self._content.strip().splitlines():
+                heading = _thinking_heading(line)
+                if heading:
+                    parts.append((f"\n  {heading}", "bold dim"))
+                else:
+                    parts.append((f"\n  {line.strip()}", "dim"))
+        return Content.assemble(*parts)
 
 class QueuedUserMessage(Static):
-    """A user message currently waiting in the processing queue."""
+    """A user message waiting in the queue: dim prompt with an amber tag."""
 
     DEFAULT_CSS = """
     QueuedUserMessage {
         height: auto;
         padding: 0 1;
         margin: 1 0 0 0;
-        background: $panel;
-        opacity: 0.7;
-        color: $foreground;
+        background: transparent;
+        border-left: wide $warning 45%;
+        color: $text-muted;
     }
     """
 
@@ -4356,8 +5079,9 @@ class QueuedUserMessage(Static):
     def render(self) -> Content:
         """Render the queued message with live theme colors."""
         return Content.assemble(
-            ("Queued: ", "italic bold $warning"),
+            ("❯ ", "dim"),
             (self._raw_content, "italic dim"),
+            ("  queued", "italic $warning"),
         )
 
 

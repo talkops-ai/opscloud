@@ -178,7 +178,7 @@ class SubagentPanel(Vertical):
     SubagentPanel {
         height: auto;
         background: $background;
-        border-top: solid $panel;
+        border-top: solid $primary 35%;
         display: none;
         padding: 1 2;
     }
@@ -214,7 +214,7 @@ class SubagentPanel(Vertical):
     SubagentPanel #subagent-phases-scroll {
         width: 24;
         height: 100%;
-        border-right: solid $panel;
+        border-right: solid $primary 25%;
         padding-right: 2;
         margin-right: 2;
     }
@@ -243,6 +243,12 @@ class SubagentPanel(Vertical):
         self._spinner = Spinner()
         self._timer: Timer | None = None
         self._pending_reset = False
+        self._dirty = False
+        self._paused = False
+
+    def on_mount(self) -> None:
+        if not self._paused and (self._dirty or self._any_running()):
+            self._ensure_timer()
 
     def compose(self) -> ComposeResult:
         yield Static("", id="subagent-header", markup=False)
@@ -351,36 +357,44 @@ class SubagentPanel(Vertical):
 
     def set_subagent_activity(self, sub_id: str | None, action: str | None) -> None:
         """Update live activity/tool description for a subagent."""
+        record: _SubagentRecord | None = None
         if sub_id:
             record = self._find_record(sub_id) or self._find_record_by_name(sub_id)
-            if record:
-                record.current_action = action
-                self._refresh()
+        if record is None:
+            running_records = [
+                r for phase in self._phases.values() for r in phase.records.values() if r.status == "running"
+            ]
+            if len(running_records) == 1:
+                record = running_records[0]
+            else:
                 return
-        for phase in self._phases.values():
-            for record in phase.records.values():
-                if record.status == "running":
-                    record.current_action = action
-                    self._refresh()
-                    return
+
+        if record is not None and record.current_action != action:
+            record.current_action = action
+            self._mark_dirty()
 
     def set_subagent_model(self, sub_id: str | None, model: str | None) -> None:
         """Update model description for a subagent."""
         if not model:
             return
         clean_model = model.split(":")[-1] if ":" in model else model
+        record: _SubagentRecord | None = None
         if sub_id:
             record = self._find_record(sub_id) or self._find_record_by_name(sub_id)
-            if record:
-                record.model = _sanitize(clean_model, max_chars=60)
-                self._refresh()
+        if record is None:
+            running_records = [
+                r for phase in self._phases.values() for r in phase.records.values() if r.status == "running"
+            ]
+            if len(running_records) == 1:
+                record = running_records[0]
+            else:
                 return
-        for phase in self._phases.values():
-            for record in phase.records.values():
-                if record.status == "running":
-                    record.model = _sanitize(clean_model, max_chars=60)
-                    self._refresh()
-                    return
+
+        if record is not None:
+            sanitized = _sanitize(clean_model, max_chars=60)
+            if record.model != sanitized:
+                record.model = sanitized
+                self._mark_dirty()
 
     def _handle_start(self, sub_id: str, eval_key: str, event: dict[str, Any]) -> None:
         if self._pending_reset:
@@ -595,6 +609,7 @@ class SubagentPanel(Vertical):
         self._applied_height = None
         self._last_render.clear()
         self._pending_reset = False
+        self._dirty = False
         self._stop_timer()
         self.remove_class("-visible")
 
@@ -634,11 +649,26 @@ class SubagentPanel(Vertical):
     def on_resize(self, _event: events.Resize) -> None:
         self._refresh()
 
+    def _mark_dirty(self) -> None:
+        """Mark panel state dirty for the next tick, avoiding unthrottled synchronous renders."""
+        self._dirty = True
+        self._ensure_timer()
+
+    def _tick(self) -> None:
+        """Throttled refresh tick: updates at most 10 fps when subagents are running or dirty."""
+        if self._any_running() or self._dirty:
+            self._dirty = False
+            self._refresh()
+        elif not self._any_running():
+            self._stop_timer()
+
     def _ensure_timer(self) -> None:
+        if self._paused or not getattr(self, "is_mounted", False):
+            return
         if self._timer is None:
             try:
-                self._timer = self.set_interval(_TICK_INTERVAL, self._refresh)
-            except RuntimeError:
+                self._timer = self.set_interval(_TICK_INTERVAL, self._tick)
+            except Exception:
                 pass
 
     def _stop_timer(self) -> None:
@@ -648,11 +678,13 @@ class SubagentPanel(Vertical):
 
     def pause(self) -> None:
         """Pause the refresh timer while an approval dialog is visible."""
+        self._paused = True
         self._stop_timer()
 
     def resume(self) -> None:
         """Resume the refresh timer after an approval decision."""
-        if self._any_running():
+        self._paused = False
+        if self._any_running() or self._dirty:
             self._ensure_timer()
 
     def _turn_counts(self) -> tuple[int, int, int, int]:
@@ -708,7 +740,7 @@ class SubagentPanel(Vertical):
         )
         done, total, failed, cancelled = self._turn_counts()
         if self._any_running() or not total:
-            icon, tint = self._spinner.next_frame(), colors.warning
+            icon, tint = self._spinner.next_frame(), colors.primary
         elif failed:
             icon, tint = glyphs.error, colors.error
         elif cancelled:
@@ -791,12 +823,12 @@ class SubagentPanel(Vertical):
             mark = glyphs.disclosure_collapsed
         else:
             mark = glyphs.bullet
-        caret = glyphs.cursor if selected else " "
+        from opscloud.config.settings import is_ascii_mode
+        bar = "|" if is_ascii_mode() else "▌"
+        caret = bar if selected else " "
         tint = colors.primary if selected else colors.muted
-        elapsed = _format_timing(phase.elapsed_seconds())
-        sep = getattr(glyphs, "separator", "·")
         return Content.styled(
-            f"{caret} {mark} {phase.index} {done}/{total} {sep} {elapsed}", tint
+            f"{caret} {mark} Phase {phase.index} ({done}/{total})", tint
         )
 
     def _agents_width(self) -> int:
@@ -845,7 +877,7 @@ class SubagentPanel(Vertical):
     ) -> Content:
         if record.status == "running":
             icon = self._spinner.current_frame()
-            tint = colors.warning
+            tint = colors.primary
         elif record.status == "done":
             icon = glyphs.checkmark
             tint = colors.success
@@ -873,7 +905,14 @@ class SubagentPanel(Vertical):
             model = _sanitize(model, max_chars=_MODEL_COL)
         else:
             model = ""
-        right = self._right_block(model, timing)
+        model_part = model[:_MODEL_COL].ljust(_MODEL_COL)
+        timing_part = timing[:_TIMING_COL].rjust(_TIMING_COL)
+        right_pieces = [
+            Content.styled(model_part + "  ", f"{colors.secondary} dim")
+            if model.strip()
+            else Content(" " * (_MODEL_COL + 2)),
+            Content.styled(timing_part, colors.muted),
+        ]
 
         if record.status == "error" and record.error:
             err_text = f" - {record.error}"
@@ -883,11 +922,11 @@ class SubagentPanel(Vertical):
             return Content.assemble(
                 Content.styled(f"  {icon}  ", tint),
                 Content.styled(task_str, colors.foreground),
-                Content.styled(right, colors.muted),
+                *right_pieces,
             )
 
         if record.status == "running" and record.current_action:
-            action_badge = f"‣ {record.current_action}"
+            action_badge = f"{self._spinner.current_frame()} {record.current_action}"
             # Reserve space for the action badge so it remains visible
             max_label_len = max(12, task_col - len(action_badge) - 2)
             if len(label) > max_label_len:
@@ -900,15 +939,15 @@ class SubagentPanel(Vertical):
                 Content.styled(f"  {icon}  ", tint),
                 Content.styled(task_label, colors.foreground),
                 Content.styled(padding, colors.foreground),
-                Content.styled(action_badge, colors.warning),
-                Content.styled(right, colors.muted),
+                Content.styled(action_badge, f"bold {colors.primary}"),
+                *right_pieces,
             )
 
         task = _sanitize(label, max_chars=task_col - 1).ljust(task_col)
         return Content.assemble(
             Content.styled(f"  {icon}  ", tint),
             Content.styled(task, colors.foreground),
-            Content.styled(right, colors.muted),
+            *right_pieces,
         )
 
     def _heading_row(self, task_col: int, colors: Any) -> Content:

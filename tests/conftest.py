@@ -32,6 +32,15 @@ def clean_environment(monkeypatch, tmp_path):
     monkeypatch.setattr("opscloud.config.toml_config._RECENT_MODELS_FILE", test_state_dir / "recent_models.json")
     monkeypatch.setattr("opscloud.config.toml_config._RECENT_PROFILES_FILE", test_state_dir / "recent_cloud_profiles.json")
 
+    # Isolate test logging to prevent test runs from polluting user's active opscloud.log
+    test_log_file = test_data_dir / "test.log"
+    try:
+        from opscloud.utils.logger import configure_logging
+
+        configure_logging(log_dir=test_data_dir, log_file=test_log_file, log_to_file=False)
+    except Exception:
+        pass
+
     # Baseline mock keys for offline deterministic unit testing
     if not os.environ.get("GOOGLE_API_KEY"):
         monkeypatch.setenv("GOOGLE_API_KEY", "mock-test-key-google")

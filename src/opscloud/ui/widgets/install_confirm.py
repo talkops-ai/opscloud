@@ -6,48 +6,31 @@ from opscloud.utils.logger import get_logger
 from typing import ClassVar
 
 from textual.binding import Binding, BindingType
-from textual.containers import Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from opscloud.model.config import PROVIDER_DISPLAY_NAMES
+from opscloud.ui.widgets.modal_base import OpsModalScreen
 
 logger = get_logger(__name__)
 
 
-class InstallProviderConfirmScreen(ModalScreen[bool]):
+class InstallProviderConfirmScreen(OpsModalScreen[bool]):
     """Confirmation modal for installing a model provider's extra.
 
     Shown when the user selects a model whose provider integration package is not installed.
     Dismisses with True to install and False to cancel.
     """
 
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
+
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("enter", "confirm", "Install", show=False, priority=True),
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
     ]
 
-    CSS = """
-    InstallProviderConfirmScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    InstallProviderConfirmScreen > Vertical {
-        width: 68;
-        max-width: 90%;
-        height: auto;
-        max-height: 90vh;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     InstallProviderConfirmScreen .install-confirm-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     InstallProviderConfirmScreen .install-confirm-body {
@@ -57,10 +40,7 @@ class InstallProviderConfirmScreen(ModalScreen[bool]):
     }
 
     InstallProviderConfirmScreen .install-confirm-help {
-        height: 1;
-        color: $text-muted;
-        text-style: italic;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -72,7 +52,7 @@ class InstallProviderConfirmScreen(ModalScreen[bool]):
         self._extra = extra
         self._model_spec = model_spec
 
-    def compose(self):
+    def compose_modal(self):
         provider_name = PROVIDER_DISPLAY_NAMES.get(
             self._provider, self._provider.replace("_", " ").title()
         )
@@ -89,20 +69,30 @@ class InstallProviderConfirmScreen(ModalScreen[bool]):
                 f"the provider package to your opscloud environment."
             )
 
-        with Vertical():
-            yield Static(
-                f"Install {provider_name} support?",
-                classes="install-confirm-title",
-            )
-            yield Static(
-                body,
-                classes="install-confirm-body",
-                markup=True,
-            )
-            yield Static(
-                "Enter to install, Esc to cancel",
-                classes="install-confirm-help",
-            )
+        yield Static(
+            f"Install {provider_name} support?",
+            classes="install-confirm-title",
+        )
+        yield Static(
+            body,
+            classes="install-confirm-body",
+            markup=True,
+        )
+        yield Static(
+            "Enter to install, Esc to cancel",
+            classes="install-confirm-help",
+        )
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        provider_name = PROVIDER_DISPLAY_NAMES.get(
+            self._provider, self._provider.replace("_", " ").title()
+        )
+        self.set_modal_title(f"Install {provider_name} support?")
+        self.set_modal_subtitle([
+            ("enter", "install"),
+            ("esc", "cancel"),
+        ])
 
     def action_confirm(self) -> None:
         self.dismiss(True)

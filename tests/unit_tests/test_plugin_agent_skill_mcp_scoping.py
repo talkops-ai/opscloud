@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from langchain_core.tools import tool
@@ -123,6 +123,62 @@ def _create_vertical_plugin(plugins_dir: Path, name: str = "equity-research") ->
     return plugin_dir
 
 
+def test_subagent_mcp_configs_are_namespaced(tmp_path: Path) -> None:
+    """Two agents may safely reuse a raw MCP server name."""
+    from opscloud.plugins.adapters.mcp import subagent_mcp_configs
+
+    bundle = tmp_path / "agent"
+    bundle.mkdir()
+    (bundle / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"aws": {"command": "aws-mcp"}}}),
+        encoding="utf-8",
+    )
+
+    first = subagent_mcp_configs("finops", bundle)
+    second = subagent_mcp_configs("security", bundle)
+
+    assert set(first) == {"subagent__finops__aws"}
+    assert set(second) == {"subagent__security__aws"}
+
+
+def test_prepare_subagents_mcp_uses_one_preload_batch() -> None:
+    """MCP I/O is globally batched instead of serialized per subagent."""
+    from opscloud.mcp.preload import clear_cached_mcp_server_infos
+    from opscloud.plugins.adapters.mcp import prepare_subagents_mcp
+
+    clear_cached_mcp_server_infos()
+    subagents = {
+        "finops": {
+            "name": "finops",
+            "mcp_config": {
+                "mcpServers": {
+                    "aws": {"command": "first", "enabled": False},
+                }
+            },
+        },
+        "security": {
+            "name": "security",
+            "mcp_config": {
+                "mcpServers": {
+                    "aws": {"command": "second", "enabled": False},
+                }
+            },
+        },
+    }
+
+    with patch("opscloud.mcp.preload.preload_mcp_metadata", new_callable=AsyncMock) as preload:
+        preload.return_value = []
+        prepared = prepare_subagents_mcp(subagents)
+
+    preload.assert_awaited_once()
+    batched = preload.await_args.args[0]
+    assert set(batched) == {
+        "subagent__finops__aws",
+        "subagent__security__aws",
+    }
+    assert set(prepared) == {"finops", "security"}
+
+
 def test_mcp_discovery_scopes_plugin_mcp(tmp_path: Path) -> None:
     """Verify MCP discovery includes partner plugin MCP and excludes agent plugin MCP."""
     plugins_dir = tmp_path / "plugins"
@@ -216,6 +272,8 @@ async def test_agent_factory_dynamic_subagents_and_coordinator_attachment(tmp_pa
 
         # Dynamic subagent has its own PluginSkillsMiddleware containing its skills
         matching_sub = [s for s in subagents if isinstance(s, dict) and "earnings-reviewer" in s["name"]][0]
+        # Direct persona sessions and the parent task tool share one compiled runnable.
+        assert "runnable" in matching_sub
         mw_list = matching_sub.get("middleware", [])
         skills_mws = [mw for mw in mw_list if isinstance(mw, PluginSkillsMiddleware)]
         assert len(skills_mws) >= 1
@@ -307,7 +365,7 @@ async def test_subagent_mcp_tools_and_middleware_scoping_with_preloaded_tools(tm
     mock_model.profile = {}
 
     with (
-        patch("opscloud.plugins.adapters.mcp.prepare_subagent_mcp") as mock_prep_mcp,
+        patch("opscloud.plugins.adapters.mcp.prepare_subagents_mcp") as mock_prep_mcp,
         patch("opscloud.agent.factory.create_deep_agent") as mock_create,
     ):
         mock_info1 = MagicMock()
@@ -316,11 +374,13 @@ async def test_subagent_mcp_tools_and_middleware_scoping_with_preloaded_tools(tm
         mock_info2.name = "billing"
         mock_info3 = MagicMock()
         mock_info3.name = "awspricing"
-        mock_prep_mcp.return_value = (
-            {"aws-mcp": {}, "billing": {}, "awspricing": {}},
-            mock_mcp_tools,
-            [mock_info1, mock_info2, mock_info3],
-        )
+        mock_prep_mcp.return_value = {
+            "finops@project": (
+                {"aws-mcp": {}, "billing": {}, "awspricing": {}},
+                mock_mcp_tools,
+                [mock_info1, mock_info2, mock_info3],
+            )
+        }
         mock_create.return_value = MagicMock()
 
         agent_graph, backend = create_opscloud_agent(
@@ -432,14 +492,16 @@ def test_coordinator_deep_agent_mcp_binding_and_isolation(tmp_path: Path):
     mock_model.profile = {}
 
     with (
-        patch("opscloud.plugins.adapters.mcp.prepare_subagent_mcp") as mock_prep_mcp,
+        patch("opscloud.plugins.adapters.mcp.prepare_subagents_mcp") as mock_prep_mcp,
         patch("opscloud.agent.factory.create_deep_agent") as mock_create,
     ):
-        mock_prep_mcp.return_value = (
-            {"billing": {"command": "uvx", "args": ["billing-server"]}},
-            [mock_billing_tool],
-            [MagicMock(name="billing")],
-        )
+        mock_prep_mcp.return_value = {
+            "finops": (
+                {"billing": {"command": "uvx", "args": ["billing-server"]}},
+                [mock_billing_tool],
+                [MagicMock(name="billing")],
+            )
+        }
         mock_create.return_value = MagicMock()
 
         # Invoke factory with coordinator MCP tools and config
@@ -465,15 +527,19 @@ def test_coordinator_deep_agent_mcp_binding_and_isolation(tmp_path: Path):
         assert mock_billing_tool not in coord_tools
 
         # 2. Coordinator middleware verify:
-        # - Has MCPContextMiddleware
-        # - Has MCPToolMiddleware
-        # - Has ServerHooksMiddleware with mcp_tools
+        # - Has MCPContextMiddleware and MCPToolMiddleware
         assert any(isinstance(mw, MCPContextMiddleware) for mw in coord_mws)
         assert any(isinstance(mw, MCPToolMiddleware) for mw in coord_mws)
         hooks_mws = [mw for mw in coord_mws if isinstance(mw, ServerHooksMiddleware)]
         assert len(hooks_mws) == 1
         assert "github_create_issue" in hooks_mws[0]._mcp_servers
         assert hooks_mws[0]._mcp_servers["github_create_issue"] == "github"
+
+        # - Coordinator MCPContextMiddleware prompt contains ONLY coordinator server
+        coord_mcp_ctx = next(mw for mw in coord_mws if isinstance(mw, MCPContextMiddleware))
+        coord_ctx_text = coord_mcp_ctx._build_mcp_context()
+        assert "github" in coord_ctx_text
+        assert "billing" not in coord_ctx_text
 
         # 3. Subagent tools and middleware verify:
         finops_sub = next(s for s in subagents if s.get("name") == "finops")
@@ -489,6 +555,12 @@ def test_coordinator_deep_agent_mcp_binding_and_isolation(tmp_path: Path):
         assert any(isinstance(mw, MCPContextMiddleware) for mw in sub_mws)
         assert any(isinstance(mw, MCPToolMiddleware) for mw in sub_mws)
 
+        # - Subagent MCPContextMiddleware prompt contains ONLY subagent server
+        sub_mcp_ctx = next(mw for mw in sub_mws if isinstance(mw, MCPContextMiddleware))
+        sub_ctx_text = sub_mcp_ctx._build_mcp_context()
+        assert "billing" in sub_ctx_text
+        assert "github" not in sub_ctx_text
+
         # - ToolFilterMiddleware allows subagent MCP tool
         tf = next(mw for mw in sub_mws if isinstance(mw, ToolFilterMiddleware))
         assert tf.is_tool_allowed("billing_get_cost_and_usage", mock_billing_tool) is True
@@ -496,3 +568,85 @@ def test_coordinator_deep_agent_mcp_binding_and_isolation(tmp_path: Path):
         # Coordinator tool blocked for subagent
         assert tf.is_tool_allowed("github_create_issue", mock_github_tool) is False
 
+
+def test_mcp_context_middleware_filters_by_config() -> None:
+    """Verify MCPContextMiddleware only includes servers present in mcp_config, filtering out leaked subagents."""
+    from opscloud.mcp.mcp_info import MCPServerInfo, MCPToolInfo
+    from opscloud.middleware.mcp_context import MCPContextMiddleware
+
+    coord_info = MCPServerInfo(
+        name="plugin__aws-core__aws-mcp",
+        status="ok",
+        tools=(MCPToolInfo(name="aws_describe_regions", description="AWS regions", input_schema={}),),
+    )
+    subagent_info_1 = MCPServerInfo(
+        name="subagent__sec-engineer__iam",
+        status="ok",
+        tools=(MCPToolInfo(name="iam_list_users", description="IAM users", input_schema={}),),
+    )
+    subagent_info_2 = MCPServerInfo(
+        name="subagent__platform-engineer__eks",
+        status="ok",
+        tools=(MCPToolInfo(name="eks_list_clusters", description="EKS clusters", input_schema={}),),
+    )
+
+    all_infos = [coord_info, subagent_info_1, subagent_info_2]
+    coord_config = {
+        "plugin__aws-core__aws-mcp": {"command": "uvx", "args": ["aws-mcp"]},
+    }
+
+    mw = MCPContextMiddleware(mcp_server_info=all_infos, mcp_config=coord_config)
+    context = mw._build_mcp_context()
+
+    assert "plugin__aws-core__aws-mcp" in context
+    assert "aws_describe_regions" in context
+    assert "subagent__sec-engineer__iam" not in context
+    assert "subagent__platform-engineer__eks" not in context
+    assert "iam_list_users" not in context
+    assert "eks_list_clusters" not in context
+
+
+@pytest.mark.asyncio
+async def test_create_opscloud_agent_async_scopes_mcp_server_info_to_coordinator(tmp_path: Path) -> None:
+    """Verify create_opscloud_agent_async only passes coordinator MCP servers to kwargs['mcp_server_info']."""
+    from opscloud.agent.factory import create_opscloud_agent_async
+    from opscloud.mcp.mcp_info import MCPServerInfo, MCPToolInfo
+
+    project_context = MagicMock(user_cwd=tmp_path, project_root=tmp_path)
+    coord_info = MCPServerInfo(
+        name="plugin__aws-core__aws-mcp",
+        status="ok",
+        tools=(MCPToolInfo(name="aws_describe_regions", description="AWS regions", input_schema={}),),
+    )
+    sub_info = MCPServerInfo(
+        name="subagent__sec-engineer__iam",
+        status="ok",
+        tools=(MCPToolInfo(name="iam_list_users", description="IAM users", input_schema={}),),
+    )
+
+    with (
+        patch("opscloud.agent.factory.list_subagents", return_value=[]),
+        patch("opscloud.plugins.adapters.mcp.prepare_subagents_mcp_async", new_callable=AsyncMock, return_value={}) as _,
+        patch(
+            "opscloud.mcp.discovery.discover_mcp_configs",
+            return_value={"plugin__aws-core__aws-mcp": {"command": "uvx", "args": ["aws-mcp"]}},
+        ),
+        patch("opscloud.mcp.preload.preload_mcp_metadata", new_callable=AsyncMock, return_value=[coord_info]),
+        patch("opscloud.mcp.preload.get_cached_mcp_server_infos", return_value=[coord_info, sub_info]),
+        patch("opscloud.mcp.session_manager.MCPSessionManager.get_instance") as mock_mgr,
+        patch("opscloud.mcp.session_manager.build_mcp_tools_from_server_infos", return_value=[]),
+        patch("opscloud.agent.factory.create_opscloud_agent", return_value=(MagicMock(), MagicMock())) as compile_agent,
+    ):
+        mock_mgr.return_value.register_servers = MagicMock()
+        await create_opscloud_agent_async(
+            model=MagicMock(),
+            cwd=tmp_path,
+            project_context=project_context,
+        )
+
+    assert compile_agent.called
+    passed_mcp_info = compile_agent.call_args.kwargs.get("mcp_server_info", [])
+    passed_names = {getattr(s, "name", str(s)) for s in passed_mcp_info}
+
+    assert "plugin__aws-core__aws-mcp" in passed_names
+    assert "subagent__sec-engineer__iam" not in passed_names

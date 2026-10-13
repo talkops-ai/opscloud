@@ -142,7 +142,7 @@ class CloudHandler(BaseCommandHandler):
         identity = resolve_aws_identity(profile=active)
 
         lines = [
-            "☁️ **Current Cloud Context:**",
+            "**Current Cloud Context:**",
             f"- **Provider:** AWS",
             f"- **Active Profile:** `{active}`",
             f"- **Persisted in config.toml:** `{persisted or 'none (using env/default)'}`",

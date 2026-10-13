@@ -84,7 +84,7 @@ from opscloud.rubrics.evaluator import (
     _RUBRIC_GRADER_SYSTEM_PROMPT,
     _create_rubric_grader_tools,
 )
-from opscloud.skills.registry import SkillRegistry, SkillSourceTuple
+from opscloud.skills.registry import SkillRegistry
 from opscloud.subagents.loader import list_subagents
 from opscloud.subagents.types import SubagentMetadata
 from opscloud.tools.catalog import register_all_tools
@@ -368,6 +368,12 @@ def _subagent_cli_middleware(
     elif interrupt_on is not None:
         middleware.append(AsyncApprovalHITLMiddleware(interrupt_on))
 
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+    from deepagents.backends import FilesystemBackend
+
+    effective_backend = backend or FilesystemBackend(virtual_mode=False)
+    middleware.append(FilesystemMiddleware(backend=effective_backend))
+
     if not has_explicit_model:
         middleware.append(ConfigurableModelMiddleware(persist_model_state=False))
 
@@ -418,9 +424,20 @@ def _subagent_cli_middleware(
 
     server_keys: list[str] = []
     if mcp_config:
-        server_keys.extend(k for k in mcp_config.keys())
+        for k in mcp_config.keys():
+            server_keys.append(k)
+            if "__" in k:
+                base = k.rsplit("__", 1)[-1]
+                if base and base not in server_keys:
+                    server_keys.append(base)
     if mcp_server_info:
-        server_keys.extend(str(getattr(s, "name", s)) for s in mcp_server_info)
+        for s in mcp_server_info:
+            s_name = str(getattr(s, "name", s))
+            server_keys.append(s_name)
+            if "__" in s_name:
+                base = s_name.rsplit("__", 1)[-1]
+                if base and base not in server_keys:
+                    server_keys.append(base)
 
     if allowed_tools or capabilities:
         middleware.append(
@@ -496,6 +513,20 @@ def _subagent_cli_middleware(
     from opscloud.middleware.subagent_artifacts import SubagentArtifactsMiddleware
 
     middleware.append(AskUserMiddleware())
+
+    from opscloud.config.langsmith import get_langsmith_project_name
+    from opscloud.middleware.local_context import LocalContextMiddleware
+
+    tracing_project_name = get_langsmith_project_name()
+    current_settings = get_settings()
+    middleware.append(
+        LocalContextMiddleware(
+            backend=backend,
+            working_dir=subagent_cwd,
+            tracing_project=tracing_project_name,
+            user_tracing_project=getattr(current_settings, "user_langchain_project", tracing_project_name),
+        )
+    )
 
     middleware.append(ManagedMemoryGuardMiddleware())
     middleware.append(SubagentArtifactsMiddleware())
@@ -619,11 +650,16 @@ def create_opscloud_agent(
         all_tools.extend(mcp_tools)
         if mcp_configs is None:
             mcp_configs = discover_mcp_configs(project_scope_root)
+        if cached_infos and mcp_configs:
+            cached_infos = [
+                info for info in cached_infos if getattr(info, "name", str(info)) in mcp_configs
+            ]
     else:
         if mcp_configs is None:
             mcp_configs = discover_mcp_configs(project_scope_root)
         from opscloud.mcp.preload import (
             get_cached_mcp_server_infos,
+            is_mcp_server_info_cached,
             preload_mcp_metadata,
         )
         from opscloud.mcp.session_manager import (
@@ -635,11 +671,10 @@ def create_opscloud_agent(
         if mcp_configs:
             try:
                 cached_infos = get_cached_mcp_server_infos()
-                cached_by_name = {info.name: info for info in cached_infos}
                 missing_configs = {
-                    k: v
-                    for k, v in mcp_configs.items()
-                    if k not in cached_by_name or not cached_by_name[k].enabled or cached_by_name[k].status != "ok"
+                    name: config
+                    for name, config in mcp_configs.items()
+                    if not is_mcp_server_info_cached(name, config)
                 }
 
                 if missing_configs:
@@ -650,17 +685,20 @@ def create_opscloud_agent(
 
                     if loop is not None and loop.is_running():
                         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            new_infos = pool.submit(asyncio.run, preload_mcp_metadata(missing_configs)).result()
+                            pool.submit(asyncio.run, preload_mcp_metadata(missing_configs)).result()
                     else:
-                        new_infos = asyncio.run(preload_mcp_metadata(missing_configs))
+                        asyncio.run(preload_mcp_metadata(missing_configs))
                     cached_infos = get_cached_mcp_server_infos()
 
                 coordinator_infos = [
-                    info for info in cached_infos if info.name in mcp_configs and info.enabled and info.status == "ok"
+                    info for info in cached_infos if info.name in mcp_configs
                 ]
-                list(coordinator_infos)
+                active_coordinator_infos = [
+                    info for info in coordinator_infos if info.enabled and info.status == "ok"
+                ]
 
-                discovered_tools = build_mcp_tools_from_server_infos(coordinator_infos, mcp_manager)
+                discovered_tools = build_mcp_tools_from_server_infos(active_coordinator_infos, mcp_manager)
+                cached_infos = coordinator_infos
                 if discovered_tools:
                     mcp_tools_list.extend(discovered_tools)
                     all_tools.extend(discovered_tools)
@@ -720,6 +758,18 @@ def create_opscloud_agent(
 
     compiled_subagents: list[SubAgent] = []
     base_subagent_tools = [t for t in all_tools if t not in mcp_tools_list]
+
+    # Collect every subagent's MCP config first, then probe all unique servers in
+    # one globally bounded batch. This avoids one blocking async bridge per agent.
+    from opscloud.plugins.adapters.mcp import prepare_subagents_mcp
+
+    prepared_subagent_mcp = kwargs.pop("_prepared_subagent_mcp", None)
+    if prepared_subagent_mcp is None:
+        prepared_subagent_mcp = prepare_subagents_mcp(
+            subagent_by_name,
+            project_scope_root,
+        )
+
     for name, subagent_meta in subagent_by_name.items():
         model_spec = subagent_meta.get("model")
         has_explicit_model = bool(model_spec)
@@ -736,11 +786,9 @@ def create_opscloud_agent(
         subagent_path = subagent_meta.get("path")
         custom_mw = subagent_meta.get("middleware")
 
-        # Build per-subagent MCP config and tools for this subagent
-        from opscloud.plugins.adapters.mcp import prepare_subagent_mcp
-
-        servers, subagent_mcp_tools, sub_mcp_server_infos = prepare_subagent_mcp(
-            subagent_name, subagent_meta, project_scope_root
+        servers, subagent_mcp_tools, sub_mcp_server_infos = prepared_subagent_mcp.get(
+            subagent_name,
+            ({}, [], []),
         )
 
         if subagent_mcp_tools:
@@ -862,6 +910,7 @@ def create_opscloud_agent(
         agent_middleware.append(AskUserMiddleware())
 
     # 10.5 MCP tool arguments and error handling
+    coord_server_info: list[Any] | None = None
     if mcp_tools_list or cached_infos or mcp_configs:
         mcp_cfg_for_mw = mcp_configs
         if not mcp_cfg_for_mw and not cached_infos and mcp_tools_list:
@@ -873,11 +922,23 @@ def create_opscloud_agent(
             if synth_cfg:
                 mcp_cfg_for_mw = synth_cfg
 
-        if cached_infos or mcp_cfg_for_mw:
+        if cached_infos is not None:
+            if mcp_cfg_for_mw:
+                coord_server_info = [
+                    info for info in cached_infos
+                    if getattr(info, "name", str(info)) in mcp_cfg_for_mw
+                ]
+            else:
+                coord_server_info = [
+                    info for info in cached_infos
+                    if not str(getattr(info, "name", info)).startswith("subagent__")
+                ]
+
+        if coord_server_info or mcp_cfg_for_mw:
             from opscloud.middleware.mcp_context import MCPContextMiddleware
 
             agent_middleware.append(
-                MCPContextMiddleware(mcp_server_info=cached_infos, mcp_config=mcp_cfg_for_mw)
+                MCPContextMiddleware(mcp_server_info=coord_server_info, mcp_config=mcp_cfg_for_mw)
             )
         agent_middleware.append(MCPToolMiddleware())
 
@@ -1050,7 +1111,7 @@ def create_opscloud_agent(
             auto_approve=auto_approve,
             shell_allow_list=allow_list,
             interrupt_on=interrupt_on,
-            mcp_server_info=cached_infos,
+            mcp_server_info=coord_server_info,
             mcp_config=mcp_configs,
             mcp_tools=mcp_tools_list or None,
         )
@@ -1058,6 +1119,50 @@ def create_opscloud_agent(
         logger.warning("Failed to create workflow agent: %s", exc, exc_info=True)
 
     agent_middleware.append(WorkflowMiddleware(workflow_agent=workflow_agent))
+
+    # 10.12b AgentSessionMiddleware — direct plugin agent session interaction.
+    # Runs before goal-criteria handling; an agent session turn jumps to "end"
+    # so the main deep agent never sees it. Each plugin subagent runnable is
+    # compiled with the exact same tools, MCP servers, skills, definition, and
+    # middleware attached as when invoked via js_eval / task.
+    from opscloud.middleware.agent_session import AgentSessionMiddleware
+    from deepagents.middleware.subagents import SubAgent, create_sub_agent
+
+    plugin_agent_runnables: dict[str, Any] = {}
+    for sub in compiled_subagents:
+        s_name = sub.get("name")
+        if not s_name:
+            continue
+        s_meta = subagent_by_name.get(s_name)
+        if s_meta and (
+            s_meta.get("is_plugin")
+            or s_meta.get("plugin_id")
+            or s_meta.get("source", "").startswith("plugin:")
+        ):
+            try:
+                spec_dict: dict[str, Any] = dict(sub)
+                if "model" not in spec_dict or not spec_dict.get("model"):
+                    spec_dict["model"] = active_model
+                from opscloud.state import OpsCloudAgentState
+
+                spec_to_compile = cast(SubAgent, spec_dict)
+                runnable = create_sub_agent(spec_to_compile, state_schema=OpsCloudAgentState)
+                # Deep Agents accepts a CompiledSubAgent-shaped mapping and
+                # will reuse this runnable instead of compiling the raw spec
+                # again while building the parent task tool. Keep the original
+                # fields for middleware inspection and compatibility.
+                cast(dict[str, Any], sub)["runnable"] = runnable
+                plugin_agent_runnables[s_name] = runnable
+                short = s_name.rsplit(":", 1)[-1]
+                if "@" in short:
+                    short = short.split("@", 1)[0]
+                plugin_agent_runnables[short] = runnable
+                plugin_agent_runnables[s_name.lower()] = runnable
+                plugin_agent_runnables[short.lower()] = runnable
+            except Exception as exc:
+                logger.warning("Failed to compile plugin agent runnable %s: %s", s_name, exc)
+
+    agent_middleware.append(AgentSessionMiddleware(agent_runnables=plugin_agent_runnables))
 
     agent_middleware.append(
         GoalCriteriaMiddleware(
@@ -1143,8 +1248,103 @@ __all__ = [
 create_agent = create_opscloud_agent
 create_k8s_autopilot_agent = create_opscloud_agent
 
+async def create_opscloud_agent_async(
+    model: str | BaseChatModel | None = None,
+    *,
+    mcp_tools: Sequence[BaseTool] | None = None,
+    **kwargs: Any,
+) -> tuple[CompiledStateGraph[Any, Any, Any, Any], OpsCloudCompositeBackend]:
+    """Prepare external MCP resources asynchronously before sync graph compilation.
+
+    Deep Agents' compilation API is synchronous, so only resource discovery is
+    kept on the caller's event loop; the final graph build is isolated in a
+    worker thread. Synchronous callers should continue using
+    :func:`create_opscloud_agent`.
+    """
+    from opscloud.mcp.discovery import discover_mcp_configs
+    from opscloud.mcp.preload import (
+        get_cached_mcp_server_infos,
+        is_mcp_server_info_cached,
+        preload_mcp_metadata,
+    )
+    from opscloud.mcp.session_manager import (
+        MCPSessionManager,
+        build_mcp_tools_from_server_infos,
+    )
+    from opscloud.plugins.adapters.mcp import prepare_subagents_mcp_async
+
+    project_context = kwargs.get("project_context") or get_server_project_context()
+    cwd_value = kwargs.get("cwd")
+    effective_cwd = Path(cwd_value).resolve() if cwd_value else (
+        project_context.user_cwd if project_context else Path.cwd().resolve()
+    )
+    if project_context and project_context.project_root:
+        project_root = project_context.project_root
+    else:
+        from opscloud.project_utils import find_project_root
+
+        project_root = find_project_root(effective_cwd) or effective_cwd
+
+    assistant_id = str(kwargs.get("assistant_id", "opscloud"))
+    user_agents_dir = paths.user_agents_dir(assistant_id)
+    project_agents_dir = paths.project_agents_dir(project_root)
+    if not project_agents_dir.is_dir() and (project_root / "agents").is_dir():
+        project_agents_dir = project_root / "agents"
+    subagent_metas = list_subagents(
+        user_agents_dir=user_agents_dir if user_agents_dir.is_dir() else None,
+        project_agents_dir=project_agents_dir if project_agents_dir.is_dir() else None,
+        project_root=project_root,
+        include_plugins=True,
+    )
+    subagent_by_name = {
+        meta["name"]: meta
+        for meta in subagent_metas
+        if meta.get("name")
+    }
+    prepared_subagent_mcp = await prepare_subagents_mcp_async(
+        subagent_by_name,
+        project_root,
+    )
+
+    mcp_config = kwargs.get("mcp_config")
+    if mcp_tools is None:
+        mcp_config = mcp_config or discover_mcp_configs(project_root)
+        manager = MCPSessionManager.get_instance(mcp_config or {})
+        manager.register_servers(mcp_config or {})
+        missing = {
+            name: config
+            for name, config in mcp_config.items()
+            if not is_mcp_server_info_cached(name, config)
+        }
+        if missing:
+            await preload_mcp_metadata(missing)
+        infos = get_cached_mcp_server_infos()
+        coordinator_infos = [
+            info
+            for info in infos
+            if info.name in mcp_config
+        ]
+        active_coordinator_infos = [
+            info
+            for info in coordinator_infos
+            if info.enabled and info.status == "ok"
+        ]
+        mcp_tools = build_mcp_tools_from_server_infos(active_coordinator_infos, manager)
+        kwargs["mcp_server_info"] = coordinator_infos
+        kwargs["mcp_config"] = mcp_config
+
+    kwargs["_prepared_subagent_mcp"] = prepared_subagent_mcp
+    return await asyncio.to_thread(
+        create_opscloud_agent,
+        model,
+        mcp_tools=mcp_tools,
+        **kwargs,
+    )
+
+
 __all__ = [
     'create_opscloud_agent',
+    'create_opscloud_agent_async',
     'create_agent',
     'create_k8s_autopilot_agent',
     'CLIContextSchema',

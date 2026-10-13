@@ -9,7 +9,7 @@ from typing import Any
 
 from opscloud.approval_mode import ApprovalMode
 from opscloud.config.settings import sync_aws_env_aliases
-from opscloud.server import ServerConfig, ServerProcess
+from opscloud.server import ServerProcess
 from opscloud.ui.app import OpsCloudApp
 from opscloud.utils.logger import get_logger
 
@@ -85,30 +85,11 @@ def run_interactive(
             resolved_model = None
             defer_server_start = True
 
+    # The Textual app owns server startup so its first frame renders immediately.
+    # ``defer_server_start`` is reserved for the no-model/credentials flow; a
+    # configured model starts asynchronously from ``OpsCloudApp.on_mount``.
     proc: ServerProcess | None = None
     url: str | None = None
-    if not defer_server_start and resolved_model:
-        config = ServerConfig.from_cli_args(
-            project_context=project_context,
-            model=resolved_model,
-            interactive=True,
-            approval_mode=str(approval_mode),
-            read_only=read_only,
-            aws_profile=aws_profile,
-            aws_region=aws_region,
-            shell_allow_list=tuple(shell_allow_list) if shell_allow_list else None,
-            mcp_config_path=mcp_config_path,
-            no_mcp=no_mcp,
-            trust_project_mcp=trust_project_mcp,
-        )
-        proc = ServerProcess(config)
-        try:
-            url = proc.start()
-        except Exception as e:
-            logger.warning("Could not start server immediately: %s", e)
-            proc = None
-            url = None
-            defer_server_start = True
 
     effective_prompt = initial_prompt
     if initial_skill and not effective_prompt:
@@ -135,6 +116,7 @@ def run_interactive(
         "trust_project_mcp": trust_project_mcp,
     }
 
+    app: OpsCloudApp | None = None
     try:
         app = OpsCloudApp(
             server_url=url,
@@ -172,5 +154,9 @@ def run_interactive(
         print(f"Error starting OpsCloud: {e}")
         return 1
     finally:
-        if proc is not None:
-            proc.stop()
+        server_proc = (getattr(app, "_server_proc", None) if app is not None else None) or proc
+        if server_proc is not None:
+            try:
+                server_proc.stop()
+            except Exception:
+                logger.debug("Failed to stop server process during interactive exit", exc_info=True)

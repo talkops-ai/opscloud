@@ -140,12 +140,82 @@ async def open_url_async(
     return opened
 
 
+def autolink_file_paths(text: str) -> str:
+    """Detect unadorned local file paths in text and wrap them as markdown links.
+
+    Preserves code fences (```...```), existing markdown links ([...](...)),
+    and image tags (![...](...)).
+    If inline code (`...`) contains an existing file path, it is wrapped in a
+    markdown link so it remains clickable.
+    Strips trailing sentence punctuation (. , ; : ! ? ) ' " >) from the path
+    so sentences like 'Saved to /path/to/report.md.' cleanly link to
+    '/path/to/report.md' with the period outside the link.
+    """
+    import re
+
+    pattern = re.compile(
+        r"(?P<fence>```[\s\S]*?```)|"
+        r"(?P<code>`[^`\n]+`)|"
+        r"(?P<link>!?\[[^\]\n]*\]\([^)\n]+\))|"
+        r"(?P<path>(?:(?:/[a-zA-Z0-9_\-\.]+){2,}/?|~/(?:[a-zA-Z0-9_\-\.]+/)*[a-zA-Z0-9_\-\.]+|\./(?:[a-zA-Z0-9_\-\.]+/)*[a-zA-Z0-9_\-\.]+|(?:\b[a-zA-Z]:[\\/](?:[a-zA-Z0-9_\-\.]+[\\/])*[a-zA-Z0-9_\-\.]+))(?:\.[a-zA-Z0-9_]+)?)"
+    )
+
+    def _replace(m: re.Match[str]) -> str:
+        if m.group("fence") or m.group("code") or m.group("link"):
+            return m.group(0)
+        p = m.group("path")
+        trailing = ""
+        while p and p[-1] in ".,;:!?)'\">":
+            trailing = p[-1] + trailing
+            p = p[:-1]
+        if not p:
+            return m.group(0)
+        return f"[{p}](file://{p}){trailing}"
+
+    return pattern.sub(_replace, text)
+
+
+async def open_link_or_file_async(
+    href: str, *, app: App, notify_on_success: bool = True
+) -> bool:
+    """Open a web URL in browser or a file path in user's default editor."""
+    raw = href.strip()
+    if not raw:
+        return False
+
+    if raw.startswith(("http://", "https://", "mailto:")):
+        return await open_checked_url_async(
+            raw, app=app, notify_on_success=notify_on_success
+        )
+
+    if raw.startswith("www."):
+        return await open_checked_url_async(
+            "https://" + raw, app=app, notify_on_success=notify_on_success
+        )
+
+    from opscloud.editor import open_file_in_editor
+
+    return open_file_in_editor(raw, app=app)
+
+
 def open_style_link(event: Click, *, app: App | None = None) -> None:
     """Open the URL from a Rich link style on click, if present."""
     notify_app = _event_app(event, app)
     url = _style_url(event.style)
     if not url:
         return
+
+    raw = url.strip()
+    if raw.startswith("file://") or (
+        not raw.startswith(("http://", "https://", "mailto:"))
+        and not raw.startswith("www.")
+    ):
+        from opscloud.editor import open_file_in_editor
+
+        opened = open_file_in_editor(raw, app=notify_app)
+        if opened:
+            event.stop()
+            return
 
     safety = check_url_safety(url)
     if not safety.safe:

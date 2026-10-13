@@ -8,6 +8,7 @@ and mode-reactive prompt glyph (❯ / / / $) with visual feedback.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass, replace
 from opscloud.utils.logger import get_logger
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
@@ -23,10 +24,12 @@ from textual.reactive import reactive
 from textual.strip import Strip
 from textual.widget import Widget
 from textual.widgets import Static, TextArea
+from textual.widgets.text_area import EditResult
 from textual.events import Click
 from textual.containers import VerticalScroll
 from textual.content import Content
 
+from opscloud.config.settings import get_glyphs
 from opscloud.ui.widgets.autocomplete import (
     CompletionResult,
     FuzzyFileController,
@@ -69,27 +72,364 @@ def detect_input_mode(text: str) -> InputMode:
 _HINT_STYLE = Style(color="grey50", italic=True)
 
 
+# Border title per non-normal mode (normal mode stays untitled).
+_MODE_TITLES: dict[str, str] = {
+    "command": "command",
+    "shell": "shell",
+    "shell_incognito": "private shell",
+}
+
+# Keys that insert a newline instead of submitting. Plain Enter submits;
+# which of these a terminal can send varies (Option+Enter arrives as
+# alt+enter on macOS, Ctrl+J everywhere, Shift+Enter with kitty protocol).
+_NEWLINE_KEYS: frozenset[str] = frozenset(
+    {"shift+enter", "alt+enter", "ctrl+enter", "meta+enter", "super+enter", "ctrl+j"}
+)
+
+
+def _newline_key_label() -> str:
+    """Short keycap label for the platform newline shortcut."""
+    from opscloud.config.settings import newline_shortcut
+
+    return {"Option+Enter": "opt+enter", "Ctrl+J": "ctrl+j"}.get(
+        newline_shortcut(), newline_shortcut().lower()
+    )
+
+
+def input_hints(mode: str) -> list[tuple[str, str]]:
+    """Keycap hints for the input's bottom border, most important first.
+
+    Args:
+        mode: Current input mode.
+
+    Returns:
+        ``(key, action)`` pairs; callers drop trailing pairs to fit.
+    """
+    if mode == "command":
+        return [("enter", "run"), ("tab", "complete"), ("↑↓", "select"), ("esc", "exit")]
+    if mode == "shell":
+        return [("enter", "run"), ("!", "private"), ("esc", "exit")]
+    if mode == "shell_incognito":
+        return [("enter", "run"), ("esc", "exit")]
+    return [
+        ("enter", "send"),
+        (_newline_key_label(), "newline"),
+        ("/", "commands"),
+        ("!", "shell"),
+        ("@", "files"),
+    ]
+
+
+def format_input_hints(hints: list[tuple[str, str]], max_width: int) -> Content:
+    """Render ``key action · key action`` keycaps, trimmed to ``max_width``.
+
+    Keys are bold, actions and separators dim. Trailing hints are dropped
+    (never cut mid-word) when the border is too narrow.
+    """
+    sep = " · "
+    kept: list[tuple[str, str]] = []
+    width = 0
+    for key, action in hints:
+        extra = len(key) + 1 + len(action) + (len(sep) if kept else 0)
+        if width + extra > max_width:
+            break
+        kept.append((key, action))
+        width += extra
+    pieces: list[tuple[str, str]] = []
+    for i, (key, action) in enumerate(kept):
+        if i:
+            pieces.append((sep, "dim"))
+        pieces.append((key, "bold"))
+        pieces.append((f" {action}", "dim"))
+    if pieces:
+        pieces.insert(0, (" ", ""))
+        pieces.append((" ", ""))
+    return Content.assemble(*pieces)
+
+
+# ── Completion rows ─────────────────────────────────────────────
+
+CompletionKind = Literal["command", "file"]
+
+_LABEL_COLUMN_MAX = 22
+"""Widest the command label column grows before labels get an ellipsis."""
+
+_ROW_PREFIX_CELLS = 2
+"""Selection bar plus one space, in front of every row."""
+
+_COLUMN_GAP = 2
+"""Cells between the label column and the description."""
+
+_MIN_DESC_CELLS = 24
+"""Description room below which argument hints stop widening the label column."""
+
+_MATCH_STYLE = "bold $primary"
+"""Style for the characters of a label that the query matched."""
+
+
+def completion_kind(suggestions: list[tuple[str, str]]) -> CompletionKind:
+    """Classify a suggestion list: file controller labels start with ``@``."""
+    if suggestions and suggestions[0][0].startswith("@"):
+        return "file"
+    return "command"
+
+
+def _fold(text: str) -> str:
+    """Lower-case *text* one character at a time so indices stay aligned."""
+    return "".join(lc if len(lc := ch.lower()) == 1 else ch for ch in text)
+
+
+def _run_match(query: str, text: str) -> list[int] | None:
+    """Match *query* in *text* taking the longest contiguous run each step."""
+    positions: list[int] = []
+    pos = 0
+    qi = 0
+    while qi < len(query):
+        for size in range(len(query) - qi, 0, -1):
+            at = text.find(query[qi : qi + size], pos)
+            if at >= 0:
+                positions.extend(range(at, at + size))
+                pos = at + size
+                qi += size
+                break
+        else:
+            return None
+    return positions
+
+
+def _leftmost_match(query: str, text: str) -> list[int] | None:
+    """Plain leftmost subsequence match of *query* in *text*."""
+    positions: list[int] = []
+    pos = 0
+    for ch in query:
+        at = text.find(ch, pos)
+        if at < 0:
+            return None
+        positions.append(at)
+        pos = at + 1
+    return positions
+
+
+def _match_spans(query: str, text: str) -> list[int]:
+    """Indices of *text* matched by *query*, for highlighting only.
+
+    Case-insensitive subsequence match that prefers contiguous runs (so
+    ``pl`` lights up the ``pl`` in ``plugins``, not ``p`` … ``l``). If the
+    run-first pass strands a later character, a plain leftmost subsequence
+    is used instead.
+
+    Returns:
+        Sorted indices into *text*; empty when *query* is empty or is not a
+        subsequence (e.g. the controller matched on the description).
+    """
+    if not query:
+        return []
+    q, t = _fold(query), _fold(text)
+    positions = _run_match(q, t)
+    if positions is None:
+        positions = _leftmost_match(q, t)
+    return positions or []
+
+
+def _clip_range(text: str, width: int, *, keep_end: bool = False) -> tuple[int, int]:
+    """Slice ``[start, end)`` of *text* that fits *width* cells with an ellipsis.
+
+    Returns the full range when *text* already fits. Otherwise room is left
+    for ``get_glyphs().ellipsis`` on the cut side (the start when
+    *keep_end*, else the end).
+    """
+    if cell_len(text) <= width:
+        return 0, len(text)
+    budget = width - cell_len(get_glyphs().ellipsis)
+    used = 0
+    if keep_end:
+        start = len(text)
+        while start > 0 and used + cell_len(text[start - 1]) <= budget:
+            start -= 1
+            used += cell_len(text[start])
+        return start, len(text)
+    end = 0
+    while end < len(text) and used + cell_len(text[end]) <= budget:
+        used += cell_len(text[end])
+        end += 1
+    return 0, end
+
+
+def _clipped_pieces(
+    text: str,
+    width: int,
+    styles: list[str],
+    *,
+    keep_end: bool = False,
+    ellipsis_style: str = "dim",
+) -> list[tuple[str, str]]:
+    """Fit *text* into *width* cells, grouping runs of equal per-char *styles*."""
+    if width <= 0 or not text:
+        return []
+    start, end = _clip_range(text, width, keep_end=keep_end)
+    ellipsis = get_glyphs().ellipsis
+    pieces: list[tuple[str, str]] = []
+    if (start, end) != (0, len(text)) and start == end:
+        return [(ellipsis[:width], ellipsis_style)]
+    if start > 0:
+        pieces.append((ellipsis, ellipsis_style))
+    run_start = start
+    for i in range(start + 1, end + 1):
+        if i == end or styles[i] != styles[run_start]:
+            pieces.append((text[run_start:i], styles[run_start]))
+            run_start = i
+    if end < len(text):
+        pieces.append((ellipsis, ellipsis_style))
+    return pieces
+
+
+def _completion_name(label: str, kind: CompletionKind) -> str:
+    """Visible label text: commands drop ``/``, files drop ``@``."""
+    return label.removeprefix("@") if kind == "file" else label.removeprefix("/")
+
+
+def completion_label_width(
+    suggestions: list[tuple[str, str]],
+    argument_hints: list[str] | None = None,
+    *,
+    kind: CompletionKind,
+    width: int,
+) -> int:
+    """Width of the label column for one popup rebuild.
+
+    Commands: the longest ``name [hint]``, capped at ``_LABEL_COLUMN_MAX``.
+    Hints are dropped from the sizing when they would leave descriptions
+    fewer than ``_MIN_DESC_CELLS``; they then get an ellipsis instead.
+    Files: the longest path, allowed to use whatever the (short) type
+    column leaves free, since a 22-cell path hides the part that matters.
+
+    Args:
+        suggestions: ``(label, description)`` pairs being shown.
+        argument_hints: Per-row argument hint (commands only), or ``None``.
+        kind: ``"command"`` or ``"file"``.
+        width: Row content width in cells; ``0`` when not laid out yet.
+    """
+    if not suggestions:
+        return 0
+    hints = argument_hints or [""] * len(suggestions)
+    names = [cell_len(_completion_name(label, kind)) for label, _desc in suggestions]
+    with_hints = [
+        cell_len(f"{_completion_name(label, kind)} {hint}") if hint and kind == "command" else n
+        for (label, _desc), hint, n in zip(suggestions, hints, names, strict=False)
+    ]
+    cap = _LABEL_COLUMN_MAX
+    if kind == "file" and width > 0:
+        widest_desc = max(cell_len(desc) for _label, desc in suggestions)
+        cap = max(cap, width - _ROW_PREFIX_CELLS - _COLUMN_GAP - widest_desc)
+    column = min(max(with_hints), cap)
+    room = width - _ROW_PREFIX_CELLS - column - _COLUMN_GAP
+    if kind == "command" and width > 0 and room < _MIN_DESC_CELLS:
+        column = min(max(names), cap)
+    if width > 0:
+        column = min(column, width - _ROW_PREFIX_CELLS)
+    return max(column, 0)
+
+
+def format_completion_row(
+    label: str,
+    description: str,
+    *,
+    query: str,
+    label_width: int,
+    width: int,
+    selected: bool,
+    kind: CompletionKind = "command",
+    argument_hint: str = "",
+) -> Content:
+    """Render one completion row as a single line.
+
+    Layout: ``▌ name [hint]…padded…  description``. The bar is drawn only
+    on the selected row (``>`` in ASCII mode); the label column is padded
+    to *label_width* so descriptions line up; anything too long gets an
+    ellipsis instead of wrapping.
+
+    Args:
+        label: Raw suggestion label (``/plugins`` or ``@src/app.py``).
+        description: Suggestion description; whitespace is collapsed.
+        query: Text typed after the trigger, used for match highlighting.
+        label_width: Label column width from `completion_label_width`.
+        width: Total row width in cells; ``0`` means unbounded.
+        selected: Whether this is the highlighted row.
+        kind: ``"command"`` or ``"file"`` (dims the directory part).
+        argument_hint: Command argument hint shown dim after the name.
+    """
+    bar = get_glyphs().selection_bar
+    pieces: list[tuple[str, str]] = [
+        (bar if selected else " " * cell_len(bar), "$primary"),
+        (" ", ""),
+    ]
+    name = _completion_name(label, kind)
+    column = label_width if label_width > 0 else cell_len(name)
+    if width > 0:
+        column = min(column, width - _ROW_PREFIX_CELLS)
+    if column <= 0:
+        return Content.assemble(*pieces)
+
+    matches = set(_match_spans(query, name))
+    base = "bold" if selected else ""
+    if kind == "file":
+        dir_end = name.rfind("/") + 1
+        styles = [
+            _MATCH_STYLE if i in matches else ("dim" if i < dir_end else base)
+            for i in range(len(name))
+        ]
+    else:
+        styles = [_MATCH_STYLE if i in matches else base for i in range(len(name))]
+    label_pieces = _clipped_pieces(name, column, styles, keep_end=kind == "file")
+    used = sum(cell_len(text) for text, _ in label_pieces)
+
+    hint_room = column - used
+    hint = f" {argument_hint}" if argument_hint and kind == "command" else ""
+    name_whole = used == cell_len(name)
+    if hint and name_whole and (cell_len(hint) <= hint_room or hint_room >= 8):
+        label_pieces += _clipped_pieces(hint, hint_room, ["dim"] * len(hint))
+        used = sum(cell_len(text) for text, _ in label_pieces)
+    pieces += label_pieces
+    if column > used:
+        pieces.append((" " * (column - used), ""))
+
+    desc = " ".join(description.split())
+    if desc:
+        room = (width - _ROW_PREFIX_CELLS - column - _COLUMN_GAP) if width > 0 else cell_len(desc)
+        desc_pieces = _clipped_pieces(desc, room, ["dim"] * len(desc))
+        if desc_pieces:
+            pieces.append((" " * _COLUMN_GAP, ""))
+            pieces += desc_pieces
+    return Content.assemble(*pieces)
+
+
+@dataclass(frozen=True)
+class CompletionRowLayout:
+    """Layout shared by every row of one popup rebuild."""
+
+    query: str = ""
+    label_width: int = 0
+    width: int = 0
+    kind: CompletionKind = "command"
+
+
 class CompletionOption(Static):
     """A clickable completion option in the autocomplete popup."""
 
+    # Selection is an accent bar (drawn in the row content) on a soft tint;
+    # no colour inversion, so it reads the same on light and dark themes.
     DEFAULT_CSS = """
     CompletionOption {
         height: 1;
-        padding: 0 1;
+        padding: 0;
     }
 
     CompletionOption:hover {
-        background: $surface-lighten-1;
+        background: $primary 6%;
     }
 
     CompletionOption.completion-option-selected {
-        background: $primary;
-        color: $background;
-        text-style: bold;
-    }
-
-    CompletionOption.completion-option-selected:hover {
-        background: $primary-lighten-1;
+        background: $primary 12%;
     }
     """
 
@@ -107,6 +447,9 @@ class CompletionOption(Static):
         description: str,
         index: int,
         is_selected: bool = False,
+        *,
+        layout: CompletionRowLayout | None = None,
+        argument_hint: str = "",
         **kwargs: Any,
     ) -> None:
         """Initialize the completion option."""
@@ -115,6 +458,8 @@ class CompletionOption(Static):
         self._description = description
         self._index = index
         self._is_selected = is_selected
+        self._layout = layout or CompletionRowLayout()
+        self._argument_hint = argument_hint
 
     def on_mount(self) -> None:
         """Set up the option display on mount."""
@@ -122,15 +467,17 @@ class CompletionOption(Static):
 
     def _update_display(self) -> None:
         """Update the display text and styling."""
-        display_label = self._label.removeprefix("/")
-        if self._description:
-            content = Content.from_markup(
-                "[bold]$label[/bold]  [dim]$desc[/dim]",
-                label=display_label,
-                desc=self._description,
-            )
-        else:
-            content = Content.from_markup("[bold]$label[/bold]", label=display_label)
+        layout = self._layout
+        content = format_completion_row(
+            self._label,
+            self._description,
+            query=layout.query,
+            label_width=layout.label_width,
+            width=layout.width,
+            selected=self._is_selected,
+            kind=layout.kind,
+            argument_hint=self._argument_hint,
+        )
 
         self.update(content)
 
@@ -145,14 +492,30 @@ class CompletionOption(Static):
             self._is_selected = selected
             self._update_display()
 
+    def set_layout(self, layout: CompletionRowLayout) -> None:
+        """Re-render with a new shared layout (e.g. after a resize)."""
+        if layout != self._layout:
+            self._layout = layout
+            self._update_display()
+
     def set_content(
-        self, label: str, description: str, index: int, *, is_selected: bool
+        self,
+        label: str,
+        description: str,
+        index: int,
+        *,
+        is_selected: bool,
+        layout: CompletionRowLayout | None = None,
+        argument_hint: str = "",
     ) -> None:
         """Replace label, description, index, and selection in-place."""
         self._label = label
         self._description = description
         self._index = index
         self._is_selected = is_selected
+        if layout is not None:
+            self._layout = layout
+        self._argument_hint = argument_hint
         self._update_display()
 
     def on_click(self, event: Click) -> None:
@@ -164,11 +527,15 @@ class CompletionOption(Static):
 class CompletionPopup(VerticalScroll):
     """Popup widget that displays completion suggestions as clickable options."""
 
+    # Inset one cell so rows line up under the prompt glyph; a faint rule
+    # separates the list from the input row.
     DEFAULT_CSS = """
     CompletionPopup {
         display: none;
         height: auto;
         max-height: 12;
+        margin: 0 1;
+        border-top: solid $primary 20%;
     }
     """
 
@@ -189,6 +556,54 @@ class CompletionPopup(VerticalScroll):
         self._pending_suggestions: list[tuple[str, str]] = []
         self._pending_selected: int = 0
         self._rebuild_generation: int = 0
+        self._shown_suggestions: list[tuple[str, str]] = []
+        self._shown_hints: list[str] = []
+        self._layout = CompletionRowLayout()
+
+    def _chat_input(self) -> ChatInput | None:
+        """Walk up the ancestor chain to the owning `ChatInput`."""
+        node = self.parent
+        while node is not None:
+            if isinstance(node, ChatInput):
+                return node
+            node = node.parent
+        return None
+
+    def _row_width(self) -> int:
+        """Cells available to one row; falls back to the box while hidden."""
+        width = self.scrollable_content_region.width
+        if width <= 0 and isinstance(self.parent, Widget):
+            # Hidden popups have no region yet; use the box minus our margin.
+            width = self.parent.content_region.width - 2
+        return max(width, 0)
+
+    def _compute_layout(
+        self, suggestions: list[tuple[str, str]]
+    ) -> tuple[CompletionRowLayout, list[str]]:
+        """Shared row layout plus per-row argument hints for *suggestions*."""
+        kind = completion_kind(suggestions)
+        owner = self._chat_input()
+        query = owner.completion_query(kind) if owner is not None else ""
+        hint_map = owner._argument_hints if owner is not None and kind == "command" else {}
+        hints = [hint_map.get(label.removeprefix("/"), "") for label, _ in suggestions]
+        width = self._row_width()
+        label_width = completion_label_width(suggestions, hints, kind=kind, width=width)
+        layout = CompletionRowLayout(
+            query=query, label_width=label_width, width=width, kind=kind
+        )
+        return layout, hints
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Re-fit rows to the new width (cheap: at most a dozen rows)."""
+        if not self._options or not self._shown_suggestions:
+            return
+        width = self._row_width()
+        label_width = completion_label_width(
+            self._shown_suggestions, self._shown_hints, kind=self._layout.kind, width=width
+        )
+        self._layout = replace(self._layout, width=width, label_width=label_width)
+        for option in self._options:
+            option.set_layout(self._layout)
 
     def update_suggestions(
         self, suggestions: list[tuple[str, str]], selected_index: int
@@ -217,13 +632,23 @@ class CompletionPopup(VerticalScroll):
             self.hide()
             return
 
+        layout, hints = self._compute_layout(suggestions)
+        self._layout = layout
+        self._shown_suggestions = list(suggestions)
+        self._shown_hints = hints
+
         existing = len(self._options)
         needed = len(suggestions)
 
         for i in range(min(existing, needed)):
             label, desc = suggestions[i]
             self._options[i].set_content(
-                label, desc, i, is_selected=(i == selected_index)
+                label,
+                desc,
+                i,
+                is_selected=(i == selected_index),
+                layout=layout,
+                argument_hint=hints[i],
             )
 
         try:
@@ -241,6 +666,8 @@ class CompletionPopup(VerticalScroll):
                         description=desc,
                         index=idx,
                         is_selected=(idx == selected_index),
+                        layout=layout,
+                        argument_hint=hints[idx],
                     )
                     new_widgets.append(option)
                 self._options.extend(new_widgets)
@@ -331,6 +758,11 @@ class ChatTextArea(TextArea):
             **kwargs,
         )
 
+    def clear(self) -> EditResult:
+        """Clear document text and reset any argument hint ghost text."""
+        self.argument_hint = ""
+        return super().clear()
+
     def render_line(self, y: int) -> Strip:
         """Render a single line, appending argument hint ghost text at EOL."""
         strip = super().render_line(y)
@@ -345,6 +777,8 @@ class ChatTextArea(TextArea):
             return strip
 
         line_text = self.document.get_line(absolute_y)
+        if not line_text.strip():
+            return strip
         content_cells = cell_len(line_text)
 
         if content_cells >= strip.cell_length:
@@ -419,14 +853,41 @@ class ChatInput(Widget):
         height: auto;
     }
 
+    /* Rounded box whose colour follows the input mode: teal prompt, violet
+       slash command, green shell, muted private shell. Dimmer while the
+       input is not focused. Mode name sits in the top border, keycap hints
+       in the bottom border. */
     ChatInput #input-box {
         height: auto;
         min-height: 3;
         max-height: 20;
-        border: solid $primary;
+        border: round $primary 45%;
+        border-title-color: $primary;
+        border-title-style: bold;
+        border-subtitle-color: $text-muted;
+        border-subtitle-align: left;
         background: $background;
         color: $foreground;
         padding: 0;
+    }
+
+    ChatInput:focus-within #input-box {
+        border: round $primary;
+    }
+
+    ChatInput.mode-command #input-box {
+        border: round $mode-command;
+        border-title-color: $mode-command;
+    }
+
+    ChatInput.mode-shell #input-box {
+        border: round $mode-bash;
+        border-title-color: $mode-bash;
+    }
+
+    ChatInput.mode-shell-incognito #input-box {
+        border: round $mode-incognito 70%;
+        border-title-color: $mode-incognito;
     }
 
     ChatInput .input-row {
@@ -443,6 +904,18 @@ class ChatInput(Widget):
         text-style: bold;
     }
 
+    ChatInput.mode-command .input-prompt {
+        color: $mode-command;
+    }
+
+    ChatInput.mode-shell .input-prompt {
+        color: $mode-bash;
+    }
+
+    ChatInput.mode-shell-incognito .input-prompt {
+        color: $mode-incognito;
+    }
+
     ChatInput ChatTextArea {
         width: 1fr;
         height: auto;
@@ -451,6 +924,13 @@ class ChatInput(Widget):
         border: none;
         background: transparent;
         padding: 0;
+    }
+
+    /* TextArea ships its own focus border/tint; the outer box shows focus. */
+    ChatInput ChatTextArea:focus {
+        border: none;
+        background: transparent;
+        background-tint: transparent;
     }
     """
 
@@ -509,6 +989,7 @@ class ChatInput(Widget):
         self._current_suggestions: list[tuple[str, str]] = []
         self._current_selected_index: int = 0
         self._completion_prefix_len: int = 0
+        self._input_box: Widget | None = None
         self._rebuild_argument_hints()
 
     def on_mount(self) -> None:
@@ -527,14 +1008,34 @@ class ChatInput(Widget):
             group="file_cache",
             exit_on_error=False,
         )
+        self._update_chrome()
 
     def compose(self) -> ComposeResult:
         from textual.containers import Horizontal, Vertical
-        with Vertical(id="input-box"):
+        with Vertical(id="input-box") as box:
+            self._input_box = box
             with Horizontal(classes="input-row"):
                 yield self._prompt_widget
                 yield self._text_area
             yield self._autocomplete
+
+    # ── Chrome (border title, keycap hints) ────────────────
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Re-fit the bottom-border hints to the new width."""
+        self._update_chrome()
+
+    def _update_chrome(self) -> None:
+        """Sync border title and keycap hints with the mode."""
+        box = self._input_box
+        if box is None:
+            return
+        mode = self.mode
+        title = _MODE_TITLES.get(mode)
+        box.border_title = f" {title} " if title else None
+        # Leave room for the rounded corners plus a little breathing space.
+        max_width = max(0, (box.size.width or self.size.width or 80) - 6)
+        box.border_subtitle = format_input_hints(input_hints(mode), max_width)
 
     # ── Properties & Delegation ─────────────────────────
 
@@ -552,6 +1053,7 @@ class ChatInput(Widget):
         else:
             self._text_area.text = value
             self._sync_mode()
+        self._update_argument_hint()
 
     @property
     def value(self) -> str:
@@ -595,13 +1097,17 @@ class ChatInput(Widget):
         if self.mode == "normal":
             return False
         self.mode = "normal"
+        if getattr(self, "_text_area", None) is not None:
+            self._text_area.argument_hint = ""
         if self._completion_manager:
             self._completion_manager.reset()
         self.clear_completion_suggestions()
         return True
 
     def clear(self) -> None:
-        self._text_area.clear()
+        if getattr(self, "_text_area", None) is not None:
+            self._text_area.argument_hint = ""
+            self._text_area.clear()
         self._pasted_full_text = None
         self._completion_manager.reset()
         self.mode = "normal"
@@ -626,6 +1132,9 @@ class ChatInput(Widget):
             self.add_class("mode-shell")
         elif mode == "shell_incognito":
             self.add_class("mode-shell-incognito")
+        if mode != "command" and getattr(self, "_text_area", None) is not None:
+            self._text_area.argument_hint = ""
+        self._update_chrome()
         self.post_message(self.ModeChanged(mode))
 
     # ── Event Handlers ──────────────────────────────────
@@ -716,6 +1225,20 @@ class ChatInput(Widget):
         self._current_suggestions = suggestions
         self._current_selected_index = selected_index
         self._autocomplete.update_suggestions(suggestions, selected_index)
+
+    def completion_query(self, kind: CompletionKind) -> str:
+        """Text typed after the completion trigger, for match highlighting.
+
+        Args:
+            kind: ``"command"`` (after the leading ``/``) or ``"file"``
+                (after the last ``@`` before the cursor).
+        """
+        text, cursor = self._completion_text_and_cursor()
+        before = text[:cursor]
+        if kind == "file":
+            at = before.rfind("@")
+            return before[at + 1 :] if at >= 0 else ""
+        return before.removeprefix("/")
 
     def clear_completion_suggestions(self) -> None:
         """Clear and hide completion popup."""
@@ -864,6 +1387,15 @@ class ChatInput(Widget):
             self._update_argument_hint()
             event.prevent_default()
             event.stop()
+            return True
+
+        # Newline shortcuts (Option+Enter / Ctrl+J / Shift+Enter) insert a
+        # line break; plain Enter submits below.
+        if key in _NEWLINE_KEYS:
+            event.prevent_default()
+            event.stop()
+            self._text_area.insert("\n")
+            self.call_after_refresh(self._after_key_sync)
             return True
 
         vtext, vcursor = self._completion_text_and_cursor()

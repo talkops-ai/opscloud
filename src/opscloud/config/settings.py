@@ -89,6 +89,11 @@ def sync_aws_env_aliases() -> None:
         os.environ["AWS_PAGER"] = ""
 
 
+def sync_cloud_env_aliases() -> None:
+    """Harmonize environment variable aliases across cloud providers."""
+    sync_aws_env_aliases()
+
+
 def _ensure_bootstrap() -> None:
     """One-time bootstrap: dotenv loading and env sync. Idempotent and thread-safe."""
     if _bootstrap_state.done:
@@ -348,6 +353,7 @@ class Settings:
     reasoning_effort: str | None = None
     model_context_limit: int | None = 128_000
     model_unsupported_modalities: frozenset[str] = field(default_factory=frozenset)
+    agent_pool: dict[str, str] | None = None
 
     # ── Assistant / Agent Identity ────────────────────────
     assistant_id: str = DEFAULT_AGENT_NAME
@@ -445,6 +451,7 @@ class Settings:
         if not self.langchain_project and self.user_langchain_project:
             self.langchain_project = self.user_langchain_project
 
+
     # ── Model Property Compatibility ──────────────────────
 
     @property
@@ -519,14 +526,24 @@ class Settings:
         return result
 
     def set_field(self, key: str, value: str) -> tuple[bool, str]:
-        """Set a settings field by name with type coercion."""
+        """Set a settings field by name with type coercion, persisting to config.toml."""
         import dataclasses
+        from opscloud.config.manifest import get_option, get_option_by_settings_field
+        from opscloud.config.toml_config import save_toml_field
 
         field_names = {f.name for f in dataclasses.fields(self)}
-        if key not in field_names:
-            return False, f"Unknown setting: {key}. Available: {', '.join(sorted(field_names))}"
+        target_field = key
+        opt = None
+        if target_field not in field_names:
+            opt = get_option(key)
+            if opt and opt.settings_field and opt.settings_field in field_names:
+                target_field = opt.settings_field
+            else:
+                return False, f"Unknown setting: {key}. Available: {', '.join(sorted(field_names))}"
+        else:
+            opt = get_option_by_settings_field(target_field) or get_option(target_field)
 
-        field_obj = next(f for f in dataclasses.fields(self) if f.name == key)
+        field_obj = next(f for f in dataclasses.fields(self) if f.name == target_field)
         type_str = (
             field_obj.type
             if isinstance(field_obj.type, str)
@@ -547,23 +564,77 @@ class Settings:
             else:
                 coerced = value
 
-            setattr(self, key, coerced)
+            setattr(self, target_field, coerced)
+
+            if opt and opt.toml_keys:
+                try:
+                    if len(opt.toml_keys) == 2:
+                        sec, fld = opt.toml_keys[0], opt.toml_keys[1]
+                        toml_val = str(coerced) if isinstance(coerced, Path) else coerced
+                        save_toml_field(sec, fld, toml_val)
+                except Exception:
+                    logger.debug("Could not persist setting %s to config.toml", key, exc_info=True)
+
+            self.export_to_environment()
             return True, f"Set {key} = {value}"
         except (ValueError, TypeError) as exc:
             return False, f"Invalid value for {key}: {exc}"
 
     def reset_field(self, key: str) -> tuple[bool, str]:
-        """Reset a settings field to its default value."""
+        """Reset a settings field to its default value, clearing it in config.toml."""
         import dataclasses
+        from opscloud.config.manifest import get_option, get_option_by_settings_field
+        from opscloud.config.toml_config import delete_toml_field
 
         field_names = {f.name: f for f in dataclasses.fields(self)}
-        if key not in field_names:
-            return False, f"Unknown setting: {key}"
+        target_field = key
+        opt = None
+        if target_field not in field_names:
+            opt = get_option(key)
+            if opt and opt.settings_field and opt.settings_field in field_names:
+                target_field = opt.settings_field
+            else:
+                return False, f"Unknown setting: {key}"
+        else:
+            opt = get_option_by_settings_field(target_field) or get_option(target_field)
 
-        f = field_names[key]
+        f = field_names[target_field]
         default = f.default if f.default is not dataclasses.MISSING else None
-        setattr(self, key, default)
+        setattr(self, target_field, default)
+
+        if opt and opt.toml_keys:
+            try:
+                if len(opt.toml_keys) == 2:
+                    sec, fld = opt.toml_keys[0], opt.toml_keys[1]
+                    delete_toml_field(sec, fld)
+            except Exception:
+                logger.debug("Could not clear setting %s from config.toml", key, exc_info=True)
+
+        self.export_to_environment()
         return True, f"Reset {key} to default"
+
+    def export_to_environment(self) -> None:
+        """Export active settings values to os.environ for child processes, SDKs, and CLI tools.
+
+        Iterates over all canonical manifest options. If an option specifies an environment
+        variable and the setting has a resolved value, exports it. Also synchronizes cloud
+        environment aliases.
+        """
+        from opscloud.config.manifest import get_config_options, serialize_typed_value
+
+        for opt in get_config_options():
+            if not opt.settings_field or not hasattr(self, opt.settings_field):
+                continue
+            val = getattr(self, opt.settings_field, None)
+            if val is None:
+                continue
+            env_key = opt.effective_env_var
+            if env_key:
+                str_val = serialize_typed_value(opt.kind, val)
+                if str_val:
+                    os.environ[env_key] = str_val
+
+        sync_cloud_env_aliases()
 
     # ── Path & Agent Helpers ──────────────────────────────
 
@@ -679,7 +750,16 @@ class Settings:
         """Hot-reload reloadable settings (API keys, project root, etc.)."""
         p = Path(start_path) if start_path else None
         _load_dotenv(start_path=p, refresh_loaded=True)
-        sync_aws_env_aliases()
+
+        # Clear process-cached environment variables for options that were neither
+        # explicitly exported in the initial shell environment nor defined in dotenv.
+        # This guarantees that config.toml edits take effect and are not shadowed by
+        # runtime in-memory state.
+        for opt in get_config_options():
+            env_key = opt.effective_env_var
+            if env_key and env_key in os.environ:
+                if env_key not in _INITIAL_SHELL_ENV and env_key not in _dotenv_loaded_values:
+                    os.environ.pop(env_key, None)
 
         previous = {field_name: getattr(self, field_name, None) for field_name in RELOADABLE_FIELDS}
         toml_data = load_config_toml(CONFIG_PATH)
@@ -691,6 +771,9 @@ class Settings:
                 if val is not None:
                     setattr(self, opt.settings_field, val)
 
+        # Re-export active resolved settings to environment
+        self.export_to_environment()
+
         for field_name in RELOADABLE_FIELDS:
             old_val = previous.get(field_name)
             new_val = getattr(self, field_name, None)
@@ -698,12 +781,19 @@ class Settings:
                 if "api_key" in field_name or "secret" in field_name:
                     old_disp = "set" if old_val else "unset"
                     new_disp = "set" if new_val else "unset"
+                elif field_name == "agent_pool":
+                    from opscloud.config.toml_config import format_agent_pool_summary
+
+                    old_disp = format_agent_pool_summary(old_val)
+                    new_disp = format_agent_pool_summary(new_val)
                 else:
                     old_disp = str(old_val)
                     new_disp = str(new_val)
                 changes.append(f"{field_name}: {old_disp} -> {new_disp}")
 
         return changes
+
+
 
 
 # ── Lazy Singleton ───────────────────────────────────────
@@ -734,11 +824,13 @@ def reload_settings() -> Settings:
 
 def reset_settings_for_testing() -> None:
     """Reset the global Settings singleton and bootstrap state (for tests)."""
-    global _settings
+    global _settings, _glyphs_cache, _charset_mode_cache
     with _settings_lock:
         _settings = None
         _bootstrap_state.done = False
         _dotenv_loaded_values.clear()
+        _glyphs_cache = None
+        _charset_mode_cache = None
 
 
 async def reload_from_store(store: Any) -> Settings:
@@ -795,6 +887,9 @@ class Glyphs:
     box_horizontal: str = "─"
     box_double_horizontal: str = "═"
     gutter_bar: str = "▌"
+    selection_bar: str = "▌"
+    meter_filled: str = "▰"
+    meter_empty: str = "▱"
     git_branch: str = "↗"
     cross: str = "✗"
     arrow_right: str = "➜"
@@ -809,6 +904,7 @@ class Glyphs:
     line_continuation: str = "…"
     tool: str = "[T]"
     file: str = "[F]"
+    search: str = "⌕"
 
 
 UNICODE_GLYPHS = Glyphs(
@@ -836,6 +932,9 @@ UNICODE_GLYPHS = Glyphs(
     box_horizontal="─",
     box_double_horizontal="═",
     gutter_bar="▌",
+    selection_bar="▌",
+    meter_filled="▰",
+    meter_empty="▱",
     git_branch="↗",
     cross="✗",
     arrow_right="➜",
@@ -850,6 +949,7 @@ UNICODE_GLYPHS = Glyphs(
     line_continuation="…",
     tool="[T]",
     file="[F]",
+    search="⌕",
 )
 
 ASCII_GLYPHS = Glyphs(
@@ -877,6 +977,9 @@ ASCII_GLYPHS = Glyphs(
     box_horizontal="-",
     box_double_horizontal="=",
     gutter_bar="|",
+    selection_bar=">",
+    meter_filled="#",
+    meter_empty="-",
     git_branch="git:",
     cross="[X]",
     arrow_right="->",
@@ -891,6 +994,7 @@ ASCII_GLYPHS = Glyphs(
     line_continuation=".",
     tool="[T]",
     file="[F]",
+    search="/",
 )
 
 _glyphs_cache: Glyphs | None = None

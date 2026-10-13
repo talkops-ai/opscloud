@@ -143,4 +143,52 @@ class CommandRouter:
         return dict(self._handlers)
 
 
-__all__ = ["CommandRouter"]
+def discover_command_handlers() -> tuple[BaseCommandHandler, ...]:
+    """Discover and return all built-in concrete BaseCommandHandler instances."""
+    sub_packages = [
+        "opscloud.commands.core",
+        "opscloud.commands.power",
+    ]
+    handlers: dict[str, BaseCommandHandler] = {}
+    for pkg_name in sub_packages:
+        try:
+            pkg = importlib.import_module(pkg_name)
+            if hasattr(pkg, "__path__"):
+                for _, mod_name, _ in pkgutil.walk_packages(pkg.__path__, prefix=f"{pkg_name}."):
+                    try:
+                        mod = importlib.import_module(mod_name)
+                        for _, obj in inspect.getmembers(mod, inspect.isclass):
+                            if (
+                                issubclass(obj, BaseCommandHandler)
+                                and obj is not BaseCommandHandler
+                                and not inspect.isabstract(obj)
+                            ):
+                                try:
+                                    inst = obj()
+                                    canonical = inst.name.lower().strip()
+                                    if canonical not in handlers:
+                                        handlers[canonical] = inst
+                                except Exception as exc:
+                                    logger.warning("Could not instantiate handler %s: %s", obj.__name__, exc)
+                    except Exception as exc:
+                        logger.warning("Failed importing module %s: %s", mod_name, exc)
+            for _, obj in inspect.getmembers(pkg, inspect.isclass):
+                if (
+                    issubclass(obj, BaseCommandHandler)
+                    and obj is not BaseCommandHandler
+                    and not inspect.isabstract(obj)
+                ):
+                    try:
+                        inst = obj()
+                        canonical = inst.name.lower().strip()
+                        if canonical not in handlers:
+                            handlers[canonical] = inst
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return tuple(handlers.values())
+
+
+__all__ = ["CommandRouter", "discover_command_handlers"]

@@ -244,7 +244,7 @@ class DoctorHandler(BaseCommandHandler):
                 configured_count += 1
             items.append(DiagnosticItem(
                 label,
-                "configured ✓" if has_key else "not set",
+                "configured" if has_key else "not set",
                 ok=True,  # Missing keys are informational
             ))
 
@@ -479,56 +479,55 @@ class DoctorHandler(BaseCommandHandler):
     # ── Tree renderer ───────────────────────────────────
 
     def _render_tree(self, sections: list[DiagnosticSection]) -> str:
-        """Render sections as a tree-style report.
-
-        Uses a fenced code block for the diagnostic tree so markdown rendering
-        preserves the ├/└ connectors and line-per-item layout.
-        """
-        from opscloud.config.settings import get_glyphs
-        glyphs = get_glyphs()
-
+        """Render sections as a styled, structured Markdown health dashboard."""
         all_healthy = all(s.ok for s in sections)
         issues: list[str] = []
 
-        # Build the tree inside a code block to preserve formatting
-        tree_lines: list[str] = []
-        for section in sections:
-            status = glyphs.checkmark if section.ok else "⚠"
-            tree_lines.append(f"  {section.title} {status}")
+        table_rows: list[str] = [
+            "| Diagnostic Category | Status | Details |",
+            "| :--- | :---: | :--- |",
+        ]
 
-            for i, item in enumerate(section.items):
-                is_last = i == len(section.items) - 1
-                connector = "└" if is_last else "├"
-                warning = " ⚠" if not item.ok else ""
-                tree_lines.append(f"    {connector} {item.label}: {item.value}{warning}")
-                if not item.ok and item.tip:
-                    issues.append(f"→ {item.tip}")
+        for s in sections:
+            status_badge = "OK" if s.ok else "CHECK"
 
-            tree_lines.append("")  # Blank line between sections
+            key_details: list[str] = []
+            for item in s.items:
+                if not item.ok:
+                    val_str = f"**{item.label}:** `{item.value}`"
+                    if item.tip:
+                        issues.append(f"**{s.title} ({item.label}):** {item.value} -> *{item.tip}*")
+                else:
+                    val_str = f"**{item.label}:** `{item.value}`"
+                key_details.append(val_str)
 
-        # Summary line inside the code block
+            details_str = " · ".join(key_details[:3])
+            if len(key_details) > 3:
+                details_str += f" *(+{len(key_details) - 3} more)*"
+
+            table_rows.append(f"| **{s.title}** | {status_badge} | {details_str} |")
+
+        parts: list[str] = [
+            "### OpsCloud Health Diagnostics\n",
+            "\n".join(table_rows),
+            "",
+        ]
+
         if all_healthy:
-            tree_lines.append("  Summary: All checks passed ✓")
+            parts.append(f"**Overall Status:** All {len(sections)} diagnostic checks passed.\n")
         else:
             fail_count = sum(1 for s in sections if not s.ok)
-            tree_lines.append(f"  Summary: {fail_count} section(s) need attention ⚠")
+            parts.append(f"**Overall Status:** {fail_count} of {len(sections)} section(s) need attention.\n")
 
-        # Remediation tips inside code block
         if issues:
-            tree_lines.append("")
-            tree_lines.append("  Suggested fixes:")
+            parts.append("#### Attention Needed")
             for tip in issues:
-                tree_lines.append(f"    {tip}")
+                parts.append(f"- {tip}")
+            parts.append("")
 
-        # Assemble final output: markdown header + code block + markdown footer
-        parts: list[str] = [
-            "**OpsCode Doctor**\n",
-            "```",
-            "\n".join(tree_lines),
-            "```",
-            "",
-            "_Tip: `/config` to inspect settings · `/config path` for file locations · `/login` to configure API keys_",
-        ]
+        parts.append(
+            "_Tip: Run `/config` to inspect settings · `/config path` for file locations · `/login` to configure API keys_"
+        )
         return "\n".join(parts)
 
 

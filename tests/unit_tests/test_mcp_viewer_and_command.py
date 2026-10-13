@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from textual.app import App, ComposeResult
+from textual.screen import Screen
 
 from opscloud.commands._base import CommandContext
 from opscloud.commands.core.mcp import McpHandler
@@ -25,10 +27,10 @@ from opscloud.ui.widgets.mcp_viewer import (
 )
 
 
-class DummyViewerApp(App):
-    """Minimal textual app to mount and test MCPViewerScreen."""
+class DummyViewerApp(App[None]):
+    """Minimal textual app to mount and test MCP screens."""
 
-    def __init__(self, screen_instance: MCPViewerScreen) -> None:
+    def __init__(self, screen_instance: Screen[Any]) -> None:
         super().__init__()
         self._test_screen = screen_instance
 
@@ -204,6 +206,7 @@ async def test_mcp_command_status() -> None:
 
     res = await handler.execute(ctx)
     assert res.success is True
+    assert res.message is not None
     assert "prod-aws" in res.message
     assert "2 tools" in res.message
 

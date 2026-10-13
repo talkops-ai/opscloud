@@ -176,20 +176,22 @@ class TasksHandler(BaseCommandHandler):
                 message="No tasks yet. Use `/tasks add <description>` to create one.",
             )
 
-        lines = ["**Session Tasks:**", ""]
+        lines = ["### Session Tasks", ""]
         for t in tasks:
             if t.status == "done":
-                marker = "[x]"
+                marker = "- [x]"
                 style = "~~"
             elif t.status == "in-progress":
-                marker = "[>]"
-                style = ""
+                marker = "- [ ]"
+                style = "**"
             else:
-                marker = "[ ]"
+                marker = "- [ ]"
                 style = ""
 
             text = f"{style}{t.text}{style}" if style else t.text
-            lines.append(f"  {marker} #{t.id} {text}")
+            if t.status == "in-progress":
+                text = f"{text} *(in progress)*"
+            lines.append(f"{marker} `#{t.id}` {text}")
 
         pending = len(store.pending)
         total = len(tasks)

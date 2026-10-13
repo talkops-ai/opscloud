@@ -144,6 +144,22 @@ def test_pool_manager_get_model_choices(pool_manager):
     assert "Deep cross-service root-cause correlation" in sub_powerful_crit
 
 
+def test_middleware_construction_does_not_resolve_model_pool() -> None:
+    """Creating many subagent middleware instances must perform zero model work."""
+    pool = MagicMock(spec=DynamicModelPoolManager)
+
+    middlewares = [
+        JevDynamicModelRouterMiddleware(
+            pool_manager=pool,
+            subagent_name=f"agent-{index}",
+        )
+        for index in range(100)
+    ]
+
+    pool.get_model_choices.assert_not_called()
+    assert all(middleware._router is None for middleware in middlewares)
+
+
 @pytest.mark.asyncio
 async def test_middleware_sends_candidate_models_in_question_choices():
     middleware = JevDynamicModelRouterMiddleware()

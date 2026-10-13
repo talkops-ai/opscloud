@@ -5,25 +5,27 @@ from __future__ import annotations
 import asyncio
 from typing import Any, ClassVar
 
+from rich.markup import escape
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
+from textual.content import Content
 from textual.css.query import NoMatches
 from textual.events import Click
 from textual.fuzzy import Matcher
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Input, Static
-
 from opscloud.config.cloud_profiles import (
     AWSProfileInfo,
     get_active_aws_profile,
     list_aws_profiles,
 )
+from opscloud.config.settings import get_glyphs
 from opscloud.config.toml_config import (
     load_aws_profile,
     load_recent_aws_profiles,
     save_aws_profile,
 )
+from opscloud.ui.widgets.modal_base import ModalDialog, OpsModalScreen
 from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -74,9 +76,13 @@ class CloudProfileOption(Static):
 
     def render_label_text(self) -> str:
         cursor = "› " if self.is_selected else "  "
-        text = f"{cursor}{self.profile_name}"
+        text = f"{cursor}{escape(self.profile_name)}"
+        if self.profile_info.region:
+            text += f" [dim]({escape(self.profile_info.region)})[/dim]"
         if self.is_current:
-            text += " [dim](current)[/dim]"
+            text += " [bold $success]● Active[/bold $success]"
+        if "prod" in self.profile_name.lower():
+            text += " [bold $ctx-prod on $ctx-prod-bg]PROD[/bold $ctx-prod on $ctx-prod-bg]"
         if self.is_default:
             text += " [bold](default)[/bold]"
         return text
@@ -92,8 +98,14 @@ class CloudProfileOption(Static):
         self.update(self.render_label_text())
 
 
-class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
+MAX_VISIBLE_ROWS: int = 24
+MIN_VISIBLE_ROWS: int = 3
+
+
+class CloudProfileSelectorScreen(OpsModalScreen[tuple[str, str | None] | None]):
     """Full-screen modal for interactive cloud profile selection."""
+
+    DIALOG_CLASSES: ClassVar[str] = ""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("up", "move_up", "Up", show=False, priority=True),
@@ -106,27 +118,9 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
     ]
 
-    CSS = """
-    CloudProfileSelectorScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    CloudProfileSelectorScreen > Vertical {
-        width: 82;
-        max-width: 95%;
-        height: auto;
-        max-height: 90vh;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     CloudProfileSelectorScreen .cloud-selector-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     CloudProfileSelectorScreen .cloud-selector-info {
@@ -137,7 +131,7 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
 
     CloudProfileSelectorScreen #cloud-filter {
         margin-bottom: 1;
-        border: solid $panel;
+        border: solid $primary 40%;
     }
 
     CloudProfileSelectorScreen #cloud-filter:focus {
@@ -146,8 +140,8 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
 
     CloudProfileSelectorScreen .cloud-list {
         height: auto;
-        min-height: 1;
-        max-height: 16;
+        min-height: 3;
+        max-height: 24;
         background: $background;
         scrollbar-gutter: stable;
     }
@@ -172,17 +166,19 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
     }
 
     CloudProfileSelectorScreen .cloud-option:hover {
-        background: $panel;
+        background: $surface-lighten-1;
     }
 
     CloudProfileSelectorScreen .cloud-option-selected {
-        background: $primary;
-        color: $background;
+        background: $primary 18%;
+        color: $text;
         text-style: bold;
+        border-left: wide $primary;
+        padding-left: 0;
     }
 
     CloudProfileSelectorScreen .cloud-option-selected:hover {
-        background: $primary;
+        background: $primary 25%;
     }
 
     CloudProfileSelectorScreen .cloud-option-current {
@@ -190,19 +186,17 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
     }
 
     CloudProfileSelectorScreen .cloud-detail-footer {
-        height: 4;
-        padding: 0 2;
+        height: auto;
+        min-height: 4;
+        max-height: 8;
+        padding: 0 1;
         margin-top: 1;
-        border-top: solid $panel;
-        background: $surface;
+        border-top: solid $primary 20%;
+        background: $background;
     }
 
     CloudProfileSelectorScreen .cloud-selector-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -213,6 +207,7 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         self._recent_profiles = load_recent_aws_profiles()
         self._dismissed: bool = False
         self._loaded: bool = False
+        self._mutated: bool = False
         self._rebuild_counter: int = 0
 
         self._all_profiles: list[AWSProfileInfo] = []
@@ -225,34 +220,35 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
 
     # ── Compose ──────────────────────────────────────────
 
-    def compose(self):
-        with Vertical():
-            title = f"Select Cloud Profile (current: {self._current_profile})"
-            yield Static(title, classes="cloud-selector-title")
+    def compose_modal(self):
+        title = f"Select Cloud Profile (current: {self._current_profile})"
+        yield Static(title, classes="cloud-selector-title")
 
-            yield Static(
-                self._info_content(),
-                classes="cloud-selector-info",
-                id="cloud-selector-info",
-            )
+        yield Static(
+            self._info_content(),
+            classes="cloud-selector-info",
+            id="cloud-selector-info",
+        )
 
-            yield Input(
-                placeholder="Type to filter or enter profile name...",
-                id="cloud-filter",
-            )
+        yield Input(
+            placeholder="Type to filter or enter profile name...",
+            id="cloud-filter",
+        )
 
-            with VerticalScroll(classes="cloud-list"):
-                self._options_container = Container(id="cloud-options")
-                yield self._options_container
+        with VerticalScroll(classes="cloud-list"):
+            self._options_container = Container(id="cloud-options")
+            yield self._options_container
 
-            yield Static("", classes="cloud-detail-footer", id="cloud-detail-footer", markup=True)
+        yield Static("", classes="cloud-detail-footer", id="cloud-detail-footer", markup=True)
 
-            yield Static(
-                "↑/↓ navigate • PgUp/PgDn page • Tab complete • Enter select • Ctrl+S default • Esc cancel",
-                classes="cloud-selector-help",
-            )
+        yield Static(
+            "↑/↓ navigate • PgUp/PgDn page • Tab complete • Enter select • Ctrl+S default • Esc cancel",
+            classes="cloud-selector-help",
+        )
 
     def on_mount(self) -> None:
+        super().on_mount()
+        self._update_modal_chrome()
         try:
             self.query_one("#cloud-filter", Input).focus()
         except NoMatches:
@@ -274,22 +270,36 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         else:
             self._sync_load_profiles()
 
+    def _update_modal_chrome(self) -> None:
+        glyphs = get_glyphs()
+        active_txt = f"active: {self._current_profile}" if self._current_profile else "no active profile"
+        self.set_modal_title("Select Cloud Profile", counter=f"{len(self._filtered_profiles)} profiles · {active_txt}")
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("enter", "select"),
+            ("tab", "autocomplete"),
+            ("ctrl+s", "set default"),
+            ("esc", "cancel"),
+        ])
+
     def on_resize(self) -> None:
         self.call_after_refresh(self._fit_cloud_list)
 
     def _fit_cloud_list(self) -> None:
         try:
-            container = self.query_one(Vertical)
-            body = self.query_one(".cloud-list", VerticalScroll)
-        except NoMatches:
+            list_widget = self.query_one(".cloud-list", VerticalScroll)
+            options_container = self._options_container or self.query_one("#cloud-options")
+            content_rows = max(MIN_VISIBLE_ROWS, len(options_container.children))
+            screen_h = self.size.height if self.size.height > 0 else 60
+            viewport_rows = max(MIN_VISIBLE_ROWS, screen_h - 12)
+            target_height = min(
+                MAX_VISIBLE_ROWS,
+                content_rows,
+                viewport_rows,
+            )
+            list_widget.styles.height = target_height
+        except (NoMatches, RuntimeError, Exception):
             return
-        non_body_height = max(0, container.region.height - body.region.height)
-        available_height = self.size.height - non_body_height
-        max_height = max(1, min(16, available_height))
-        current = body.styles.max_height
-        if current is not None and current.cells == max_height:
-            return
-        body.styles.max_height = max_height
 
     def _load_profile_data(self) -> list[AWSProfileInfo]:
         return list_aws_profiles()
@@ -328,6 +338,7 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
             self.query_one("#cloud-selector-info", Static).update(self._info_content())
         except NoMatches:
             pass
+        self._update_modal_chrome()
 
     # ── Filtering ────────────────────────────────────────
 
@@ -472,6 +483,12 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
                 else None
             )
             self._scroll_to_selected()
+        self._fit_cloud_list()
+        try:
+            self.call_after_refresh(self._fit_cloud_list)
+            self.refresh(layout=True)
+        except Exception:
+            pass
 
     def _rebuild_options_sync(self) -> None:
         if not self._options_container:
@@ -489,6 +506,12 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
                 else None
             )
             self._scroll_to_selected()
+        self._fit_cloud_list()
+        try:
+            self.call_after_refresh(self._fit_cloud_list)
+            self.refresh(layout=True)
+        except Exception:
+            pass
 
     def _create_option_widget(
         self,
@@ -500,7 +523,7 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         is_default = prof.name == self._default_profile
 
         cursor = "› " if is_selected else "  "
-        text = f"{cursor}{prof.name}"
+        text = f"{cursor}{escape(prof.name)}"
         if is_current:
             text += " [dim](current)[/dim]"
         if is_default:
@@ -536,28 +559,69 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
 
         # Line 1: Provider, Profile name, Region
         region_str = profile.region or "us-east-1 (default)"
-        line1 = f"Provider: [green]AWS[/green] • Profile: [bold]{profile.name}[/bold] • Region: {region_str}"
+        is_prod = "prod" in profile.name.lower()
 
-        # Line 2: Account ID / Role ARN
+        pieces: list[Any] = [
+            ("Provider: ", "dim"),
+            ("AWS", "bold $primary"),
+            (" • Profile: ", "dim"),
+            (profile.name, "bold $foreground"),
+        ]
+        if is_prod:
+            pieces.extend([
+                (" ", ""),
+                ("PROD", "bold $ctx-prod on $ctx-prod-bg"),
+            ])
+        pieces.extend([
+            (" • Region: ", "dim"),
+            (region_str, "$secondary"),
+            "\n",
+        ])
+
+        # Line 2: Account ID / Role ARN / Auth
         if profile.account_id and profile.role_arn:
-            line2 = f"Account: [cyan]{profile.account_id}[/cyan] • Role: {profile.role_arn}"
+            pieces.extend([
+                ("Account: ", "dim"),
+                (profile.account_id, "$secondary"),
+                (" • Role: ", "dim"),
+                (profile.role_arn, "dim"),
+            ])
         elif profile.account_id:
-            line2 = f"Account: [cyan]{profile.account_id}[/cyan]"
+            pieces.extend([
+                ("Account: ", "dim"),
+                (profile.account_id, "$secondary"),
+            ])
         elif profile.role_arn:
-            line2 = f"Role: {profile.role_arn}"
+            pieces.extend([
+                ("Role: ", "dim"),
+                (profile.role_arn, "dim"),
+            ])
         elif profile.is_sso:
-            line2 = "Authentication: [cyan]AWS SSO Session[/cyan]"
+            pieces.extend([
+                ("Authentication: ", "dim"),
+                ("AWS SSO Session", "$secondary"),
+            ])
         elif profile.has_keys:
-            line2 = "Authentication: [cyan]Static IAM Access Keys[/cyan]"
+            pieces.extend([
+                ("Authentication: ", "dim"),
+                ("Static IAM Access Keys", "$secondary"),
+            ])
         else:
-            line2 = "Authentication: Standard AWS Credential Chain"
+            pieces.extend([
+                ("Authentication: ", "dim"),
+                ("Standard AWS Credential Chain", "dim"),
+            ])
+        pieces.append("\n")
 
         # Line 3: Capabilities & Status
-        status_tag = "[green]configured[/green]"
-        caps = "[green]read & write operations active[/green]"
-        line3 = f"Status: {status_tag} • Mode: {caps}"
+        pieces.extend([
+            ("Status: ", "dim"),
+            ("configured", "bold $success"),
+            (" • Mode: ", "dim"),
+            ("read & write operations active", "dim"),
+        ])
 
-        footer.update(f"{line1}\n{line2}\n{line3}")
+        footer.update(Content.assemble(*pieces))
 
     # ── Selection Movement ───────────────────────────────
 
@@ -738,6 +802,7 @@ class CloudProfileSelectorScreen(ModalScreen[tuple[str, str | None] | None]):
         pname = opt.profile_name
         self._default_profile = pname
         save_aws_profile(pname)
+        self._mutated = True
         self.notify(f"Default AWS profile set: {pname} (saved to config.toml)", severity="information", timeout=3)
         for w in self._option_widgets:
             w.is_default = (w.profile_name == self._default_profile)

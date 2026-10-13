@@ -87,13 +87,13 @@ class McpHandler(BaseCommandHandler):
         if not servers:
             return CommandResult(success=True, message="No MCP servers configured.")
 
-        lines = ["**MCP Servers:**\n"]
+        lines = ["### MCP Server Status\n"]
         for srv in servers:
             connected = getattr(srv, "connected", False)
             name = getattr(srv, "name", "unknown")
             tool_count = getattr(srv, "tool_count", 0)
-            icon = "[connected]" if connected else "[disconnected]"
-            lines.append(f"  {icon} `{name}`: {tool_count} tools")
+            status = "Connected" if connected else "Disconnected"
+            lines.append(f"- **`{name}`**: {status} · {tool_count} tools")
         return CommandResult(success=True, message="\n".join(lines))
 
     async def _login(self, ctx: CommandContext, server_name: str) -> CommandResult:

@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 from typing import Any, ClassVar
 
+from rich.markup import escape
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
+from textual.content import Content
 from textual.css.query import NoMatches
 from textual.events import Click
 from textual.fuzzy import Matcher
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+from opscloud.config.settings import get_glyphs
 from opscloud.model.config import (
     DEFAULT_PROVIDER_PRIORITY,
     RECOMMENDED_SPECS,
@@ -29,6 +31,7 @@ from opscloud.model.config import (
     load_recent_models,
     save_default_model,
 )
+from opscloud.ui.widgets.modal_base import ModalDialog, OpsModalScreen
 from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -102,9 +105,9 @@ class ModelOption(Static):
     def render_label_text(self, show_specs: bool = False) -> str:
         cursor = "› " if self.is_selected else "  "
         main_name = self.model_spec if show_specs else self.display_name
-        text = f"{cursor}{main_name}"
+        text = f"{cursor}{escape(main_name)}"
         if self.show_provider and self.provider_tag and not show_specs:
-            text += f" [dim]({self.provider_tag})[/dim]"
+            text += f" [dim]({escape(self.provider_tag)})[/dim]"
         if self.is_current:
             text += " [dim](current)[/dim]"
         if self.is_default:
@@ -122,8 +125,14 @@ class ModelOption(Static):
         self.update(self.render_label_text(show_specs))
 
 
-class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, str] | None]):
+MAX_VISIBLE_ROWS: int = 24
+MIN_VISIBLE_ROWS: int = 3
+
+
+class ModelSelectorScreen(OpsModalScreen[tuple[str, str, str | None] | tuple[str, str] | None]):
     """Full-screen modal for interactive model selection."""
+
+    DIALOG_CLASSES: ClassVar[str] = ""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("up", "move_up", "Up", show=False, priority=True),
@@ -138,27 +147,9 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
     ]
 
-    CSS = """
-    ModelSelectorScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    ModelSelectorScreen > Vertical {
-        width: 82;
-        max-width: 95%;
-        height: auto;
-        max-height: 90vh;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     ModelSelectorScreen .model-selector-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     ModelSelectorScreen .model-selector-info {
@@ -169,7 +160,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
 
     ModelSelectorScreen #model-filter {
         margin-bottom: 1;
-        border: solid $panel;
+        border: solid $primary 40%;
     }
 
     ModelSelectorScreen #model-filter:focus {
@@ -178,8 +169,8 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
 
     ModelSelectorScreen .model-list {
         height: auto;
-        min-height: 1;
-        max-height: 16;
+        min-height: 3;
+        max-height: 24;
         background: $background;
         scrollbar-gutter: stable;
     }
@@ -204,17 +195,19 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
     }
 
     ModelSelectorScreen .model-option:hover {
-        background: $panel;
+        background: $surface-lighten-1;
     }
 
     ModelSelectorScreen .model-option-selected {
-        background: $primary;
-        color: $background;
+        background: $primary 18%;
+        color: $text;
         text-style: bold;
+        border-left: wide $primary;
+        padding-left: 0;
     }
 
     ModelSelectorScreen .model-option-selected:hover {
-        background: $primary;
+        background: $primary 25%;
     }
 
     ModelSelectorScreen .model-option-current {
@@ -222,19 +215,17 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
     }
 
     ModelSelectorScreen .model-detail-footer {
-        height: 4;
-        padding: 0 2;
+        height: auto;
+        min-height: 4;
+        max-height: 8;
+        padding: 0 1;
         margin-top: 1;
-        border-top: solid $panel;
-        background: $surface;
+        border-top: solid $primary 20%;
+        background: $background;
     }
 
     ModelSelectorScreen .model-selector-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -274,37 +265,38 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
 
     # ── Compose ──────────────────────────────────────────
 
-    def compose(self):
-        with Vertical():
-            if self._current_spec:
-                title = f"Select Model (current: {self._current_spec})"
-            else:
-                title = "Select Model"
-            yield Static(title, classes="model-selector-title")
+    def compose_modal(self):
+        if self._current_spec:
+            title = f"Select Model (current: {self._current_spec})"
+        else:
+            title = "Select Model"
+        yield Static(title, classes="model-selector-title")
 
-            yield Static(
-                self._info_content(),
-                classes="model-selector-info",
-                id="model-selector-info",
-            )
+        yield Static(
+            self._info_content(),
+            classes="model-selector-info",
+            id="model-selector-info",
+        )
 
-            yield Input(
-                placeholder="Type to filter or enter provider:model...",
-                id="model-filter",
-            )
+        yield Input(
+            placeholder="Type to filter or enter provider:model...",
+            id="model-filter",
+        )
 
-            with VerticalScroll(classes="model-list"):
-                self._options_container = Container(id="model-options")
-                yield self._options_container
+        with VerticalScroll(classes="model-list"):
+            self._options_container = Container(id="model-options")
+            yield self._options_container
 
-            yield Static("", classes="model-detail-footer", id="model-detail-footer", markup=True)
+        yield Static("", classes="model-detail-footer", id="model-detail-footer", markup=True)
 
-            yield Static(
-                "↑/↓ navigate • PgUp/PgDn page • Tab autocomplete • Enter select • Ctrl+S default • Ctrl+R recommended • Ctrl+N IDs",
-                classes="model-selector-help",
-            )
+        yield Static(
+            "↑/↓ navigate • PgUp/PgDn page • Tab autocomplete • Enter select • Ctrl+S default • Ctrl+R recommended • Ctrl+N IDs",
+            classes="model-selector-help",
+        )
 
     def on_mount(self) -> None:
+        super().on_mount()
+        self._update_modal_chrome()
         try:
             self.query_one("#model-filter", Input).focus()
         except NoMatches:
@@ -326,22 +318,43 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         else:
             self._sync_load_models()
 
+    def _update_modal_chrome(self) -> None:
+        glyphs = get_glyphs()
+        if self._current_spec:
+            title = "Select Model"
+            counter = f"{len(self._filtered_models)} models · active: {self._current_spec}"
+        else:
+            title = "Select Model"
+            counter = f"{len(self._filtered_models)} models"
+
+        self.set_modal_title(title, counter=counter)
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("enter", "select"),
+            ("tab", "autocomplete"),
+            ("ctrl+r", "recommended/all"),
+            ("ctrl+s", "set default"),
+            ("esc", "cancel"),
+        ])
+
     def on_resize(self) -> None:
         self.call_after_refresh(self._fit_model_list)
 
     def _fit_model_list(self) -> None:
         try:
-            container = self.query_one(Vertical)
-            body = self.query_one(".model-list", VerticalScroll)
-        except NoMatches:
+            list_widget = self.query_one(".model-list", VerticalScroll)
+            options_container = self._options_container or self.query_one("#model-options")
+            content_rows = max(MIN_VISIBLE_ROWS, len(options_container.children))
+            screen_h = self.size.height if self.size.height > 0 else 60
+            viewport_rows = max(MIN_VISIBLE_ROWS, screen_h - 12)
+            target_height = min(
+                MAX_VISIBLE_ROWS,
+                content_rows,
+                viewport_rows,
+            )
+            list_widget.styles.height = target_height
+        except (NoMatches, RuntimeError, Exception):
             return
-        non_body_height = max(0, container.region.height - body.region.height)
-        available_height = self.size.height - non_body_height
-        max_height = max(1, min(16, available_height))
-        current = body.styles.max_height
-        if current is not None and current.cells == max_height:
-            return
-        body.styles.max_height = max_height
 
     def _load_model_data(self) -> list[tuple[str, str, str]]:
         raw_models = get_available_models_list()
@@ -382,6 +395,7 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             self.query_one("#model-selector-info", Static).update(self._info_content())
         except NoMatches:
             pass
+        self._update_modal_chrome()
 
     # ── Filtering ────────────────────────────────────────
 
@@ -645,6 +659,12 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
                 else None
             )
             self._scroll_to_selected()
+        self._fit_model_list()
+        try:
+            self.call_after_refresh(self._fit_model_list)
+            self.refresh(layout=True)
+        except Exception:
+            pass
 
     def _rebuild_options_sync(self) -> None:
         if not self._options_container:
@@ -662,6 +682,12 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
                 else None
             )
             self._scroll_to_selected()
+        self._fit_model_list()
+        try:
+            self.call_after_refresh(self._fit_model_list)
+            self.refresh(layout=True)
+        except Exception:
+            pass
 
     def _format_row_label(
         self,
@@ -675,9 +701,9 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         cursor = "› " if selected else "  "
         main_name = spec if self._show_specs else display_name
 
-        text = f"{cursor}{main_name}"
+        text = f"{cursor}{escape(main_name)}"
         if provider_tag and not self._show_specs:
-            text += f" [dim]({provider_tag})[/dim]"
+            text += f" [dim]({escape(provider_tag)})[/dim]"
         if is_current:
             text += " [dim](current)[/dim]"
         if is_default:
@@ -699,16 +725,32 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         spec, display_name, provider = model
         if spec in ("auto", "dynamic"):
             footer.update(
-                "Router: Autonomous tier routing (Fast / Standard / Powerful)\n"
-                "Classifier: TypeSafe Jev (System 1 Calibrated Decision Model)\n"
-                "Capabilities: [green]parallel classification[/green] [green]zero token generation[/green] [green]RLCD probabilities[/green]"
+                Content.assemble(
+                    ("Router: ", "dim"),
+                    ("Autonomous tier routing (Fast / Standard / Powerful)\n", "$foreground"),
+                    ("Classifier: ", "dim"),
+                    ("TypeSafe Jev (System 1 Calibrated Decision Model)\n", "$foreground"),
+                    ("Capabilities: ", "dim"),
+                    ("parallel classification", "bold $success"),
+                    (" ", ""),
+                    ("zero token generation", "bold $success"),
+                    (" ", ""),
+                    ("RLCD probabilities", "bold $success"),
+                )
             )
             return
 
         profile_entry = get_model_profile(spec)
 
         if not profile_entry or not profile_entry.get("profile"):
-            footer.update(f"Spec: {spec}\nProvider: {provider}")
+            footer.update(
+                Content.assemble(
+                    ("Spec: ", "dim"),
+                    (spec, "bold $foreground"),
+                    ("\nProvider: ", "dim"),
+                    (provider, "$secondary"),
+                )
+            )
             return
 
         prof = profile_entry["profile"]
@@ -716,7 +758,14 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
         # Line 1: Context window (Clean text, no markdown asterisks!)
         inp_tok = format_token_count(prof.get("max_input_tokens", 128000))
         out_tok = format_token_count(prof.get("max_output_tokens", 16384))
-        line1 = f"Context: {inp_tok} in • {out_tok} out"
+        pieces: list[Any] = [
+            ("Context: ", "dim"),
+            (inp_tok, "bold $primary"),
+            (" in • ", "dim"),
+            (out_tok, "bold $primary"),
+            (" out\n", "dim"),
+            ("Input: ", "dim"),
+        ]
 
         # Line 2: Input Modalities
         modalities = [
@@ -726,13 +775,16 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             ("pdf_inputs", "pdf"),
             ("video_inputs", "video"),
         ]
-        mod_parts = []
+        first_mod = True
         for key, tag in modalities:
+            if not first_mod:
+                pieces.append((" ", ""))
+            first_mod = False
             if prof.get(key):
-                mod_parts.append(f"[green]{tag}[/green]")
+                pieces.append((tag, "bold $success"))
             else:
-                mod_parts.append(f"[dim]{tag}[/dim]")
-        line2 = f"Input: {' '.join(mod_parts)}"
+                pieces.append((tag, "dim"))
+        pieces.append(("\nCapabilities: ", "dim"))
 
         # Line 3: Capabilities
         capabilities = [
@@ -740,16 +792,17 @@ class ModelSelectorScreen(ModalScreen[tuple[str, str, str | None] | tuple[str, s
             ("tool_calling", "tool calling"),
             ("structured_output", "structured output"),
         ]
-        cap_parts = []
+        first_cap = True
         for key, tag in capabilities:
+            if not first_cap:
+                pieces.append((" ", ""))
+            first_cap = False
             if prof.get(key):
-                mod_parts_cap = f"[green]{tag}[/green]"
+                pieces.append((tag, "bold $secondary"))
             else:
-                mod_parts_cap = f"[dim]{tag}[/dim]"
-            cap_parts.append(mod_parts_cap)
-        line3 = f"Capabilities: {' '.join(cap_parts)}"
+                pieces.append((tag, "dim"))
 
-        footer.update(f"{line1}\n{line2}\n{line3}")
+        footer.update(Content.assemble(*pieces))
 
     # ── Selection Movement ───────────────────────────────
 

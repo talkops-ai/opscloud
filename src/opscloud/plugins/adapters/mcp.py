@@ -260,7 +260,7 @@ def subagent_mcp_configs(
                 data_dir=data_dir,
                 project_dir=project_dir,
             )
-            normalized[name] = norm_srv
+            normalized[scoped_subagent_mcp_server_name(subagent_name, name)] = norm_srv
 
     return normalized
 
@@ -296,23 +296,12 @@ def discover_plugin_mcp_configs(
         return {}
 
 
-def prepare_subagent_mcp(
+def collect_subagent_mcp_configs(
     subagent_name: str,
     subagent_meta: SubagentMetadata | Mapping[str, Any],
     project_root: Path | None = None,
-) -> tuple[dict[str, Any], list[Any], list[Any]]:
-    """Prepare and preload MCP servers and tools for a subagent.
-
-    Args:
-        subagent_name: Name of the subagent.
-        subagent_meta: Subagent metadata dict.
-        project_root: Optional project scope root directory.
-
-    Returns:
-        Tuple of (servers_dict, subagent_mcp_tools, sub_mcp_server_infos).
-    """
-    import asyncio
-    import concurrent.futures
+) -> dict[str, Any]:
+    """Collect a subagent's MCP configs without opening any connections."""
     from opscloud.plugins.adapters.agents import get_subagent_bundle_dir
 
     servers: dict[str, Any] = {}
@@ -320,47 +309,168 @@ def prepare_subagent_mcp(
     mcp_files_raw = subagent_meta.get("mcp_files")
     mcp_files = list(mcp_files_raw) if mcp_files_raw is not None else None
     if bundle_dir and bundle_dir.is_dir():
-        servers.update(subagent_mcp_configs(subagent_name, bundle_dir, mcp_files, project_dir=project_root))
+        servers.update(
+            subagent_mcp_configs(
+                subagent_name,
+                bundle_dir,
+                mcp_files,
+                project_dir=project_root,
+            )
+        )
 
     raw_mcp_cfg = subagent_meta.get("mcp_config")
     if raw_mcp_cfg and isinstance(raw_mcp_cfg, dict):
-        servers.update(raw_mcp_cfg.get("mcpServers") or raw_mcp_cfg)
+        raw_servers = raw_mcp_cfg.get("mcpServers") or raw_mcp_cfg
+        if isinstance(raw_servers, dict):
+            prefix = f"subagent__{_safe_mcp_name_part(subagent_name)}__"
+            for raw_name, config in raw_servers.items():
+                name = str(raw_name)
+                scoped_name = (
+                    name
+                    if name.startswith(prefix)
+                    else scoped_subagent_mcp_server_name(subagent_name, name)
+                )
+                servers[scoped_name] = config
+    return servers
 
-    if not servers:
-        return {}, [], []
 
-    subagent_mcp_tools: list[Any] = []
-    sub_mcp_server_infos: list[Any] = []
+def _run_preload_sync(configs: dict[str, Any]) -> None:
+    """Run one bounded async preload batch from the synchronous graph factory."""
+    import asyncio
+    import concurrent.futures
+
+    from opscloud.mcp.preload import preload_mcp_metadata
+
+    if not configs:
+        return
     try:
-        from opscloud.mcp.preload import get_cached_mcp_server_infos, preload_mcp_metadata
-        from opscloud.mcp.session_manager import MCPSessionManager, build_mcp_tools_from_server_infos
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, preload_mcp_metadata(configs)).result()
+    else:
+        asyncio.run(preload_mcp_metadata(configs))
 
-        sub_mcp_manager = MCPSessionManager.get_instance(servers, purge_missing=False)
-        sub_mcp_manager.register_servers(servers)
 
-        cached_infos = get_cached_mcp_server_infos()
-        cached_by_name = {info.name: info for info in cached_infos}
-        missing_configs = {k: v for k, v in servers.items() if k not in cached_by_name}
+async def prepare_subagents_mcp_async(
+    subagents: Mapping[str, SubagentMetadata | Mapping[str, Any]],
+    project_root: Path | None = None,
+) -> dict[str, tuple[dict[str, Any], list[Any], list[Any]]]:
+    """Prepare subagent MCP resources on the caller's event loop."""
+    plans = {
+        name: collect_subagent_mcp_configs(name, meta, project_root)
+        for name, meta in subagents.items()
+    }
+    all_servers = {
+        server_name: config
+        for servers in plans.values()
+        for server_name, config in servers.items()
+    }
+    if not all_servers:
+        return {name: ({}, [], []) for name in subagents}
 
-        if missing_configs:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+    try:
+        from opscloud.mcp.preload import (
+            get_cached_mcp_server_infos,
+            is_mcp_server_info_cached,
+            preload_mcp_metadata,
+        )
+        from opscloud.mcp.session_manager import (
+            MCPSessionManager,
+            build_mcp_tools_from_server_infos,
+        )
 
-            if loop is not None and loop.is_running():
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    new_infos = pool.submit(asyncio.run, preload_mcp_metadata(missing_configs)).result()
-            else:
-                new_infos = asyncio.run(preload_mcp_metadata(missing_configs))
-            cached_infos.extend(new_infos)
-            cached_by_name.update({info.name: info for info in new_infos})
-
-        sub_mcp_server_infos = [cached_by_name[k] for k in servers if k in cached_by_name]
-        sub_tools = build_mcp_tools_from_server_infos(sub_mcp_server_infos, sub_mcp_manager)
-        if sub_tools:
-            subagent_mcp_tools.extend(sub_tools)
+        manager = MCPSessionManager.get_instance(all_servers)
+        manager.register_servers(all_servers)
+        missing = {
+            name: config
+            for name, config in all_servers.items()
+            if not is_mcp_server_info_cached(name, config)
+        }
+        if missing:
+            await preload_mcp_metadata(missing)
+        cached_by_name = {
+            info.name: info for info in get_cached_mcp_server_infos()
+        }
+        return {
+            subagent_name: (
+                servers,
+                build_mcp_tools_from_server_infos(
+                    [cached_by_name[name] for name in servers if name in cached_by_name],
+                    manager,
+                ),
+                [cached_by_name[name] for name in servers if name in cached_by_name],
+            )
+            for subagent_name, servers in plans.items()
+        }
     except Exception as exc:
-        logger.warning("Could not initialize subagent %s MCP tools: %s", subagent_name, exc)
+        logger.warning("Could not initialize async subagent MCP tools: %s", exc)
+        return {name: (servers, [], []) for name, servers in plans.items()}
 
-    return servers, subagent_mcp_tools, sub_mcp_server_infos
+
+def prepare_subagents_mcp(
+    subagents: Mapping[str, SubagentMetadata | Mapping[str, Any]],
+    project_root: Path | None = None,
+) -> dict[str, tuple[dict[str, Any], list[Any], list[Any]]]:
+    """Prepare every subagent MCP binding in one globally bounded probe batch."""
+    plans = {
+        name: collect_subagent_mcp_configs(name, meta, project_root)
+        for name, meta in subagents.items()
+    }
+    all_servers = {
+        server_name: config
+        for servers in plans.values()
+        for server_name, config in servers.items()
+    }
+    if not all_servers:
+        return {name: ({}, [], []) for name in subagents}
+
+    try:
+        from opscloud.mcp.preload import (
+            get_cached_mcp_server_infos,
+            is_mcp_server_info_cached,
+        )
+        from opscloud.mcp.session_manager import (
+            MCPSessionManager,
+            build_mcp_tools_from_server_infos,
+        )
+
+        manager = MCPSessionManager.get_instance(all_servers)
+        manager.register_servers(all_servers)
+        missing = {
+            name: config
+            for name, config in all_servers.items()
+            if not is_mcp_server_info_cached(name, config)
+        }
+        _run_preload_sync(missing)
+        cached_by_name = {
+            info.name: info for info in get_cached_mcp_server_infos()
+        }
+
+        prepared: dict[str, tuple[dict[str, Any], list[Any], list[Any]]] = {}
+        for subagent_name, servers in plans.items():
+            infos = [
+                cached_by_name[name]
+                for name in servers
+                if name in cached_by_name
+            ]
+            tools = build_mcp_tools_from_server_infos(infos, manager)
+            prepared[subagent_name] = (servers, tools, infos)
+        return prepared
+    except Exception as exc:
+        logger.warning("Could not initialize batched subagent MCP tools: %s", exc)
+        return {name: (servers, [], []) for name, servers in plans.items()}
+
+
+def prepare_subagent_mcp(
+    subagent_name: str,
+    subagent_meta: SubagentMetadata | Mapping[str, Any],
+    project_root: Path | None = None,
+) -> tuple[dict[str, Any], list[Any], list[Any]]:
+    """Backward-compatible one-subagent wrapper around batched preparation."""
+    return prepare_subagents_mcp(
+        {subagent_name: subagent_meta},
+        project_root,
+    )[subagent_name]

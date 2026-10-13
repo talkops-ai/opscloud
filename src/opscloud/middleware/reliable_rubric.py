@@ -305,9 +305,10 @@ with warnings.catch_warnings():
             the main transcript, so grading it against a goal rubric would be
             meaningless (and could loop the main model back into execution).
             """
+            from opscloud.state.agent_session_channels import is_agent_session_turn
             from opscloud.state.workflow_channels import is_workflow_turn
 
-            if is_workflow_turn(state):
+            if is_workflow_turn(state) or is_agent_session_turn(state):
                 return None
             return super()._prepare_evaluation(state, runtime)
 

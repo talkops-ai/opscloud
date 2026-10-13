@@ -14,9 +14,9 @@ import os
 from typing import TYPE_CHECKING, ClassVar, Any
 
 from textual.binding import Binding, BindingType
+from textual.content import Content
 from textual.containers import Vertical, Horizontal
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Static, Button
 from textual.widgets.option_list import Option
 
@@ -26,6 +26,8 @@ from opscloud.config.manifest import (
     get_config_options,
     resolve_scalar,
 )
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen, format_modal_option_row
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
@@ -36,33 +38,18 @@ logger = get_logger(__name__)
 
 # ── Inline Edit Modal ─────────────────────────────────────
 
-class _InlineEditScreen(ModalScreen[str | None]):
+class _InlineEditScreen(OpsModalScreen[str | None]):
     """Small modal for editing a single string/path/list config value."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
     ]
 
-    CSS = """
-    _InlineEditScreen {
-        align: center middle;
-        background: $background 70%;
-    }
-
-    _InlineEditScreen > Vertical {
-        width: 72;
-        max-width: 90%;
-        height: auto;
-        max-height: 12;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     _InlineEditScreen .edit-title {
-        text-style: bold;
-        color: $primary;
-        margin-bottom: 1;
+        display: none;
     }
 
     _InlineEditScreen Input {
@@ -85,19 +72,25 @@ class _InlineEditScreen(ModalScreen[str | None]):
         self._current_value = current_value
         self._placeholder = placeholder
 
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Static(f"Edit: {self._label}", classes="edit-title")
-            yield Input(
-                value=self._current_value,
-                placeholder=self._placeholder or "Enter value...",
-                id="edit-input",
-            )
-            with Horizontal():
-                yield Button("Save", variant="primary", id="save-btn")
-                yield Button("Cancel", variant="default", id="cancel-btn")
+    def compose_modal(self):
+        yield Static(f"Edit: {self._label}", classes="edit-title")
+        yield Input(
+            value=self._current_value,
+            placeholder=self._placeholder or "Enter value...",
+            id="edit-input",
+        )
+        with Horizontal():
+            yield Button("Save", variant="primary", id="save-btn")
+            yield Button("Cancel", variant="default", id="cancel-btn")
 
     def on_mount(self) -> None:
+        super().on_mount()
+        glyphs = get_glyphs()
+        self.set_modal_title(f"Edit: {self._label}")
+        self.set_modal_subtitle([
+            ("enter", "save"),
+            ("esc", "cancel"),
+        ])
         try:
             inp = self.query_one("#edit-input", Input)
             inp.focus()
@@ -122,13 +115,15 @@ class _InlineEditScreen(ModalScreen[str | None]):
 
 # ── Config Manager Screen ─────────────────────────────────
 
-class ConfigManagerScreen(ModalScreen[None]):
+class ConfigManagerScreen(OpsModalScreen[bool]):
     """Modal screen for searching, inspecting, and modifying OpsCloud configuration settings.
 
     Features a top search bar, live filterable setting entries formatted with setting name,
     value, and value source, with interactive toggling for booleans and choice cycling.
     All settings are interactively editable.
     """
+
+    DIALOG_CLASSES: ClassVar[str] = "-workspace"
 
     class SettingChanged(Message):
         """Posted when a setting field is updated."""
@@ -144,26 +139,9 @@ class ConfigManagerScreen(ModalScreen[None]):
         Binding("delete", "reset_selected", "Reset setting", show=False, priority=True),
     ]
 
-    CSS = """
-    ConfigManagerScreen {
-        align: center middle;
-        background: $background 70%;
-    }
-
-    ConfigManagerScreen > Vertical {
-        width: 90;
-        max-width: 95%;
-        height: 85%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     ConfigManagerScreen .config-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     ConfigManagerScreen Input#config-search {
@@ -179,14 +157,17 @@ class ConfigManagerScreen(ModalScreen[None]):
         height: 1fr;
         min-height: 5;
         background: $background;
+        border: solid $primary 20%;
+    }
+
+    ConfigManagerScreen OptionList#config-options > .option-list--option-highlighted {
+        background: $primary 18%;
+        color: $text;
+        text-style: bold;
     }
 
     ConfigManagerScreen .config-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        text-align: center;
-        margin-top: 1;
+        display: none;
     }
     """
 
@@ -211,30 +192,62 @@ class ConfigManagerScreen(ModalScreen[None]):
             settings = global_settings
         self._settings: Settings = settings
         self._filter_query: str = ""
+        self._changes_made: bool = False
         # Cache TOML data once at mount time so we don't re-read on every rebuild
         self._toml_data: dict[str, Any] | None = None
 
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Static("OpsCloud Configuration", classes="config-title")
-            yield Input(
-                placeholder="Type to search settings...",
-                id="config-search",
-            )
-            yield OptionList(*self._build_options(), id="config-options")
-            yield Static(
-                "↑/↓ navigate • Enter edit/toggle • / search • Delete reset • Esc close",
-                classes="config-help",
-            )
+    def compose_modal(self):
+        yield Static("OpsCloud Configuration", classes="config-title")
+        yield Input(
+            placeholder="Type to search settings...",
+            id="config-search",
+        )
+        yield OptionList(*self._build_options(), id="config-options")
+        yield Static(
+            "↑/↓ navigate • Enter edit/toggle • / search • Delete reset • Esc close",
+            classes="config-help",
+        )
 
     def on_mount(self) -> None:
-        from opscloud.config.manifest import load_config_toml
+        super().on_mount()
+        glyphs = get_glyphs()
+        from opscloud.config.manifest import get_config_options, load_config_toml
         self._toml_data = load_config_toml()
+        total_settings = len(get_config_options())
+        self.set_modal_title("Configuration", counter=f"{total_settings} settings")
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("enter", "edit/toggle"),
+            ("/", "search"),
+            ("del", "reset"),
+            ("esc", "close"),
+        ])
         # Focus the OptionList so arrow keys navigate immediately
         try:
             self.query_one("#config-options", OptionList).focus()
         except Exception:
             pass
+        self._last_row_width: int | None = None
+        self.call_after_refresh(self._reformat_options)
+
+    def on_resize(self) -> None:
+        width = self._option_content_width("#config-options", fallback=84)
+        if width != getattr(self, "_last_row_width", None):
+            self._last_row_width = width
+            self.call_after_refresh(self._reformat_options)
+
+    def _reformat_options(self) -> None:
+        try:
+            ol = self.query_one("#config-options", OptionList)
+        except Exception:
+            return
+        highlighted = ol.highlighted if ol.highlighted is not None else 0
+        w = self._option_content_width("#config-options", fallback=84)
+        ol.clear_options()
+        for opt in self._build_options(width=w):
+            ol.add_option(opt)
+        if ol.option_count > 0 and 0 <= highlighted < ol.option_count:
+            ol.highlighted = highlighted
 
     def on_key(self, event: Any) -> None:
         """Route keyboard between search Input and OptionList.
@@ -259,10 +272,11 @@ class ConfigManagerScreen(ModalScreen[None]):
             self._filter_query = event.value.strip().lower()
             self._refresh_options()
 
-    def _build_options(self) -> list[Option]:
+    def _build_options(self, width: int | None = None) -> list[Option]:
         """Build filtered OptionList items dynamically from the config manifest."""
         options: list[Option] = []
         current_group: str | None = None
+        row_w = width if width is not None else self._option_content_width("#config-options", fallback=84)
 
         for opt in get_config_options():
             # Apply search filter across key, summary, and group
@@ -277,7 +291,11 @@ class ConfigManagerScreen(ModalScreen[None]):
             if opt.group != current_group:
                 current_group = opt.group
                 options.append(
-                    Option(f"── {current_group} ──", id=f"_group_{current_group}", disabled=True)
+                    Option(
+                        Content.from_markup(f"[bold $primary]── {current_group} ──[/]"),
+                        id=f"_group_{current_group}",
+                        disabled=True,
+                    )
                 )
 
             # Resolve effective value and its source
@@ -285,13 +303,22 @@ class ConfigManagerScreen(ModalScreen[None]):
                 opt, settings=self._settings, toml_data=self._toml_data,
             )
             val_str = self._format_value(opt, value)
-            source_tag = f"[{source}]" if source != "default" else ""
+            badges: list[tuple[str, str]] = []
+            if source != "default":
+                b_style = (
+                    "bold $primary"
+                    if source == "env"
+                    else ("bold $warning" if source == "cli" else "dim")
+                )
+                badges.append((source.upper(), b_style))
 
-            # Build display line: summary (left-aligned) + value + source
-            summary_col = f"{opt.summary[:38]:<38}"
-            value_col = f"{val_str:<20}"
-            display = f"{summary_col} {value_col} {source_tag}".rstrip()
-            options.append(Option(display, id=opt.key))
+            row_content = format_modal_option_row(
+                label=opt.summary,
+                badges=badges if badges else None,
+                status=(val_str, "bold $secondary"),
+                width=row_w,
+            )
+            options.append(Option(row_content, id=opt.key))
 
         if not options:
             options.append(Option("No matching settings found.", id="none", disabled=True))
@@ -371,6 +398,7 @@ class ConfigManagerScreen(ModalScreen[None]):
             new_val = not cur_val
             ok, msg = self._settings.set_field(opt.settings_field, str(new_val))
             if ok:
+                self._changes_made = True
                 self.post_message(self.SettingChanged(opt.key, new_val))
                 self.app.notify(f"Set {opt.summary} = {new_val}", severity="information")
                 self._refresh_options()
@@ -389,6 +417,7 @@ class ConfigManagerScreen(ModalScreen[None]):
             cycle = {"allow": "ask", "ask": "deny", "deny": "allow"}
             new_status = cycle[current]
             store.add_rule(new_status, scope_name, source="session")
+            self._changes_made = True
             self.app.notify(f"Permission `{scope_name}` → {new_status}", severity="information")
             self._refresh_options()
 
@@ -405,6 +434,7 @@ class ConfigManagerScreen(ModalScreen[None]):
 
         ok, msg = self._settings.set_field(opt.settings_field, new_val)
         if ok:
+            self._changes_made = True
             self.post_message(self.SettingChanged(opt.key, new_val))
             self.app.notify(f"Set {opt.summary} = {new_val}", severity="information")
             self._refresh_options()
@@ -431,6 +461,7 @@ class ConfigManagerScreen(ModalScreen[None]):
 
                 def _on_theme_result(result: str | None) -> None:
                     if result:
+                        self._changes_made = True
                         self.app.theme = result
                         from opscloud.ui.theme import save_theme_preference
                         save_theme_preference(result)
@@ -455,6 +486,7 @@ class ConfigManagerScreen(ModalScreen[None]):
 
                 def _on_model_result(result: Any) -> None:
                     if result:
+                        self._changes_made = True
                         self.post_message(self.SettingChanged("models.name", result))
                         self._refresh_options()
 
@@ -485,6 +517,7 @@ class ConfigManagerScreen(ModalScreen[None]):
 
                 def _on_effort_result(result: str | None) -> None:
                     if result is not None:
+                        self._changes_made = True
                         self._settings.reasoning_effort = result
                         # Sync to app._reasoning_effort if present
                         if hasattr(self.app, "_reasoning_effort"):
@@ -516,6 +549,7 @@ class ConfigManagerScreen(ModalScreen[None]):
 
                 def _on_cloud_result(result: tuple[str, str | None] | None) -> None:
                     if result:
+                        self._changes_made = True
                         from opscloud.config.cloud_profiles import set_active_aws_profile
 
                         profile_name = result[0] if isinstance(result, tuple) else str(result)
@@ -568,6 +602,7 @@ class ConfigManagerScreen(ModalScreen[None]):
                     os.environ[opt.env_var] = raw_value
                 else:
                     os.environ.pop(opt.env_var, None)
+                self._changes_made = True
                 self.app.notify(f"Set env {opt.env_var}", severity="information")
                 self._refresh_options()
             return
@@ -575,6 +610,7 @@ class ConfigManagerScreen(ModalScreen[None]):
         # Use Settings.set_field for type-safe coercion
         ok, msg = self._settings.set_field(opt.settings_field, raw_value)
         if ok:
+            self._changes_made = True
             self.post_message(self.SettingChanged(opt.key, raw_value))
             self.app.notify(f"Set {opt.summary} = {raw_value}", severity="information")
             self._refresh_options()
@@ -611,6 +647,7 @@ class ConfigManagerScreen(ModalScreen[None]):
                         store.add_rule("ask", scope_name, source="default")
                     elif scope_name in _DEFAULT_DENY:
                         store.add_rule("deny", scope_name, source="default")
+                    self._changes_made = True
                     self.app.notify(f"Reset `{scope_name}` to default", severity="warning")
                     self._refresh_options()
                 return
@@ -619,6 +656,7 @@ class ConfigManagerScreen(ModalScreen[None]):
             if opt.settings_field:
                 ok, msg = self._settings.reset_field(opt.settings_field)
                 if ok:
+                    self._changes_made = True
                     self.app.notify(msg, severity="warning")
                     self.post_message(self.SettingChanged(opt.key, None))
                     self._refresh_options()
@@ -641,7 +679,7 @@ class ConfigManagerScreen(ModalScreen[None]):
             pass
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self.dismiss(self._changes_made)
 
     @staticmethod
     def _find_option(key: str) -> ConfigOption | None:

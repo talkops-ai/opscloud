@@ -29,6 +29,8 @@ from textual.screen import ModalScreen
 from textual.style import Style as TStyle
 from textual.widgets import Checkbox, Input, RadioButton, RadioSet, Static
 
+from opscloud.ui.widgets.modal_base import OpsModalScreen
+
 if TYPE_CHECKING:
     from textual.app import ComposeResult
     from textual.events import Click, MouseMove
@@ -121,7 +123,7 @@ class AuthResult(StrEnum):
     """User dismissed the prompt without saving."""
 
 
-class AuthPromptScreen(ModalScreen[AuthResult]):
+class AuthPromptScreen(OpsModalScreen[AuthResult]):
     """Modal that captures and persists an API key for one provider or service.
 
     Shows provider-specific acquisition instructions with a clickable link
@@ -132,33 +134,17 @@ class AuthPromptScreen(ModalScreen[AuthResult]):
 
     AUTO_FOCUS = "#auth-prompt-input"
 
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
+
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
         Binding("f2", "toggle_advanced", "Advanced", show=False, priority=True),
         Binding("enter", "save", "Save", show=False, priority=True),
     ]
 
-    CSS = """
-    AuthPromptScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    AuthPromptScreen > Vertical {
-        width: 72;
-        max-width: 90%;
-        height: auto;
-        max-height: 90vh;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     AuthPromptScreen .auth-prompt-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     AuthPromptScreen .auth-prompt-copy,
@@ -196,10 +182,7 @@ class AuthPromptScreen(ModalScreen[AuthResult]):
     }
 
     AuthPromptScreen .auth-prompt-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -223,24 +206,26 @@ class AuthPromptScreen(ModalScreen[AuthResult]):
         self._advanced_visible = False
         self._is_langsmith = is_langsmith(provider)
 
-    def compose(self) -> ComposeResult:
+    def on_mount(self) -> None:
+        super().on_mount()
         provider_label = self._get_display_name()
-        with Vertical():
-            # ── Title ──
-            yield Static(
-                Content.from_markup(
-                    "API key for [bold]$provider[/bold]",
-                    provider=provider_label,
-                ),
-                classes="auth-prompt-title",
-            )
+        self.set_modal_title(f"API Key: {provider_label}")
+        self.set_modal_subtitle([
+            ("enter", "save"),
+            ("esc", "cancel"),
+            ("f2", "advanced"),
+        ])
 
-            # ── Reason ──
-            if self._reason:
-                yield Static(
-                    Content.from_markup("$reason", reason=self._reason),
-                    classes="auth-prompt-copy",
-                )
+    def compose_modal(self) -> ComposeResult:
+        provider_label = self._get_display_name()
+        yield Static("", classes="auth-prompt-title")
+
+        # ── Reason ──
+        if self._reason:
+            yield Static(
+                Content.from_markup("$reason", reason=self._reason),
+                classes="auth-prompt-copy",
+            )
 
             # ── Instructions with clickable link ──
             yield Static(
@@ -540,12 +525,6 @@ class AuthPromptScreen(ModalScreen[AuthResult]):
 
     def on_leave(self) -> None:
         self.styles.pointer = "default"
-
-    BINDINGS = [
-        Binding("escape", "cancel", "Cancel"),
-        Binding("f2", "toggle_advanced", "Advanced"),
-        Binding("enter", "save", "Save"),
-    ]
 
     def action_save(self) -> None:
         self._perform_save()

@@ -21,7 +21,7 @@ def _read_env_str(suffix: str) -> str | None:
     return os.environ.get(f"{SERVER_ENV_PREFIX}{suffix}")
 
 
-@dataclass(frozen=True)
+@dataclass
 class ServerConfig:
     """Configuration payload passed to the LangGraph server subprocess."""
 

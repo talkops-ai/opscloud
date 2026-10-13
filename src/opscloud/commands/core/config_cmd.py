@@ -67,7 +67,12 @@ class ConfigHandler(BaseCommandHandler):
             from opscloud.ui.widgets.config_manager import ConfigManagerScreen
             settings = self._get_settings(ctx)
             screen = ConfigManagerScreen(settings=settings)
-            ctx.app.push_screen(screen)
+
+            def _on_config_closed(changed: bool | None) -> None:
+                if changed and ctx.app is not None:
+                    ctx.app._schedule_reload()
+
+            ctx.app.push_screen(screen, _on_config_closed)
             return CommandResult(success=True, message="", mount_as_app_message=False)
 
         # Inline fallback: use the manifest for a grouped, source-aware display
@@ -77,7 +82,7 @@ class ConfigHandler(BaseCommandHandler):
 
         from opscloud.config.manifest import get_config_options, resolve_scalar
 
-        lines = ["⚙️ **Current Configuration:**\n"]
+        lines = ["**Current Configuration:**\n"]
         current_group = None
         for opt in get_config_options():
             if opt.group != current_group:
@@ -100,6 +105,8 @@ class ConfigHandler(BaseCommandHandler):
         if settings is None:
             return CommandResult(success=False, message="Settings not available.")
         ok, msg = settings.set_field(key, value)
+        if ok and ctx.app is not None:
+            ctx.app._schedule_reload()
         return CommandResult(success=ok, message=msg)
 
     def _reset_config(self, ctx: CommandContext, key: str) -> CommandResult:
@@ -107,6 +114,8 @@ class ConfigHandler(BaseCommandHandler):
         if settings is None:
             return CommandResult(success=False, message="Settings not available.")
         ok, msg = settings.reset_field(key)
+        if ok and ctx.app is not None:
+            ctx.app._schedule_reload()
         return CommandResult(success=ok, message=msg)
 
     @staticmethod

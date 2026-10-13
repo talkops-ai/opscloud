@@ -11,6 +11,9 @@ from textual.containers import VerticalGroup
 from textual.screen import ModalScreen
 from textual.widgets import Checkbox, Static
 
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen
+
 if TYPE_CHECKING:
     from textual.app import ComposeResult
 
@@ -26,11 +29,13 @@ WARNING_TOGGLES: list[tuple[str, str]] = [
 ]
 
 
-class NotificationSettingsScreen(ModalScreen[None]):
+class NotificationSettingsScreen(OpsModalScreen[None]):
     """Modal dialog for managing startup warning preferences.
 
     Toggling a checkbox enables or suppresses startup warning notices.
     """
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Close", show=False),
@@ -40,40 +45,19 @@ class NotificationSettingsScreen(ModalScreen[None]):
         Binding("shift+tab", "app.focus_previous", "Previous", show=False, priority=True),
     ]
 
-    CSS = """
-    NotificationSettingsScreen {
-        align: center middle;
-        background: $background 60%;
-    }
-
-    NotificationSettingsScreen > VerticalGroup {
-        width: 65;
-        max-width: 90%;
-        height: auto;
-        max-height: 80%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     NotificationSettingsScreen .ns-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     NotificationSettingsScreen .ns-help {
-        height: 1;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
 
     NotificationSettingsScreen Checkbox {
         margin: 0;
         border: none;
+        height: auto;
     }
     """
 
@@ -81,16 +65,29 @@ class NotificationSettingsScreen(ModalScreen[None]):
         super().__init__()
         self._suppressed: set[str] = suppressed or set()
 
-    def compose(self) -> ComposeResult:
-        with VerticalGroup():
-            yield Static("Notification Settings", classes="ns-title")
-            for key, label in WARNING_TOGGLES:
-                yield Checkbox(
-                    label,
-                    value=key not in self._suppressed,
-                    id=f"ns-{key}",
-                )
-            yield Static("↑/↓ or Tab navigate • Space toggle • Esc close", classes="ns-help")
+    def compose_modal(self):
+        yield Static("Notification Settings", classes="ns-title")
+        for key, label in WARNING_TOGGLES:
+            yield Checkbox(
+                label,
+                value=key not in self._suppressed,
+                id=f"ns-{key}",
+            )
+        yield Static("↑/↓ or Tab navigate • Space toggle • Esc close", classes="ns-help")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        glyphs = get_glyphs()
+        self.set_modal_title("Notification Settings", counter=f"{len(WARNING_TOGGLES)} rules")
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("space", "toggle"),
+            ("esc", "close"),
+        ])
+        try:
+            self.query(Checkbox).first().focus()
+        except Exception:
+            pass
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         event.stop()

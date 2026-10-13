@@ -213,6 +213,12 @@ class SubagentTelemetryMiddleware(AgentMiddleware[Any, Any, Any]):
         except Exception:
             pass
 
+    def before_agent(self, state: Any, runtime: Any) -> None:
+        self._emit_progress("Thinking...", tool_name=None, runtime=runtime)
+
+    async def abefore_agent(self, state: Any, runtime: Any) -> None:
+        await self._aemit_progress("Thinking...", tool_name=None, runtime=runtime)
+
     def wrap_tool_call(
         self,
         request: ToolCallRequest,

@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,7 +15,7 @@ from opscloud.config.cloud_profiles import (
     list_aws_profiles,
     set_active_aws_profile,
 )
-from opscloud.config.settings import Settings
+from opscloud.config.settings import Settings, get_glyphs
 from opscloud.config.toml_config import (
     clear_aws_profile,
     load_aws_profile,
@@ -80,10 +81,12 @@ def test_recent_aws_profiles(tmp_path: Path, monkeypatch):
 
 def test_list_aws_profiles_mock_cli():
     """Test profile listing via aws configure list-profiles mock."""
+    from opscloud.config.cloud_profiles import invalidate_aws_profile_cache
+    invalidate_aws_profile_cache()
     mock_res = MagicMock(return_code=0, stdout="default\nprod\nstaging\n")
     mock_res.returncode = 0
     with patch("subprocess.run", return_value=mock_res):
-        profiles = list_aws_profiles()
+        profiles = list_aws_profiles(force_refresh=True)
         names = [p.name for p in profiles]
         assert "default" in names
         assert "prod" in names
@@ -164,6 +167,7 @@ async def test_cloud_handler_direct_switch(monkeypatch, tmp_path: Path):
 
     result = await handler.execute(ctx)
     assert result.success is True
+    assert result.message is not None
     assert "test-account" in result.message
     assert os.environ.get("AWS_PROFILE") == "test-account"
     assert settings.aws_profile == "test-account"
@@ -176,6 +180,7 @@ async def test_cloud_handler_list_subcommand():
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Configured AWS Profiles" in result.message
 
 
@@ -186,6 +191,7 @@ async def test_cloud_handler_status_subcommand():
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Current Cloud Context" in result.message
     assert "AWS" in result.message
 
@@ -408,25 +414,62 @@ async def test_status_bar_cloud_display():
     assert bar.cloud_region == ""
 
 
-def test_welcome_banner_no_cloud_column():
+def test_welcome_banner_environment_and_capabilities():
     from opscloud.ui.widgets.welcome import WelcomeBanner
 
-    banner = WelcomeBanner()
+    banner = WelcomeBanner(model_spec="anthropic:claude-opus", effort="high")
     banner._skills_data = [("aws-core", "Core AWS")]
     banner._subagents_data = []
 
-    right_text = banner._build_right_panel()
-    plain = right_text.plain
+    plain = banner._build_right_panel().plain
 
-    # Verify Cloud section is NOT displayed in banner (shown on status bar instead)
-    assert "Cloud" not in plain
-    assert "aws:" not in plain
-    assert "Skills" in plain
-    assert "Agents" in plain
+    assert "Environment" in plain
+    assert "Capabilities" in plain
+    assert "claude-opus" in plain
+    assert "skills" in plain
+    assert "agents" in plain
+    assert "aws-core" in plain
+    # No cloud profile yet: prompts the user to select one.
+    assert "no profile" in plain
 
-    # update_cloud is a safe no-op
+    # update_cloud reflects the active profile and region.
     banner.update_cloud("prod-account", "us-east-1")
-    assert "Cloud" not in banner._build_right_panel().plain
+    plain = banner._build_right_panel().plain
+    assert "prod-account" in plain
+    assert "us-east-1" in plain
+    assert "no profile" not in plain
+
+
+def test_welcome_banner_mcp_states():
+    from opscloud.mcp.mcp_info import MCPServerInfo, MCPToolInfo
+    from opscloud.ui.widgets.welcome import WelcomeBanner
+
+    banner = WelcomeBanner()
+    assert "discovering" in banner._build_right_panel().plain
+
+    banner.update_mcp([])
+    assert "none configured" in banner._build_right_panel().plain
+
+    banner.update_mcp(
+        [
+            MCPServerInfo(name="aws", tools=(MCPToolInfo("a"), MCPToolInfo("b"))),
+            MCPServerInfo(name="gh", status="unauthenticated"),
+        ]
+    )
+    plain = banner._build_right_panel().plain
+    assert "2 tools" in plain
+    assert "1 need attention" in plain
+
+
+def test_welcome_banner_long_skill_list_never_wraps():
+    from opscloud.ui.widgets.welcome import WelcomeBanner
+
+    banner = WelcomeBanner()
+    banner._skills_data = [(f"aws-compute-skill-number-{i}", "") for i in range(16)]
+    text = banner._build_right_panel(width=56)
+    for line in text.plain.splitlines():
+        assert len(line) <= 56
+    assert "more" in text.plain
 
 
 @pytest.mark.asyncio
@@ -438,6 +481,7 @@ async def test_cloud_handler_headless_no_args():
 
     assert result.success is True
     assert result.push_screen is None
+    assert result.message is not None
     assert "Current Cloud Context" in result.message
     assert "Active Profile:" in result.message
 
@@ -461,6 +505,7 @@ async def test_cloud_handler_default_setting(monkeypatch, tmp_path: Path):
 
     result = await handler.execute(ctx)
     assert result.success is True
+    assert result.message is not None
     assert "Default AWS profile set to `prod-corp`" in result.message
     assert settings.aws_profile == "prod-corp"
     assert load_aws_profile(test_config) == "prod-corp"
@@ -505,9 +550,9 @@ def test_cloud_selector_unconfigured_profile_notification():
     screen._filter_text = "non-existent-prof"
 
     notified: list[str] = []
-    screen.notify = lambda msg, **kwargs: notified.append(msg)
+    setattr(screen, "notify", lambda msg, **kwargs: notified.append(msg))
     dismissed: list[tuple[str, str | None] | None] = []
-    screen.dismiss = lambda res: dismissed.append(res)
+    setattr(screen, "dismiss", lambda res: dismissed.append(res))
 
     screen.action_select()
     assert len(notified) == 1
@@ -532,25 +577,25 @@ def test_status_bar_narrow_cloud_rendering():
         rendered: list[Any] = []
         display = MagicMock()
         display.update = lambda t: rendered.append(t)
-        bar.query_one = lambda sel, *args: display if sel == "#cloud-display" else MagicMock()
+        setattr(bar, "query_one", lambda sel, *args: display if sel == "#cloud-display" else MagicMock())
 
         bar.set_cloud(profile="my-extremely-long-production-profile", region="us-east-1")
         bar._render_cloud()
 
         assert len(rendered) >= 1
         text_content = rendered[-1]
-        assert "aws:" in text_content.plain
+        assert "aws " in text_content.plain
         assert "my-extremely-long-production-profile" in text_content.plain
-        assert "(us-east-1)" in text_content.plain
+        assert "us-east-1" in text_content.plain
 
         # Narrow terminal: < 90
         mock_app.size.width = 75
         bar._render_cloud()
         narrow_content = rendered[-1]
-        assert "aws:" in narrow_content.plain
-        assert "…" in narrow_content.plain
+        assert "aws " in narrow_content.plain
+        assert get_glyphs().ellipsis in narrow_content.plain
         # Region must be hidden in narrow mode
-        assert "(us-east-1)" not in narrow_content.plain
+        assert "us-east-1" not in narrow_content.plain
     finally:
         textual._context.active_app.reset(token)
 

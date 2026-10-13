@@ -5,15 +5,18 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from textual.binding import Binding, BindingType
-from textual.containers import Vertical
 from textual.css.query import NoMatches
-from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen, format_modal_option_row
 
-class EffortSelectorScreen(ModalScreen[str | None]):
+
+class EffortSelectorScreen(OpsModalScreen[str | None]):
     """Modal dialog for selecting a reasoning effort level."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False),
@@ -21,49 +24,37 @@ class EffortSelectorScreen(ModalScreen[str | None]):
         Binding("shift+tab", "cursor_up", "Previous", show=False, priority=True),
     ]
 
+    _EFFORT_DESCRIPTIONS: ClassVar[dict[str, str]] = {
+        "low": "Fast responses, minimal thinking tokens",
+        "medium": "Balanced reasoning depth and speed",
+        "high": "Maximum thinking budget and depth",
+        "off": "Disable explicit reasoning effort",
+    }
+
     DEFAULT_CSS = """
-    EffortSelectorScreen {
-        align: center middle;
-        background: transparent;
-    }
-
-    EffortSelectorScreen > Vertical {
-        width: 54;
-        max-width: 90%;
-        height: auto;
-        max-height: 80%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
     EffortSelectorScreen .effort-selector-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     EffortSelectorScreen .effort-selector-subtitle {
-        height: auto;
-        color: $text-muted;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     EffortSelectorScreen OptionList {
         height: auto;
-        max-height: 10;
+        max-height: 14;
         background: $background;
-        border: solid $accent;
+        border: solid $primary 20%;
+    }
+
+    EffortSelectorScreen OptionList > .option-list--option-highlighted {
+        background: $primary 18%;
+        color: $text;
+        text-style: bold;
     }
 
     EffortSelectorScreen .effort-selector-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -81,26 +72,7 @@ class EffortSelectorScreen(ModalScreen[str | None]):
         self._current_effort = current_effort
         self._default_effort = default_effort or "high"
         self._dismissed: bool = False
-
-    def compose(self):
-        options = [
-            Option(self._format_label(effort), id=effort) for effort in self._efforts
-        ]
-        highlighted_effort = self._current_effort or self._default_effort
-        try:
-            highlighted = self._efforts.index(highlighted_effort)
-        except ValueError:
-            highlighted = 0
-
-        help_text = "↑/↓ or Tab switch  •  Enter select  •  Esc cancel"
-
-        with Vertical():
-            yield Static("Select Reasoning Effort", classes="effort-selector-title")
-            yield Static(self._model_spec, classes="effort-selector-subtitle")
-            option_list = OptionList(*options, id="effort-options")
-            option_list.highlighted = highlighted
-            yield option_list
-            yield Static(help_text, classes="effort-selector-help")
+        self._last_row_width: int | None = None
 
     def _format_label(self, effort: str) -> str:
         markers = []
@@ -112,6 +84,76 @@ class EffortSelectorScreen(ModalScreen[str | None]):
             suffix = ", ".join(markers)
             return f"{effort} ({suffix})"
         return effort
+
+    def _build_options(self, width: int | None = None) -> list[Option]:
+        options: list[Option] = []
+        w = width if width is not None else self._option_content_width("#effort-options", fallback=50)
+        for effort in self._efforts:
+            badges: list[tuple[str, str]] = []
+            if effort == self._current_effort:
+                badges.append(("ACTIVE", "bold $success"))
+            if effort == self._default_effort:
+                badges.append(("DEFAULT", "bold $primary"))
+
+            desc = self._EFFORT_DESCRIPTIONS.get(
+                effort.lower(), f"{effort.capitalize()} reasoning effort"
+            )
+            content = format_modal_option_row(
+                label=effort.upper(),
+                description=desc,
+                badges=badges if badges else None,
+                width=w,
+            )
+            options.append(Option(content, id=effort))
+        return options
+
+    def compose_modal(self):
+        highlighted_effort = self._current_effort or self._default_effort
+        try:
+            highlighted = self._efforts.index(highlighted_effort)
+        except ValueError:
+            highlighted = 0
+
+        yield Static("Select Reasoning Effort", classes="effort-selector-title")
+        yield Static(self._model_spec, classes="effort-selector-subtitle")
+        option_list = OptionList(*self._build_options(), id="effort-options")
+        option_list.highlighted = highlighted
+        yield option_list
+        help_text = "↑/↓ or Tab switch  •  Enter select  •  Esc cancel"
+        yield Static(help_text, classes="effort-selector-help")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        glyphs = get_glyphs()
+        self.set_modal_title("Reasoning Effort", counter=self._model_spec)
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("enter", "select"),
+            ("esc", "cancel"),
+        ])
+        try:
+            self.query_one("#effort-options", OptionList).focus()
+        except NoMatches:
+            pass
+        self.call_after_refresh(self._reformat_options)
+
+    def on_resize(self) -> None:
+        width = self._option_content_width("#effort-options", fallback=50)
+        if width != self._last_row_width:
+            self._last_row_width = width
+            self.call_after_refresh(self._reformat_options)
+
+    def _reformat_options(self) -> None:
+        try:
+            ol = self.query_one("#effort-options", OptionList)
+        except NoMatches:
+            return
+        highlighted = ol.highlighted if ol.highlighted is not None else 0
+        w = self._option_content_width("#effort-options", fallback=50)
+        ol.clear_options()
+        ol.add_options(self._build_options(width=w))
+        if 0 <= highlighted < len(self._efforts):
+            ol.highlighted = highlighted
 
     def dismiss(self, result: str | None = None) -> Any:
         """Safely dismiss the modal screen with idempotency protection."""

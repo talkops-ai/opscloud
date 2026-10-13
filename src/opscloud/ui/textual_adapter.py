@@ -40,9 +40,11 @@ logger = get_logger(__name__)
 @dataclass
 class _TurnStreamState:
     thinking_start_t: float | None = None
+    thinking_start_by_ns: dict[str, float] = field(default_factory=dict)
     turn_context_tokens: int = 0
     start_session_tokens: int = 0
     received_session_tokens: bool = False
+    default_spinner: str = "Thinking"
     assistant_message_by_namespace: dict[tuple[str, ...], Any] = field(default_factory=dict)
     pending_text_by_namespace: dict[tuple[str, ...], str] = field(default_factory=dict)
     tool_call_buffers: dict[ToolCallBufferKey, ToolCallBuffer] = field(default_factory=dict)
@@ -71,6 +73,9 @@ def _is_renderable_subagent_event(data: Any, *, is_main_agent: bool) -> bool:
 _WORKFLOW_NAMESPACE_PREFIX = "WorkflowMiddleware."
 """Mirrors ``opscloud.middleware.workflow.WORKFLOW_NODE_PREFIX``."""
 
+_AGENT_SESSION_NAMESPACE_PREFIX = "AgentSessionMiddleware."
+"""Mirrors ``opscloud.middleware.agent_session.AGENT_SESSION_NODE_PREFIX``."""
+
 
 def _is_workflow_namespace(ns_key: tuple[str, ...]) -> bool:
     """Whether ``ns_key`` is the isolated workflow agent graph.
@@ -79,6 +84,25 @@ def _is_workflow_namespace(ns_key: tuple[str, ...]) -> bool:
     deeper graphs stay non-primary.
     """
     return len(ns_key) == 1 and ns_key[0].startswith(_WORKFLOW_NAMESPACE_PREFIX)
+
+
+def _is_agent_session_namespace(ns_key: tuple[str, ...]) -> bool:
+    """Whether ``ns_key`` is the activated plugin agent session graph.
+
+    Only the direct child of ``AgentSessionMiddleware.before_agent`` qualifies;
+    deeper graphs stay non-primary.
+    """
+    return len(ns_key) == 1 and ns_key[0].startswith(_AGENT_SESSION_NAMESPACE_PREFIX)
+
+
+def _is_panel_visible(panel: Any) -> bool:
+    """Whether the subagent panel is attached and visibly rendered with active content."""
+    if panel is None or not getattr(panel, "is_attached", False):
+        return False
+    try:
+        return bool(panel.has_class("-visible"))
+    except Exception:
+        return False
 
 
 def _is_auto_mode_classifier_chunk(metadata: dict[str, Any] | None) -> bool:
@@ -402,7 +426,10 @@ class TextualAdapter:
         self._messages: MessageList | None = messages_widget
         self._status_bar: StatusBar | None = status_bar
         self._auto_approve = auto_approve
-        self._set_spinner = set_spinner
+        self._raw_set_spinner = set_spinner
+        self._current_spinner_text: Any = None
+        self._pending_spinner_text: Any = None
+        self._spinner_flush_task: asyncio.Task[None] | None = None
         self._on_subagent_event = on_subagent_event
         self._app = app
         self._prompt_manager = prompt_manager
@@ -415,6 +442,63 @@ class TextualAdapter:
         self._approval_events: dict[str, asyncio.Event] = {}
         self._approval_responses: dict[str, bool] = {}
         self._turn_number = 0
+        self.last_turn_ok: bool = False
+        """True when the most recent ``stream_turn`` completed without error or cancel."""
+        self._maintenance_tasks: set[asyncio.Task[None]] = set()
+
+    async def _set_spinner(self, text: Any) -> None:
+        """Coalesce and deduplicate spinner mutations (DV-07)."""
+        if not self._raw_set_spinner:
+            return
+        if not text:
+            if self._spinner_flush_task and not self._spinner_flush_task.done():
+                self._spinner_flush_task.cancel()
+            self._pending_spinner_text = None
+            if self._current_spinner_text is not None:
+                self._current_spinner_text = None
+                try:
+                    await self._raw_set_spinner(None)
+                except Exception:
+                    pass
+            return
+
+        if text == self._current_spinner_text or text == self._pending_spinner_text:
+            return
+
+        self._pending_spinner_text = text
+        if self._spinner_flush_task is None or self._spinner_flush_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+                self._spinner_flush_task = loop.create_task(self._flush_spinner_coalesced())
+            except RuntimeError:
+                pass
+
+    async def _flush_spinner_coalesced(self) -> None:
+        """Flush the latest pending spinner status at bounded rate (DV-07)."""
+        await asyncio.sleep(0.02)
+        target = self._pending_spinner_text
+        self._pending_spinner_text = None
+        if target is not None and target != self._current_spinner_text and self._raw_set_spinner:
+            self._current_spinner_text = target
+            try:
+                await self._raw_set_spinner(target)
+            except Exception:
+                pass
+
+    async def drain_maintenance(self, timeout: float = 3.0) -> None:
+        """Wait for in-flight maintenance tasks, cancelling if timed out to guarantee zero overlap with new turns (DV-02)."""
+        pending = [t for t in list(self._maintenance_tasks) if not t.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning("Maintenance task timed out after %.1fs; cancelling to guarantee no race with new turn", timeout)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            self._maintenance_tasks.difference_update({t for t in pending if t.done()})
 
     @property
     def _effective_request_approval(self) -> Callable[..., Any] | None:
@@ -586,6 +670,7 @@ class TextualAdapter:
         if turn_id is not None:
             enriched_context["turn_id"] = turn_id
         enriched_context["approval_mode"] = selected_mode.value
+        enriched_context["smart"] = (selected_mode == ApprovalMode.SMART)
         enriched_context["auto_approve"] = auto_approve_active
         if live_key is not None:
             enriched_context["approval_mode_key"] = live_key
@@ -634,9 +719,9 @@ class TextualAdapter:
             panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
             if panel is not None:
                 panel.set_subagent_activity(sub_str, action)
-            has_attached_panel = panel is not None and getattr(panel, "is_attached", False)
+            panel_showing = _is_panel_visible(panel)
             if self._set_spinner:
-                if has_attached_panel:
+                if panel_showing:
                     try:
                         import asyncio
                         loop = asyncio.get_running_loop()
@@ -644,16 +729,30 @@ class TextualAdapter:
                     except RuntimeError:
                         pass
                 else:
-                    display_name = f"Subagent [{sub_str}]" if sub_str else "Subagent"
+                    clean_name = (sub_str or "Agent").rsplit(":", 1)[-1].split("@", 1)[0]
+                    if is_main_agent:
+                        display_text = f"Thinking ({clean_name})" if action in ("Thinking...", "Thinking") else f"{clean_name}: {action}"
+                    else:
+                        display_text = f"Subagent [{clean_name}]: {action}"
                     try:
                         import asyncio
                         loop = asyncio.get_running_loop()
-                        loop.create_task(self._set_spinner(f"{display_name}: {action}"))
+                        loop.create_task(self._set_spinner(display_text))
                     except RuntimeError:
                         pass
             return
 
         if isinstance(data, dict) and data.get("type") == "model_routed":
+            from opscloud.approval_mode import ApprovalMode
+
+            app_mode = getattr(self._app, "_approval_mode", None)
+            if (
+                app_mode is not None
+                and app_mode is not ApprovalMode.SMART
+                and getattr(app_mode, "value", str(app_mode)).lower() != "smart"
+            ):
+                return
+
             provider = str(data.get("provider") or "")
             model_name = str(data.get("model") or "")
             effort = str(data.get("effort") or "")
@@ -661,7 +760,8 @@ class TextualAdapter:
             if is_sub:
                 panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
                 if panel is not None:
-                    panel.set_subagent_model(None, model_name)
+                    sub_id = data.get("subagent_id") or data.get("id") or None
+                    panel.set_subagent_model(sub_id, model_name)
             else:
                 if self._status_bar is not None and model_name:
                     self._status_bar.set_model(
@@ -670,6 +770,10 @@ class TextualAdapter:
                         effort=effort,
                     )
                 if self._app is not None and model_name:
+                    if not getattr(self._app, "_smart_routed_active", False):
+                        if getattr(self._app, "_model", None):
+                            self._app._manual_model = self._app._model
+                    self._app._smart_routed_active = True
                     self._app._model = f"{provider}:{model_name}" if provider else model_name
                     if effort:
                         self._app._reasoning_effort = effort
@@ -849,22 +953,23 @@ class TextualAdapter:
                 else self._active_tools_map.get(call_id, "tool")
             )
             content = str(getattr(msg_obj, "content", ""))
+            sub_id = ns_key[0].split("tools:", 1)[-1] if (ns_key and "tools:" in ns_key[0]) else (ns_key[0] if ns_key else None)
             if self._messages is not None and is_main_agent:
                 self._messages.update_tool_result(call_id=call_id, result=content, name=tool_name)
 
             if not is_main_agent:
                 panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
                 if panel is not None:
-                    panel.set_subagent_activity(None, "Thinking")
-                has_panel = panel is not None and getattr(panel, "is_attached", False)
-                if self._set_spinner and not has_panel:
+                    panel.set_subagent_activity(sub_id, "Thinking")
+                panel_showing = _is_panel_visible(panel)
+                if self._set_spinner and not panel_showing:
                     try:
                         await self._set_spinner("Subagent: Thinking")
                     except Exception:
                         pass
             elif self._set_spinner:
                 try:
-                    await self._set_spinner("Thinking")
+                    await self._set_spinner(stream_state.default_spinner)
                 except Exception:
                     pass
 
@@ -892,24 +997,28 @@ class TextualAdapter:
                     pass
 
             if thinking:
-                if stream_state.thinking_start_t is None:
-                    stream_state.thinking_start_t = time.time()
-                thinking_dur = time.time() - stream_state.thinking_start_t
+                ns_id = ns_key[0] if ns_key else "main"
+                just_started = False
+                if ns_id not in stream_state.thinking_start_by_ns:
+                    stream_state.thinking_start_by_ns[ns_id] = time.time()
+                    just_started = True
+                thinking_dur = time.time() - stream_state.thinking_start_by_ns[ns_id]
                 if self._messages is not None and is_main_agent:
                     self._messages.append_thinking_token(thinking, duration_seconds=thinking_dur)
                 if not is_main_agent:
                     panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
-                    if panel is not None:
-                        panel.set_subagent_activity(None, "Thinking")
-                    has_panel = panel is not None and getattr(panel, "is_attached", False)
-                    if self._set_spinner and not has_panel:
+                    if panel is not None and just_started:
+                        sub_id = ns_key[0].split("tools:", 1)[-1] if (ns_key and "tools:" in ns_key[0]) else (ns_key[0] if ns_key else None)
+                        panel.set_subagent_activity(sub_id, "Thinking")
+                    panel_showing = _is_panel_visible(panel)
+                    if self._set_spinner and not panel_showing:
                         try:
                             await self._set_spinner("Subagent: Thinking")
                         except Exception:
                             pass
                 elif self._set_spinner:
                     try:
-                        await self._set_spinner("Thinking")
+                        await self._set_spinner(stream_state.default_spinner)
                     except Exception:
                         pass
 
@@ -970,9 +1079,10 @@ class TextualAdapter:
                     if not is_main_agent:
                         panel = getattr(self._app, "_get_subagent_panel", lambda: None)() if self._app else None
                         if panel is not None:
-                            panel.set_subagent_activity(None, buffer_name)
-                        has_panel = panel is not None and getattr(panel, "is_attached", False)
-                        if self._set_spinner and not has_panel:
+                            sub_id = ns_key[0].split("tools:", 1)[-1] if (ns_key and "tools:" in ns_key[0]) else (ns_key[0] if ns_key else None)
+                            panel.set_subagent_activity(sub_id, buffer_name)
+                        panel_showing = _is_panel_visible(panel)
+                        if self._set_spinner and not panel_showing:
                             try:
                                 await self._set_spinner(f"Subagent: {buffer_name}")
                             except Exception:
@@ -980,7 +1090,7 @@ class TextualAdapter:
                     else:
                         if self._set_spinner:
                             try:
-                                await self._set_spinner("Thinking")
+                                await self._set_spinner("Running tools")
                             except Exception:
                                 pass
 
@@ -1146,6 +1256,7 @@ class TextualAdapter:
     ) -> None:
         """Update session stats and post StreamFinished message."""
         self._stats.request_count += 1
+        self.last_turn_ok = not self._cancel_event.is_set()
         if stream_state and not stream_state.received_session_tokens and self._app and turn_context_tokens > 0:
             new_cumulative = stream_state.start_session_tokens + turn_context_tokens
             setattr(self._app, "_cumulative_session_tokens", new_cumulative)
@@ -1159,6 +1270,24 @@ class TextualAdapter:
         if self._app:
             self._app.post_message(self.StreamFinished(self._stats))
 
+        # Safely trigger background pruning only on confirmed turn success (not on cancel or error)
+        tid = getattr(self, "_current_thread_id", None) or (getattr(self._app, "_agent_thread_id", None) if self._app else None)
+        if tid and tid != "local_session" and self.last_turn_ok and not self._cancel_event.is_set():
+            async def _safe_prune(target_tid: str) -> None:
+                try:
+                    from opscloud.state.session import SessionManager
+                    await SessionManager.prune_thread(target_tid)
+                except Exception:
+                    logger.debug("Failed to prune thread %s", target_tid, exc_info=True)
+
+            try:
+                loop = asyncio.get_running_loop()
+                t = loop.create_task(_safe_prune(tid), name=f"prune-{tid}")
+                self._maintenance_tasks.add(t)
+                t.add_done_callback(self._maintenance_tasks.discard)
+            except RuntimeError:
+                pass
+
     def _finalize_turn_error(self, error: Exception) -> None:
         """Handle turn exception: finish assistant message, mount error, and post StreamError."""
         logger.exception("TUI: stream_turn Exception: %s", error)
@@ -1170,7 +1299,9 @@ class TextualAdapter:
         if self._app:
             self._app.post_message(self.StreamError(str(error)))
 
-    async def _finalize_turn_cleanup(self, start_t: float, turn_context_tokens: int) -> None:
+    async def _finalize_turn_cleanup(
+        self, start_t: float, turn_context_tokens: int, thread_id: str | None = None
+    ) -> None:
         """Final cleanup logic executed in the finally block."""
         self._stats.wall_time_seconds += time.time() - start_t
         # Dismiss the spinner and clear the status bar on turn end.
@@ -1184,6 +1315,7 @@ class TextualAdapter:
                 self._status_bar.set_status("Interrupted")
             else:
                 self._status_bar.set_status("")
+
         logger.debug("TUI: stream_turn finally complete")
 
     # ── Public Stream API ─────────────────────────────────
@@ -1199,17 +1331,29 @@ class TextualAdapter:
         """Run one agent turn, routing stream events to Textual widgets."""
         from langgraph.types import Command
 
+        # Ensure any in-flight background maintenance task completes before starting new turn
+        await self.drain_maintenance(timeout=2.0)
+
         # 1. Prepare input and configuration
         input_msg, turn_id = self._prepare_stream_input(prompt, graph_input)
         config, enriched_context = await self._prepare_stream_config(thread_id, turn_id, context)
 
         start_t = time.time()
         self._cancel_event.clear()
+        self.last_turn_ok = False
         self._stats.input_tokens += max(1, len(prompt) // 4)
         if self._status_bar is not None:
             self._status_bar.show_pending_tokens()
 
         stream_state = _TurnStreamState()
+        agent_req = graph_input.get("agent_session_request") if isinstance(graph_input, dict) else None
+        if isinstance(agent_req, dict) and agent_req.get("agent_name"):
+            raw_name = str(agent_req["agent_name"])
+            short_name = raw_name.rsplit(":", 1)[-1].split("@", 1)[0]
+            stream_state.default_spinner = f"Thinking ({short_name})"
+        else:
+            stream_state.default_spinner = "Thinking"
+
         stream_state.start_session_tokens = (
             getattr(self._app, "_cumulative_session_tokens", 0) if self._app else 0
         )
@@ -1221,7 +1365,7 @@ class TextualAdapter:
                 pending_interrupts: dict[str, Any] = {}
 
                 if self._set_spinner and not getattr(self, "_current_tool_messages", {}):
-                    await self._set_spinner("Thinking")
+                    await self._set_spinner(stream_state.default_spinner)
 
                 async for chunk in self._client.astream(
                     stream_input,
@@ -1239,9 +1383,13 @@ class TextualAdapter:
 
                     namespace, current_stream_mode, data = chunk
                     ns_key = tuple(namespace) if namespace else ()
-                    # The isolated /workflow agent runs one level down inside
-                    # WorkflowMiddleware; render it as primary.
-                    is_main_agent = ns_key == () or _is_workflow_namespace(ns_key)
+                    # The isolated /workflow and /agent session run one level down inside
+                    # their respective middleware; render them as primary.
+                    is_main_agent = (
+                        ns_key == ()
+                        or _is_workflow_namespace(ns_key)
+                        or _is_agent_session_namespace(ns_key)
+                    )
 
                     if current_stream_mode == "custom":
                         self._handle_custom_stream_event(data, is_main_agent, stream_state=stream_state)
@@ -1300,20 +1448,28 @@ class TextualAdapter:
             self._finalize_turn_error(e)
             raise
         finally:
+            active_tid = self._current_thread_id
             self._current_thread_id = None
-            await self._finalize_turn_cleanup(start_t, stream_state.turn_context_tokens)
+            await self._finalize_turn_cleanup(start_t, stream_state.turn_context_tokens, thread_id=active_tid)
 
 
     def cancel(self, thread_id: str | None = None) -> None:
-        """Cancel the current streaming turn and notify the server."""
+        """Cancel the current streaming turn, prune tasks, and notify the server (DV-02/DV-09)."""
         self._cancel_event.set()
+        for t in list(self._maintenance_tasks):
+            if not t.done():
+                t.cancel()
+        if self._spinner_flush_task and not self._spinner_flush_task.done():
+            self._spinner_flush_task.cancel()
         tid = thread_id or getattr(self, "_current_thread_id", None)
         if self._client and hasattr(self._client, "acancel_active_runs") and tid:
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(
+                cancel_task = loop.create_task(
                     self._client.acancel_active_runs({"configurable": {"thread_id": tid}})
                 )
+                self._maintenance_tasks.add(cancel_task)
+                cancel_task.add_done_callback(self._maintenance_tasks.discard)
             except RuntimeError:
                 pass
 

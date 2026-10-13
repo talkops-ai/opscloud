@@ -12,12 +12,16 @@ import json
 import re
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from rich.markup import escape
 from textual import events
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen
 from opscloud.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -115,34 +119,23 @@ def _format_prop_type(prop_type: Any) -> str:
 # ── Tool Detail Screen (Full Modal on Enter) ─────────────
 
 
-class MCPToolDetailScreen(ModalScreen[None]):
+class MCPToolDetailScreen(OpsModalScreen[None]):
     """Full-screen modal showing comprehensive MCP tool schema and documentation."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "close_dialog", "Close", show=False, priority=True),
         Binding("q", "close_dialog", "Close", show=False),
     ]
 
-    CSS = """
-    MCPToolDetailScreen {
-        align: center middle;
-        background: $background 70%;
-    }
-
-    MCPToolDetailScreen > Vertical {
-        width: 96;
-        max-width: 98%;
-        height: 90%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     MCPToolDetailScreen .mcp-tool-detail-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
+    }
+
+    MCPToolDetailScreen .mcp-tool-detail-help {
+        display: none;
     }
 
     MCPToolDetailScreen .mcp-tool-detail-body {
@@ -161,14 +154,6 @@ class MCPToolDetailScreen(ModalScreen[None]):
     MCPToolDetailScreen .detail-value {
         margin-bottom: 0;
     }
-
-    MCPToolDetailScreen .mcp-tool-detail-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
-    }
     """
 
     def __init__(self, tool_info: MCPToolInfo, server_name: str = "") -> None:
@@ -177,42 +162,45 @@ class MCPToolDetailScreen(ModalScreen[None]):
         self.display_name = clean_tool_name(tool_info.name, tool_info.original_name)
         super().__init__()
 
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Static(f"MCP Tool: {self.display_name}", classes="mcp-tool-detail-title")
-            with VerticalScroll(classes="mcp-tool-detail-body"):
-                yield Vertical(id="mcp-tool-detail-content")
-            yield Static("Esc or 'q' to close", classes="mcp-tool-detail-help")
+    def compose_modal(self) -> ComposeResult:
+        yield Static(f"MCP Tool: {self.display_name}", classes="mcp-tool-detail-title")
+        with VerticalScroll(classes="mcp-tool-detail-body"):
+            yield Vertical(id="mcp-tool-detail-content")
+        yield Static("Esc or 'q' to close", classes="mcp-tool-detail-help")
 
     def on_mount(self) -> None:
+        super().on_mount()
+        self.set_modal_title("MCP Tool", counter=self.display_name)
+        self.set_modal_subtitle([("esc", "close")])
         content = self.query_one("#mcp-tool-detail-content", Vertical)
-        content.mount(Static("[bold]Tool Name[/bold]", classes="detail-label"))
-        content.mount(Static(f"[bold cyan]{self.display_name}[/bold cyan]", classes="detail-value"))
+        content.mount(Static("Tool Name", classes="detail-label"))
+        content.mount(Static(Content.styled(self.display_name, "bold $secondary"), classes="detail-value"))
 
         if self.server_name:
             srv_disp, srv_scope = clean_server_name(self.server_name)
-            scope_txt = f" [cyan][{srv_scope}][/cyan]" if srv_scope else ""
-            content.mount(Static("[bold]Server[/bold]", classes="detail-label"))
-            content.mount(Static(f"{srv_disp}{scope_txt} [dim]({self.server_name})[/dim]", classes="detail-value"))
+            pieces: list[Any] = [(srv_disp, "bold $foreground")]
+            if srv_scope:
+                pieces.append((f" [{srv_scope}]", "$secondary"))
+            pieces.append((f" ({self.server_name})", "dim"))
+            content.mount(Static("Server", classes="detail-label"))
+            content.mount(Static(Content.assemble(*pieces), classes="detail-value"))
 
-        content.mount(Static("[bold]Full Identifier[/bold]", classes="detail-label"))
-        content.mount(Static(f"[dim]{self.tool_info.name}[/dim]", classes="detail-value"))
+        content.mount(Static("Full Identifier", classes="detail-label"))
+        content.mount(Static(Content.styled(self.tool_info.name, "dim"), classes="detail-value"))
 
-        content.mount(Static("[bold]Description[/bold]", classes="detail-label"))
-        content.mount(
-            Static(
-                self.tool_info.description or "[dim]No description provided.[/dim]",
-                classes="detail-value",
-            )
-        )
+        content.mount(Static("Description", classes="detail-label"))
+        if self.tool_info.description:
+            content.mount(Static(Content(self.tool_info.description), classes="detail-value"))
+        else:
+            content.mount(Static(Content.styled("No description provided.", "dim"), classes="detail-value"))
 
         schema = self.tool_info.input_schema
-        content.mount(Static("[bold]Input Schema (JSON Schema)[/bold]", classes="detail-label"))
+        content.mount(Static("Input Schema (JSON Schema)", classes="detail-label"))
         if schema:
             schema_json = json.dumps(schema, indent=2)
-            content.mount(Static(schema_json, classes="detail-value"))
+            content.mount(Static(Content(schema_json), classes="detail-value"))
         else:
-            content.mount(Static("[dim]No input parameters specified.[/dim]", classes="detail-value"))
+            content.mount(Static(Content.styled("No input parameters specified.", "dim"), classes="detail-value"))
 
     def action_close_dialog(self) -> None:
         self.dismiss(None)
@@ -221,34 +209,27 @@ class MCPToolDetailScreen(ModalScreen[None]):
 # ── Server Error Sub-modal ───────────────────────────────
 
 
-class MCPServerErrorScreen(ModalScreen[None]):
+class MCPServerErrorScreen(OpsModalScreen[None]):
     """Read-only modal for a failed MCP server's error details."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Close", show=False, priority=True),
         Binding("q", "cancel", "Close", show=False),
     ]
 
-    CSS = """
-    MCPServerErrorScreen {
-        align: center middle;
-        background: $background 70%;
-    }
-
-    MCPServerErrorScreen > Vertical {
-        width: 90;
-        max-width: 90%;
-        height: 70%;
-        background: $surface;
+    DEFAULT_CSS = """
+    MCPServerErrorScreen .ops-modal-dialog {
         border: solid $error;
-        padding: 1 2;
     }
 
     MCPServerErrorScreen .mcp-error-title {
-        text-style: bold;
-        color: $error;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
+    }
+
+    MCPServerErrorScreen .mcp-error-help {
+        display: none;
     }
 
     MCPServerErrorScreen .mcp-error-body {
@@ -261,28 +242,24 @@ class MCPServerErrorScreen(ModalScreen[None]):
     MCPServerErrorScreen .mcp-error-text {
         color: $text;
     }
-
-    MCPServerErrorScreen .mcp-error-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
-    }
     """
 
     def __init__(self, server: MCPServerInfo) -> None:
-        super().__init__()
         self._server = server
         self._error = server.error or "No error details were reported."
+        super().__init__()
 
-    def compose(self) -> ComposeResult:
+    def compose_modal(self) -> ComposeResult:
         name = self._server.name
-        with Vertical():
-            yield Static(f"MCP Server Error: {name}", classes="mcp-error-title")
-            with VerticalScroll(classes="mcp-error-body"):
-                yield Static(self._error, classes="mcp-error-text")
-            yield Static("Esc close", classes="mcp-error-help")
+        yield Static(f"MCP Server Error: {name}", classes="mcp-error-title")
+        with VerticalScroll(classes="mcp-error-body"):
+            yield Static(Content(self._error), classes="mcp-error-text")
+        yield Static("Esc close", classes="mcp-error-help")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.set_modal_title(f"MCP Server Error: {self._server.name}")
+        self.set_modal_subtitle([("esc", "close")])
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -324,27 +301,34 @@ class MCPToolItem(Static):
         if desc and len(desc) > 30:
             desc = desc[:27] + "..."
 
+        safe_display = escape(self.display_name)
+        safe_desc = escape(desc) if desc else ""
+        safe_tool_name = escape(self.tool_name)
+
         # Retain raw identifier in dim markup for diagnostic & test verification
-        raw_dim = f" [dim]({self.tool_name})[/dim]" if self.tool_name != self.display_name else ""
+        raw_dim = f" [dim]({safe_tool_name})[/dim]" if self.tool_name != self.display_name else ""
 
         if self._selected:
             if desc:
-                return f"  {cursor} [bold]{self.display_name}[/bold]  {desc}{raw_dim}"
-            return f"  {cursor} [bold]{self.display_name}[/bold]{raw_dim}"
+                return f"  {cursor} [bold]{safe_display}[/bold]  {safe_desc}{raw_dim}"
+            return f"  {cursor} [bold]{safe_display}[/bold]{raw_dim}"
         else:
             if desc:
-                return f"  {cursor} {self.display_name}  [dim]{desc}{raw_dim}[/dim]"
-            return f"  {cursor} {self.display_name}{raw_dim}"
+                return f"  {cursor} {safe_display}  [dim]{safe_desc}{raw_dim}[/dim]"
+            return f"  {cursor} {safe_display}{raw_dim}"
 
     def _format_expanded(self) -> str:
         # Kept for direct toggle_expand callers / existing test assertions
-        lines = [f"  [bold]{self.display_name}[/bold] [dim]({self.tool_name})[/dim]"]
+        safe_display = escape(self.display_name)
+        safe_tool_name = escape(self.tool_name)
+        lines = [f"  [bold]{safe_display}[/bold] [dim]({safe_tool_name})[/dim]"]
         if self.tool_description:
             style = self._desc_style()
+            safe_desc = escape(self.tool_description)
             if style:
-                lines.append(f"    [{style}]{self.tool_description}[/{style}]")
+                lines.append(f"    [{style}]{safe_desc}[/{style}]")
             else:
-                lines.append(f"    {self.tool_description}")
+                lines.append(f"    {safe_desc}")
 
         # Parameter schema
         schema = self._input_schema
@@ -362,11 +346,12 @@ class MCPToolItem(Static):
                         prop_schema.get("type") if isinstance(prop_schema, dict) else None
                     )
                     star = " *" if prop_name in required else ""
-                    safe_name = str(prop_name).replace("\n", " ")[:80]
+                    safe_name = escape(str(prop_name).replace("\n", " ")[:80])
+                    safe_type = escape(str(prop_type))
                     if style:
-                        lines.append(f"      [{style}]{safe_name}: {prop_type}{star}[/{style}]")
+                        lines.append(f"      [{style}]{safe_name}: {safe_type}{star}[/{style}]")
                     else:
-                        lines.append(f"      {safe_name}: {prop_type}{star}")
+                        lines.append(f"      {safe_name}: {safe_type}{star}")
         return "\n".join(lines)
 
     def _rerender(self) -> None:
@@ -440,34 +425,46 @@ class MCPServerHeaderItem(Static):
 
     def _render_header(self) -> str:
         server = self._server
-        glyph = _status_glyph(server)
-        transport = server.transport
         status = server.status
+        if status == "ok":
+            glyph = "[bold $success]●[/bold $success]"
+        elif status == "unauthenticated":
+            glyph = "[bold $warning]●[/bold $warning]"
+        elif status == "error":
+            glyph = "[bold $error]●[/bold $error]"
+        elif status == "disabled":
+            glyph = "[dim]○[/dim]"
+        else:
+            glyph = "[dim]●[/dim]"
+
+        transport = escape(server.transport)
         tool_count = self._visible_tool_count
         t_label = "tool" if tool_count == 1 else "tools"
 
         cursor = "›" if self._selected else " "
-        scope_badge = f" [{self.scope}]" if self.scope else ""
+        safe_name = escape(self.display_name)
+        safe_scope = escape(self.scope) if self.scope else ""
+        scope_badge = f" [{safe_scope}]" if self.scope else ""
 
         # Retain raw identifier in dim markup for diagnostic & test verification
-        raw_dim = f" [dim]({server.name})[/dim]" if server.name != self.display_name else ""
+        raw_dim = f" [dim]({escape(server.name)})[/dim]" if server.name != self.display_name else ""
 
         if self._selected:
             if status == "ok":
-                return f"{cursor} {glyph} [bold]{self.display_name}[/bold]{scope_badge}  {transport} · {tool_count} {t_label}{raw_dim}"
+                return f"{cursor} {glyph} [bold]{safe_name}[/bold]{scope_badge}  {transport} · {tool_count} {t_label}{raw_dim}"
             if status == "unauthenticated":
-                return f"{cursor} {glyph} [bold]{self.display_name}[/bold]{scope_badge}  {transport} · {status} (Enter to log in){raw_dim}"
+                return f"{cursor} {glyph} [bold]{safe_name}[/bold]{scope_badge}  {transport} · {status} (Enter to log in){raw_dim}"
             if status == "error":
-                return f"{cursor} {glyph} [bold]{self.display_name}[/bold]{scope_badge}  {transport} · {status} (Enter for error){raw_dim}"
-            return f"{cursor} {glyph} [bold]{self.display_name}[/bold]{scope_badge}  {transport} · {status}{raw_dim}"
+                return f"{cursor} {glyph} [bold]{safe_name}[/bold]{scope_badge}  {transport} · {status} (Enter for error){raw_dim}"
+            return f"{cursor} {glyph} [bold]{safe_name}[/bold]{scope_badge}  {transport} · {status}{raw_dim}"
         else:
             if status == "ok":
-                return f"{cursor} {glyph} [bold]{self.display_name}[/bold][cyan]{scope_badge}[/cyan]  [dim]{transport} · {tool_count} {t_label}{raw_dim}[/dim]"
+                return f"{cursor} {glyph} [bold]{safe_name}[/bold][$secondary]{scope_badge}[/$secondary]  [dim]{transport} · {tool_count} {t_label}{raw_dim}[/dim]"
             if status == "unauthenticated":
-                return f"{cursor} {glyph} [bold]{self.display_name}[/bold][cyan]{scope_badge}[/cyan]  [yellow]{status}[/yellow] [dim]— Enter to log in{raw_dim}[/dim]"
+                return f"{cursor} {glyph} [bold]{safe_name}[/bold][$secondary]{scope_badge}[/$secondary]  [$warning]{status}[/$warning] [dim]— Enter to log in{raw_dim}[/dim]"
             if status == "error":
-                return f"{cursor} {glyph} [bold]{self.display_name}[/bold][cyan]{scope_badge}[/cyan]  [red]{status}[/red] [dim]— Enter for details{raw_dim}[/dim]"
-            return f"{cursor} {glyph} [bold]{self.display_name}[/bold][cyan]{scope_badge}[/cyan]  [dim]{transport} · {status}{raw_dim}[/dim]"
+                return f"{cursor} {glyph} [bold]{safe_name}[/bold][$secondary]{scope_badge}[/$secondary]  [$error]{status}[/$error] [dim]— Enter for details{raw_dim}[/dim]"
+            return f"{cursor} {glyph} [bold]{safe_name}[/bold][$secondary]{scope_badge}[/$secondary]  [dim]{transport} · {status}{raw_dim}[/dim]"
 
     def set_selected(self, selected: bool) -> None:
         if self._selected == selected:
@@ -527,12 +524,14 @@ def _visible_tools_for(
 # ── Main MCP Viewer Screen ───────────────────────────────
 
 
-class MCPViewerScreen(ModalScreen[str | None]):
+class MCPViewerScreen(OpsModalScreen[str | None]):
     """Two-pane modal viewer for active MCP servers and their tools.
 
     Left pane lists MCP servers and their tools with keyboard and mouse hover support.
     Right pane displays real-time metadata, parameter schemas, and error diagnostics.
     """
+
+    DIALOG_CLASSES: ClassVar[str] = "-workspace"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("up", "move_up", "Up", show=False, priority=True),
@@ -546,35 +545,24 @@ class MCPViewerScreen(ModalScreen[str | None]):
         Binding("pageup", "page_up", "Page up", show=False, priority=True),
         Binding("pagedown", "page_down", "Page down", show=False, priority=True),
         Binding("escape", "cancel", "Close", show=False, priority=True),
+        Binding("slash", "focus_filter", "Filter", show=False),
     ]
 
-    CSS = """
-    MCPViewerScreen {
-        align: center middle;
-        background: $background 70%;
-    }
-
-    MCPViewerScreen > Vertical {
+    DEFAULT_CSS = """
+    MCPViewerScreen #mcp-container {
+        height: 1fr;
         width: 100%;
-        max-width: 98%;
-        height: 90%;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
     }
 
-    /* ── Title ─────────────────────────── */
+    /* ── Title (Rendered in dialog border) ─── */
     MCPViewerScreen .mcp-viewer-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     /* ── Filter ────────────────────────── */
     MCPViewerScreen #mcp-filter {
         margin-bottom: 1;
-        border: solid $primary-lighten-2;
+        border: solid $primary 40%;
     }
 
     MCPViewerScreen #mcp-filter:focus {
@@ -584,12 +572,13 @@ class MCPViewerScreen(ModalScreen[str | None]):
     /* ── Two-pane body ─────────────────── */
     MCPViewerScreen .mcp-body {
         height: 1fr;
+        width: 100%;
     }
 
     /* ── Left pane: server & tool list ─── */
     MCPViewerScreen .mcp-list-pane {
-        width: 1fr;
-        min-width: 35;
+        width: 2fr;
+        min-width: 28;
         height: 1fr;
     }
 
@@ -619,13 +608,15 @@ class MCPViewerScreen(ModalScreen[str | None]):
     }
 
     MCPViewerScreen .mcp-header-selected {
-        background: $primary;
-        color: $background;
+        background: $primary 18%;
+        color: $text;
         text-style: bold;
+        border-left: wide $primary;
+        padding-left: 0;
     }
 
     MCPViewerScreen .mcp-header-selected:hover {
-        background: $primary-lighten-1;
+        background: $primary 25%;
     }
 
     /* ── Tool items ────────────────────── */
@@ -640,23 +631,35 @@ class MCPViewerScreen(ModalScreen[str | None]):
     }
 
     MCPViewerScreen .mcp-tool-selected {
-        background: $primary;
-        color: $background;
+        background: $primary 14%;
+        color: $text;
         text-style: bold;
+        border-left: wide $primary;
+        padding-left: 1;
     }
 
     MCPViewerScreen .mcp-tool-selected:hover {
-        background: $primary-lighten-1;
+        background: $primary 20%;
     }
 
     /* ── Right pane: detail panel ──────── */
     MCPViewerScreen .mcp-detail-pane {
-        width: 46;
+        width: 3fr;
         min-width: 32;
         height: 1fr;
         margin-left: 1;
         padding-left: 1;
-        border-left: solid $primary-lighten-2;
+        border-left: solid $primary 25%;
+    }
+
+    /* Narrow terminals: list first, Enter opens details. */
+    MCPViewerScreen.-narrow .mcp-list-pane {
+        width: 1fr;
+        min-width: 0;
+    }
+
+    MCPViewerScreen.-narrow .mcp-detail-pane {
+        display: none;
     }
 
     MCPViewerScreen .mcp-detail-title {
@@ -669,6 +672,8 @@ class MCPViewerScreen(ModalScreen[str | None]):
         height: 1fr;
         min-height: 1;
         scrollbar-gutter: stable;
+        background: $background;
+        padding: 1;
     }
 
     MCPViewerScreen .detail-label {
@@ -688,13 +693,9 @@ class MCPViewerScreen(ModalScreen[str | None]):
         margin-top: 2;
     }
 
-    /* ── Help footer ───────────────────── */
+    /* ── Help footer (Rendered in dialog border) ─── */
     MCPViewerScreen .mcp-viewer-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 1;
-        text-align: center;
+        display: none;
     }
     """
 
@@ -721,11 +722,47 @@ class MCPViewerScreen(ModalScreen[str | None]):
 
     # ── Compose / Mount ──────────────────────────────────
 
-    def compose(self) -> ComposeResult:
-        yield Vertical()
+    def compose_modal(self) -> ComposeResult:
+        yield Vertical(id="mcp-container")
 
     def on_mount(self) -> None:
-        self._mount_body(self.query_one(Vertical))
+        super().on_mount()
+        is_narrow = self.app.size.width < 90
+        self.set_class(is_narrow, "-narrow")
+        container = self.query_one("#mcp-container", Vertical)
+        self._mount_body(container)
+
+    def on_resize(self) -> None:
+        is_narrow = self.app.size.width < 90
+        if is_narrow != self.has_class("-narrow"):
+            self.set_class(is_narrow, "-narrow")
+
+    def _update_modal_chrome(self) -> None:
+        glyphs = get_glyphs()
+        total_servers = len(self._server_info)
+        total_tools = sum(s.tool_count for s in self._server_info)
+
+        if total_servers:
+            s_label = "server" if total_servers == 1 else "servers"
+            t_label = "tool" if total_tools == 1 else "tools"
+            counter = f"{total_servers} {s_label} · {total_tools} {t_label}"
+        else:
+            counter = "0 servers"
+
+        self.set_modal_title("MCP Servers", counter=counter)
+
+        subtitles: list[tuple[str, str]] = [
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            (glyphs.newline, "details"),
+            ("f2", "disable/enable"),
+        ]
+        if self._pending_reconnect:
+            subtitles.append(("ctrl+r", "reconnect"))
+        subtitles.extend([
+            ("/", "filter"),
+            ("esc", "close"),
+        ])
+        self.set_modal_subtitle(subtitles)
 
     def _mount_body(self, container: Vertical) -> None:
         total_servers = len(self._server_info)
@@ -737,6 +774,8 @@ class MCPViewerScreen(ModalScreen[str | None]):
             title = f"MCP Servers ({total_servers} {s_label}, {total_tools} {t_label})"
         else:
             title = "MCP Servers"
+
+        self._update_modal_chrome()
 
         container.mount(Static(title, classes="mcp-viewer-title"))
 
@@ -880,69 +919,84 @@ class MCPViewerScreen(ModalScreen[str | None]):
 
     def _render_tool_details(self, detail_body: Vertical, item: MCPToolItem) -> None:
         """Mount formatted metadata and parameter schemas for a tool."""
-        detail_body.mount(Static("[bold]Tool[/bold]", classes="detail-label"))
-        detail_body.mount(Static(f"[bold cyan]{item.display_name}[/bold cyan]", classes="detail-value"))
+        detail_body.mount(Static("Tool", classes="detail-label"))
+        detail_body.mount(Static(Content.styled(item.display_name, "bold $secondary"), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]MCP Server[/bold]", classes="detail-label"))
+        detail_body.mount(Static("MCP Server", classes="detail-label"))
         if item.server_info:
             srv_disp, srv_scope = clean_server_name(item.server_info.name)
-            scope_badge = f" [cyan][{srv_scope}][/cyan]" if srv_scope else ""
             status_glyph = _status_glyph(item.server_info)
-            detail_body.mount(
-                Static(
-                    f"{srv_disp}{scope_badge} [dim]({status_glyph} {item.server_info.transport})[/dim]",
-                    classes="detail-value",
-                )
-            )
+            pieces: list[Any] = [(srv_disp, "bold $foreground")]
+            if srv_scope:
+                pieces.append((f" [{srv_scope}]", "$secondary"))
+            pieces.append((f" ({status_glyph} {item.server_info.transport})", "dim"))
+            detail_body.mount(Static(Content.assemble(*pieces), classes="detail-value"))
         else:
-            detail_body.mount(Static(item.server_name, classes="detail-value"))
+            detail_body.mount(Static(Content(item.server_name), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]Description[/bold]", classes="detail-label"))
-        desc = item.tool_description or "[dim]No description provided.[/dim]"
-        detail_body.mount(Static(desc, classes="detail-value"))
+        detail_body.mount(Static("Description", classes="detail-label"))
+        desc = item.tool_description
+        if desc:
+            detail_body.mount(Static(Content(desc), classes="detail-value"))
+        else:
+            detail_body.mount(Static(Content.styled("No description provided.", "dim"), classes="detail-value"))
 
         schema = item._input_schema
-        detail_body.mount(Static("[bold]Parameters[/bold]", classes="detail-label"))
+        detail_body.mount(Static("Parameters", classes="detail-label"))
         if schema and isinstance(schema, dict):
             properties = schema.get("properties")
             if isinstance(properties, dict) and properties:
                 required = set(schema.get("required") or [])
                 count = len(properties)
                 detail_body.mount(
-                    Static(f"[dim]{count} parameter{'s' if count != 1 else ''}[/dim]", classes="detail-value")
+                    Static(Content.styled(f"{count} parameter{'s' if count != 1 else ''}", "dim"), classes="detail-value")
                 )
                 for prop_name, prop_schema in properties.items():
                     is_req = prop_name in required
-                    req_badge = "[bold red]* required[/bold red]" if is_req else "[dim]optional[/dim]"
                     p_type = _format_prop_type(
                         prop_schema.get("type") if isinstance(prop_schema, dict) else None
                     )
-                    detail_body.mount(
-                        Static(f"• [bold cyan]{prop_name}[/bold cyan] ({p_type})  {req_badge}", classes="detail-value")
-                    )
+                    param_line: list[Any] = [
+                        ("• ", "dim"),
+                        (str(prop_name), "bold $secondary"),
+                        (f" ({p_type})  ", "dim"),
+                    ]
+                    if is_req:
+                        param_line.append(("* required", "bold $error"))
+                    else:
+                        param_line.append(("optional", "dim"))
+                    detail_body.mount(Static(Content.assemble(*param_line), classes="detail-value"))
+
                     if isinstance(prop_schema, dict):
                         p_desc = prop_schema.get("description", "").strip()
                         if p_desc:
-                            detail_body.mount(Static(f"    [dim]{p_desc}[/dim]", classes="detail-value"))
+                            detail_body.mount(Static(Content.styled(f"    {p_desc}", "dim"), classes="detail-value"))
                         enum_vals = prop_schema.get("enum")
                         if enum_vals:
                             enum_str = ", ".join(repr(v) for v in enum_vals[:6])
                             if len(enum_vals) > 6:
                                 enum_str += ", …"
-                            detail_body.mount(Static(f"    [dim]Options: [{enum_str}][/dim]", classes="detail-value"))
+                            detail_body.mount(Static(Content.styled(f"    Options: [{enum_str}]", "dim"), classes="detail-value"))
                         default_val = prop_schema.get("default")
                         if default_val is not None:
-                            detail_body.mount(Static(f"    [dim]Default: {default_val}[/dim]", classes="detail-value"))
+                            detail_body.mount(Static(Content.styled(f"    Default: {default_val}", "dim"), classes="detail-value"))
             else:
-                detail_body.mount(Static("[dim]No parameters required[/dim]", classes="detail-value"))
+                detail_body.mount(Static(Content.styled("No parameters required", "dim"), classes="detail-value"))
         else:
-            detail_body.mount(Static("[dim]No parameters required[/dim]", classes="detail-value"))
+            detail_body.mount(Static(Content.styled("No parameters required", "dim"), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]Identifier[/bold]", classes="detail-label"))
-        detail_body.mount(Static(f"[dim]{item.tool_name}[/dim]", classes="detail-value"))
+        detail_body.mount(Static("Identifier", classes="detail-label"))
+        detail_body.mount(Static(Content.styled(item.tool_name, "dim"), classes="detail-value"))
 
         detail_body.mount(
-            Static("\n[dim]Press [bold]Enter[/bold] to inspect full JSON schema[/dim]", classes="detail-label")
+            Static(
+                Content.assemble(
+                    ("\nPress ", "dim"),
+                    ("Enter", "bold $foreground"),
+                    (" to inspect full JSON schema", "dim"),
+                ),
+                classes="detail-label",
+            )
         )
 
     def _render_server_details(self, detail_body: Vertical, item: MCPServerHeaderItem) -> None:
@@ -950,53 +1004,82 @@ class MCPViewerScreen(ModalScreen[str | None]):
         server = item.server
         srv_display, srv_scope = clean_server_name(server.name)
 
-        detail_body.mount(Static("[bold]Server[/bold]", classes="detail-label"))
-        scope_badge = f" [cyan][{srv_scope}][/cyan]" if srv_scope else ""
-        detail_body.mount(Static(f"[bold cyan]{srv_display}[/bold cyan]{scope_badge}", classes="detail-value"))
+        detail_body.mount(Static("Server", classes="detail-label"))
+        pieces: list[Any] = [(srv_display, "bold $secondary")]
+        if srv_scope:
+            pieces.append((f" [{srv_scope}]", "$secondary"))
+        detail_body.mount(Static(Content.assemble(*pieces), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]Status[/bold]", classes="detail-label"))
+        detail_body.mount(Static("Status", classes="detail-label"))
         glyph = _status_glyph(server)
         if server.status == "ok":
-            status_text = f"[green]{glyph} Connected / Active[/green]"
+            detail_body.mount(
+                Static(Content.styled(f"{glyph} Connected / Active", "bold $success"), classes="detail-value")
+            )
         elif server.status == "unauthenticated":
-            status_text = f"[yellow]{glyph} Unauthenticated[/yellow] [dim](Press Enter to log in)[/dim]"
+            detail_body.mount(
+                Static(
+                    Content.assemble(
+                        (f"{glyph} Unauthenticated ", "bold $warning"),
+                        ("(Press Enter to log in)", "dim"),
+                    ),
+                    classes="detail-value",
+                )
+            )
         elif server.status == "error":
-            status_text = f"[red]{glyph} Error[/red] [dim](Press Enter for details)[/dim]"
+            detail_body.mount(
+                Static(
+                    Content.assemble(
+                        (f"{glyph} Error ", "bold $error"),
+                        ("(Press Enter for details)", "dim"),
+                    ),
+                    classes="detail-value",
+                )
+            )
         elif server.status == "disabled":
-            status_text = f"[dim]{glyph} Disabled (Press F2 to enable)[/dim]"
+            detail_body.mount(
+                Static(Content.styled(f"{glyph} Disabled (Press F2 to enable)", "dim"), classes="detail-value")
+            )
         else:
-            status_text = f"{glyph} {server.status}"
-        detail_body.mount(Static(status_text, classes="detail-value"))
+            detail_body.mount(Static(Content(f"{glyph} {server.status}"), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]Transport[/bold]", classes="detail-label"))
-        detail_body.mount(Static(f"[cyan]{server.transport}[/cyan]", classes="detail-value"))
+        detail_body.mount(Static("Transport", classes="detail-label"))
+        detail_body.mount(Static(Content.styled(server.transport, "$secondary"), classes="detail-value"))
 
         if server.command:
             cmd_str = server.command
             if server.args:
                 cmd_str += " " + " ".join(server.args)
-            detail_body.mount(Static("[bold]Command[/bold]", classes="detail-label"))
-            detail_body.mount(Static(f"[dim]{cmd_str}[/dim]", classes="detail-value"))
+            detail_body.mount(Static("Command", classes="detail-label"))
+            detail_body.mount(Static(Content.styled(cmd_str, "dim"), classes="detail-value"))
 
         if server.url:
-            detail_body.mount(Static("[bold]URL[/bold]", classes="detail-label"))
-            detail_body.mount(Static(f"[cyan]{server.url}[/cyan]", classes="detail-value"))
+            detail_body.mount(Static("URL", classes="detail-label"))
+            detail_body.mount(Static(Content.styled(server.url, "$secondary"), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]Tools[/bold]", classes="detail-label"))
+        detail_body.mount(Static("Tools", classes="detail-label"))
         count = len(server.tools)
-        detail_body.mount(Static(f"{count} available", classes="detail-value"))
+        detail_body.mount(Static(Content(f"{count} available"), classes="detail-value"))
         for t in server.tools[:8]:
             t_clean = clean_tool_name(t.name, t.original_name)
-            detail_body.mount(Static(f"• [dim]{t_clean}[/dim]", classes="detail-value"))
+            detail_body.mount(
+                Static(
+                    Content.assemble(
+                        ("• ", "dim"),
+                        (t_clean, "dim"),
+                    ),
+                    classes="detail-value",
+                )
+            )
         if count > 8:
-            detail_body.mount(Static(f"[dim]… and {count - 8} more[/dim]", classes="detail-value"))
+            detail_body.mount(Static(Content.styled(f"… and {count - 8} more", "dim"), classes="detail-value"))
 
         if server.error:
-            detail_body.mount(Static("[bold red]Error Diagnostics[/bold red]", classes="detail-label"))
-            detail_body.mount(Static(f"[red]{server.error}[/red]", classes="detail-value"))
+            detail_body.mount(Static(Content.styled("Error Diagnostics", "bold $error"), classes="detail-label"))
+            detail_body.mount(Static(Content.styled(str(server.error), "$error"), classes="detail-value"))
 
-        detail_body.mount(Static("[bold]Config Identifier[/bold]", classes="detail-label"))
-        detail_body.mount(Static(f"[dim]{server.name}[/dim]", classes="detail-value"))
+        detail_body.mount(Static("Config Identifier", classes="detail-label"))
+        detail_body.mount(Static(Content.styled(server.name, "dim"), classes="detail-value"))
 
     # ── Filter ───────────────────────────────────────────
 
@@ -1159,6 +1242,12 @@ class MCPViewerScreen(ModalScreen[str | None]):
             return
         self.app.call_later(self._on_toggle_disable, server_name)
 
+    def action_focus_filter(self) -> None:
+        try:
+            self.query_one("#mcp-filter", Input).focus()
+        except Exception:
+            pass
+
     def action_cancel(self) -> None:
         self.dismiss(None)
 
@@ -1177,11 +1266,14 @@ class MCPViewerScreen(ModalScreen[str | None]):
         self._query = ""
         if pending_reconnect is not None:
             self._pending_reconnect = pending_reconnect
-        body = self.query_one(Vertical)
-        await body.remove_children()
+        try:
+            container = self.query_one("#mcp-container", Vertical)
+        except Exception:
+            container = self.query_one(Vertical)
+        await container.remove_children()
         self._row_widgets = []
         self._selected_index = 0
-        self._mount_body(body)
+        self._mount_body(container)
         if select_server is not None:
             for idx, widget in enumerate(self._row_widgets):
                 if (

@@ -224,6 +224,9 @@ def _toml_lookup(data: dict[str, Any], keys: tuple[str, ...]) -> tuple[bool, Any
     node: Any = data
     for key in keys:
         if not isinstance(node, dict) or key not in node:
+            if key == "agent_pool" and isinstance(node, dict) and "model_pool" in node:
+                node = node["model_pool"]
+                continue
             return False, None
         node = node[key]
     return True, node
@@ -504,6 +507,17 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         env_var="MODEL_CONTEXT_LIMIT",
         settings_field="model_context_limit",
         default=128_000,
+    ),
+    ConfigOption(
+        key="models.agent_pool",
+        group="Models",
+        summary="Tier-based model pool configuration (fast, standard, powerful, provider)",
+        kind=OptionKind.JSON,
+        db_key="AGENT_POOL",
+        env_var="OPSCLOUD_AGENT_POOL",
+        toml_keys=("agent_pool",),
+        settings_field="agent_pool",
+        default=None,
     ),
     # ── Startup & Environment ─────────────────────────────
     ConfigOption(
@@ -797,6 +811,11 @@ def get_option_by_db_key(db_key: str) -> ConfigOption | None:
     return {opt.db_key: opt for opt in get_config_options()}.get(db_key)
 
 
+def get_option_by_settings_field(field_name: str) -> ConfigOption | None:
+    """Look up a configuration option by its Settings field name (e.g. 'aws_profile')."""
+    return next((opt for opt in get_config_options() if opt.settings_field == field_name), None)
+
+
 def option_keys() -> tuple[str, ...]:
     """Return all canonical option keys in declaration order."""
     return tuple(opt.key for opt in get_config_options())
@@ -820,6 +839,7 @@ __all__ = [
     "get_config_options",
     "get_option",
     "get_option_by_db_key",
+    "get_option_by_settings_field",
     "iter_groups",
     "load_config_toml",
     "option_keys",

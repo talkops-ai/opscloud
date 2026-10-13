@@ -303,10 +303,10 @@ def _format_mcp_server_changes(
         lines.append(f"  - Recovered: {', '.join(recovered)}")
     if status_changed:
         transitions = ", ".join(
-            f"{name} ({before[name].status} {glyphs.arrow_right} {servers[name].status})"
+            f"`{name}` ({before[name].status} {glyphs.arrow_right} {servers[name].status})"
             for name in status_changed
         )
-        lines.append(f"  - Status changed: {transitions}")
+        lines.append(f"  - **Status changed:** {transitions}")
     if reconfigured:
         edits = []
         for name in reconfigured:
@@ -343,7 +343,7 @@ class QueuedMessage:
 class OpsCloudApp(App):
     """OpsCloud interactive TUI — DevOps coding agent orchestrator."""
 
-    CSS_PATH = "app.tcss"
+    CSS_PATH = ["app.tcss", "modal.tcss"]
     ENABLE_COMMAND_PALETTE = False
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -446,20 +446,22 @@ class OpsCloudApp(App):
                 model = ""
                 defer_server_start = True
         self._model = model or ""
+        self._manual_model: str | None = self._model or None
+        self._smart_routed_active: bool = False
         self._server_startup_deferred = defer_server_start and (client is None)
-        from opscloud.config.settings import settings
-        self._settings = settings
-        self._reasoning_effort: str | None = getattr(settings, "reasoning_effort", None)
+        from opscloud.config.settings import get_settings
+        self._settings = get_settings()
+        self._reasoning_effort: str | None = getattr(self._settings, "reasoning_effort", None)
 
         # Sync model metadata to settings early so /config can display it
         # before the agent is created (apply_to_settings only runs on first turn)
-        if model and not settings.model_name:
+        if model and not self._settings.model_name:
             if ":" in model:
                 provider_part, model_part = model.split(":", 1)
-                settings.model_provider = provider_part
-                settings.model_name = model_part
+                self._settings.model_provider = provider_part
+                self._settings.model_name = model_part
             else:
-                settings.model_name = model
+                self._settings.model_name = model
 
         from opscloud.approval_mode import ApprovalMode
         if approval_mode is not None:
@@ -515,6 +517,8 @@ class OpsCloudApp(App):
         self._agent_turn_started: bool = False
         self._active_user_message: Any | None = None
         self._active_turn_visible_output_started: bool = False
+        self._turn_metrics_start: dict[str, Any] | None = None
+        """Counters captured at turn start; consumed by ``_mount_turn_summary``."""
         self._clear_input_pending: bool = False
         self._quit_pending: bool = False
         self._shell_worker: Any | None = None
@@ -544,6 +548,7 @@ class OpsCloudApp(App):
         self._restart_respawn_task: asyncio.Task[bool] | None = None
         self._server_restart_tasks: set[asyncio.Task[Any]] = set()
         self._discovered_skills: list[dict[str, Any]] = []
+        self._last_reload_snapshot: dict[str, Any] | None = None
 
         # Deferred server startup
         self._server_kwargs: dict[str, Any] | None = server_kwargs
@@ -660,7 +665,16 @@ class OpsCloudApp(App):
         self._chat_input = self.query_one("#input-area", ChatInput)
         self._chat_input.focus()
 
-        messages_widget.mount(WelcomeBanner())
+        messages_widget.mount(
+            WelcomeBanner(
+                model_spec=self._model or "",
+                effort=eff or "",
+                mcp_servers=self._mcp_server_info or None,
+                mcp_disabled=bool(
+                    (getattr(self, "_mcp_preload_kwargs", None) or {}).get("no_mcp")
+                ),
+            )
+        )
         self._sync_status_cloud()
 
         # Always refocus input after mounting widgets that may steal focus
@@ -707,6 +721,20 @@ class OpsCloudApp(App):
         if self._goal:
             self.call_later(self._send_goal)
 
+    def _sync_banner_model(self, model_spec: str, effort: str = "") -> None:
+        """Mirror the active model / effort onto the welcome banner, if present."""
+        try:
+            self.query_one(WelcomeBanner).update_model(model_spec, effort)
+        except Exception:
+            pass
+
+    def _sync_banner_mcp(self) -> None:
+        """Mirror probed MCP server metadata onto the welcome banner, if present."""
+        try:
+            self.query_one(WelcomeBanner).update_mcp(self._mcp_server_info or [])
+        except Exception:
+            pass
+
     async def _set_spinner(self, status: str | None) -> None:
         """Show, update, or hide the loading spinner in the message list."""
         from opscloud.ui.widgets.loading import LoadingWidget
@@ -726,7 +754,8 @@ class OpsCloudApp(App):
             return
 
         if self._loading_widget is None or not getattr(self._loading_widget, "is_attached", False):
-            self._loading_widget = LoadingWidget(status)
+            turn_start = (self._turn_metrics_start or {}).get("started")
+            self._loading_widget = LoadingWidget(status, started_at=turn_start)
             await messages.mount(self._loading_widget)
             messages.scroll_end(animate=False)
         else:
@@ -797,6 +826,8 @@ class OpsCloudApp(App):
 
         self._server_startup_deferred = False
         self._model = model_spec
+        if not getattr(self, "_manual_model", None):
+            self._manual_model = model_spec
         self._connecting = True
         if self._server_kwargs is None:
             self._server_kwargs = {
@@ -833,34 +864,30 @@ class OpsCloudApp(App):
             kwargs: dict[str, Any] = dict(self._server_kwargs or {})
             assistant_id = str(kwargs.pop("assistant_id", self._assistant_id))
 
-            coros: list[Any] = [
-                start_server_and_get_agent(
-                    assistant_id=assistant_id,
-                    **kwargs,
-                )
-            ]
+            client, server_proc = await start_server_and_get_agent(
+                assistant_id=assistant_id,
+                on_spawn=lambda proc: setattr(self, "_server_proc", proc),
+                **kwargs,
+            )
+            self._server_proc = server_proc
+            if self._exit:
+                try:
+                    server_proc.stop()
+                except Exception:
+                    pass
+                return
 
+            # The server owns cold MCP discovery. Reading metadata afterward
+            # uses the fingerprinted schema cache and avoids launching every
+            # stdio server a second time in the TUI process.
+            mcp_info = None
             if self._mcp_preload_kwargs is not None and not self._mcp_preload_kwargs.get("no_mcp"):
                 from opscloud.mcp.preload import preload_mcp_server_info
 
-                coros.append(preload_mcp_server_info(**self._mcp_preload_kwargs))
-
-            results = await asyncio.gather(*coros, return_exceptions=True)
-
-            server_result = results[0]
-            if isinstance(server_result, BaseException):
-                raise server_result
-
-            client, server_proc = server_result
-            self._server_proc = server_proc
-
-            mcp_info = None
-            if len(results) > 1:
-                mcp_res = results[1]
-                if isinstance(mcp_res, list):
-                    mcp_info = mcp_res
-                elif isinstance(mcp_res, BaseException):
-                    logger.warning("MCP metadata preload background failed: %s", mcp_res)
+                try:
+                    mcp_info = await preload_mcp_server_info(**self._mcp_preload_kwargs)
+                except Exception as exc:
+                    logger.warning("MCP metadata preload background failed: %s", exc)
 
             self.post_message(
                 self.ServerReady(
@@ -882,6 +909,7 @@ class OpsCloudApp(App):
             if infos:
                 self._mcp_server_info = infos
                 logger.debug("Background MCP preload populated %d servers", len(infos))
+                self._sync_banner_mcp()
                 try:
                     from opscloud.ui.widgets.mcp_viewer import MCPViewerScreen
 
@@ -923,6 +951,7 @@ class OpsCloudApp(App):
             banner.set_connected()
         except Exception:
             pass  # Banner may have been dismissed already
+        self._sync_banner_mcp()
 
         # Restore focus to input after async server startup
         if self._chat_input:
@@ -1070,6 +1099,11 @@ class OpsCloudApp(App):
             self._chat_input.text = f"{event.command_name} "
             self._chat_input.focus_input()
 
+    def set_chat_input(self, text: str) -> None:
+        """Insert text into the chat input area and focus it."""
+        if self._chat_input is not None:
+            self._chat_input.text = text
+            self._chat_input.focus_input()
 
     @on(ChatInput.Typing)
     def _on_typing(self, event: ChatInput.Typing) -> None:
@@ -1257,6 +1291,8 @@ class OpsCloudApp(App):
         await self._mount_message(user_msg)
         if await self._maybe_continue_workflow(message):
             return
+        if await self._maybe_continue_agent_session(message):
+            return
         await self._send_to_agent(message)
 
     async def send_agent_message(self, message: str, **kwargs: Any) -> None:
@@ -1341,6 +1377,12 @@ class OpsCloudApp(App):
                 if isinstance(raw_request_id, str):
                     criteria_request_id = raw_request_id
         workflow_turn = graph_input is not None and isinstance(graph_input.get("workflow_request"), dict)
+        agent_session_turn = graph_input is not None and isinstance(graph_input.get("agent_session_request"), dict)
+        # Goal-criteria generation is a background server operation, not a
+        # conversational turn, so it gets no footer.
+        self._turn_metrics_start = (
+            None if criteria_request_id is not None else self._snapshot_turn_metrics()
+        )
 
         task_succeeded = False
         try:
@@ -1360,6 +1402,9 @@ class OpsCloudApp(App):
                 context["aws_profile"] = active_aws_prof
             if active_aws_reg:
                 context["aws_region"] = active_aws_reg
+            mode_val = self._approval_mode.value if hasattr(self._approval_mode, "value") else str(self._approval_mode)
+            context["approval_mode"] = mode_val
+            context["smart"] = (mode_val.lower() == "smart")
             panel = self._get_subagent_panel()
             if panel is not None:
                 spec = self._model or ""
@@ -1391,12 +1436,19 @@ class OpsCloudApp(App):
             await self._mount_message(ErrorMessage(body))
 
         finally:
+            if self._turn_metrics_start is not None:
+                self._turn_metrics_start["elapsed"] = (
+                    time.monotonic() - self._turn_metrics_start["started"]
+                )
+                self._turn_metrics_start["ok"] = task_succeeded and bool(
+                    getattr(self._adapter, "last_turn_ok", True)
+                )
             panel = self._get_subagent_panel()
             if panel is not None:
                 panel.finalize_running()
             self._close_active_tool_group()
             await self._cleanup_agent_task(
-                force_goal_sync=graph_input is not None and not workflow_turn,
+                force_goal_sync=graph_input is not None and not workflow_turn and not agent_session_turn,
                 goal_criteria_request_id=criteria_request_id,
                 goal_criteria_succeeded=(
                     criteria_request_id is None or task_succeeded
@@ -1472,12 +1524,58 @@ class OpsCloudApp(App):
             except Exception:
                 logger.exception("Error during agent turn regrouping")
 
+            # Turn footer (after cost sync so tokens/cost are reconciled,
+            # before the queue drains so it sits under *this* turn).
+            try:
+                await self._mount_turn_summary()
+            except Exception:
+                logger.exception("Error mounting turn summary")
+
             # Process next message from queue
             if not self._startup_sequence_running:
                 await self._process_next_from_queue()
         finally:
             self._agent_reconciling = False
             self._focus_chat_input_after_refresh()
+
+    # ── Turn Summary Footer ──────────────────────────────
+
+    def _snapshot_turn_metrics(self) -> dict[str, Any]:
+        """Capture the counters a turn footer is computed from (as deltas)."""
+        tool_total = 0
+        with suppress(NoMatches):
+            tool_total = getattr(self.query_one("#messages", MessageList), "_tool_call_total", 0)
+        return {
+            "started": time.monotonic(),
+            "tools": tool_total,
+            "tokens": self._cumulative_session_tokens,
+            "cost": self._session_cost_usd,
+        }
+
+    async def _mount_turn_summary(self) -> None:
+        """Mount the ``✓ Done in … · N tools · tokens · cost`` footer.
+
+        Only shown for turns that completed cleanly; errors and interrupts
+        already leave their own message in the transcript.  The snapshot is
+        consumed so cleanup paths that run without a turn never mount one.
+        """
+        start = self._turn_metrics_start
+        self._turn_metrics_start = None
+        if not start or not start.get("ok"):
+            return
+        from opscloud.ui.widgets.messages import TurnSummary
+
+        tool_total = start["tools"]
+        with suppress(NoMatches):
+            tool_total = getattr(self.query_one("#messages", MessageList), "_tool_call_total", tool_total)
+        await self._mount_message(
+            TurnSummary(
+                elapsed_seconds=float(start.get("elapsed", 0.0)),
+                tool_count=max(0, tool_total - start["tools"]),
+                tokens=max(0, self._cumulative_session_tokens - start["tokens"]),
+                cost_usd=max(0.0, self._session_cost_usd - start["cost"]),
+            )
+        )
 
     # ── Goal State Management ────────────────────────────
     #
@@ -2272,7 +2370,8 @@ class OpsCloudApp(App):
             )
             res = await self._command_router.dispatch(text, ctx)
             if res.mount_as_app_message and res.message:
-                await self._mount_message(SystemMessage(res.message))
+                from opscloud.ui.widgets.messages import CommandOutputMessage
+                await self._mount_message(CommandOutputMessage(res.message, command=cmd_name))
             if res.notify:
                 self.notify(res.notify, severity=res.notify_severity)
             if res.push_screen:
@@ -2306,13 +2405,25 @@ class OpsCloudApp(App):
             else:
                 await self._show_theme_selector()
 
-        elif cmd_name == "/agents":
-            if arg:
-                # Direct switch: /agents <name>
-                self._switch_agent(arg)
-            else:
-                # Open interactive picker
-                await self._show_agent_selector()
+        elif cmd_name in {"/agents", "/agent"}:
+            from opscloud.commands import CommandContext
+            from opscloud.commands.power.agents import AgentsHandler
+            from opscloud.config.settings import settings as global_settings
+
+            ctx = CommandContext(
+                app=self,
+                session=getattr(self, "_session_state", None),
+                agent=getattr(self, "_agent", None),
+                settings=getattr(self, "_settings", None) or global_settings,
+                raw_command=text,
+                args=arg,
+                thread_id=self._agent_thread_id,
+                model_spec=self._model,
+            )
+            res = await AgentsHandler().execute(ctx)
+            if res.mount_as_app_message and res.message:
+                from opscloud.ui.widgets.messages import CommandOutputMessage
+                await self._mount_message(CommandOutputMessage(res.message, command=cmd_name))
 
         elif cmd_name in {"/manual", "/auto", "/smart"}:
             target_mode = ApprovalMode(cmd_name.lstrip("/"))
@@ -2670,7 +2781,7 @@ class OpsCloudApp(App):
     ) -> _ServerRespawnResult:
         """Stop the app-owned server subprocess and rebuild the agent."""
         server_proc = self._server_proc
-        if server_proc is None:
+        if server_proc is None or self._exit:
             return _ServerRespawnResult(restarted=False)
 
         try:
@@ -2683,6 +2794,13 @@ class OpsCloudApp(App):
             else:
                 await asyncio.to_thread(server_proc.stop)
                 await asyncio.to_thread(server_proc.start)
+
+            if self._exit:
+                try:
+                    server_proc.stop()
+                except Exception:
+                    pass
+                return _ServerRespawnResult(restarted=False)
 
             from opscloud.mcp.preload import preload_mcp_server_info
             from opscloud.ui.remote_client import RemoteAgent
@@ -2733,6 +2851,30 @@ class OpsCloudApp(App):
 
     # ── /reload Implementation ───────────────────────────
 
+    def _take_reload_snapshot(self) -> dict[str, Any]:
+        """Capture runtime snapshot of reloadable items for change detection."""
+        try:
+            from opscloud.config.cloud_profiles import get_active_aws_profile, get_active_aws_region
+            from opscloud.config.toml_config import load_agent_pool, load_default_agent, load_default_model
+
+            prof = get_active_aws_profile()
+            reg = get_active_aws_region() or (getattr(self._settings, "aws_region", None) if self._settings else None)
+            pool = load_agent_pool()
+            def_model = load_default_model()
+            def_agent = load_default_agent()
+            theme_name = getattr(self, "theme", None)
+            return {
+                "aws_profile": prof,
+                "aws_region": reg,
+                "agent_pool": pool.copy() if pool else None,
+                "default_model": def_model,
+                "default_agent": def_agent,
+                "theme": theme_name,
+            }
+        except Exception:
+            logger.exception("Failed to capture reload snapshot")
+            return {}
+
     def _schedule_reload(self) -> asyncio.Task[None]:
         """Run `/reload` off the Textual message pump."""
         reload_task = self._reload_task
@@ -2778,10 +2920,12 @@ class OpsCloudApp(App):
 
     async def _run_reload_unlocked(self) -> None:
         """Run `/reload` while the environment mutation lock is held."""
+        from opscloud.config.toml_config import format_agent_pool_summary
         from opscloud.plugins.adapters.mcp import plugin_mcp_configs
         from opscloud.plugins.discovery import discover_plugins
 
         try:
+            old_snapshot = dict(self._last_reload_snapshot) if self._last_reload_snapshot else self._take_reload_snapshot()
             old_skill_names = {
                 str(s.get("name", "")) for s in (self._discovered_skills or []) if s.get("name")
             }
@@ -2792,6 +2936,40 @@ class OpsCloudApp(App):
                 changes = await asyncio.to_thread(self._settings.reload_from_environment)
                 from opscloud.model.config import clear_caches
                 clear_caches()
+                from opscloud.model.pool import clear_pool_caches
+                clear_pool_caches()
+                from opscloud.config.cloud_profiles import invalidate_aws_profile_cache
+                invalidate_aws_profile_cache()
+
+                if self._settings is not None:
+                    prof = getattr(self._settings, "aws_profile", None)
+                    if isinstance(prof, str) and prof:
+                        os.environ["OPSCLOUD_SERVER_AWS_PROFILE"] = prof
+                    reg = getattr(self._settings, "aws_region", None)
+                    if isinstance(reg, str) and reg:
+                        os.environ["OPSCLOUD_SERVER_AWS_REGION"] = reg
+
+                    if self._server_kwargs is not None:
+                        if isinstance(prof, str) and prof:
+                            self._server_kwargs["aws_profile"] = prof
+                        if isinstance(reg, str) and reg:
+                            self._server_kwargs["aws_region"] = reg
+
+                    if self._server_proc is not None:
+                        try:
+                            from dataclasses import is_dataclass, replace
+                            cur_cfg = getattr(self._server_proc, "config", None)
+                            updates: dict[str, Any] = {}
+                            if isinstance(prof, str) and prof:
+                                updates["aws_profile"] = prof
+                            if isinstance(reg, str) and reg:
+                                updates["aws_region"] = reg
+                            if updates and cur_cfg is not None and is_dataclass(cur_cfg):
+                                self._server_proc.config = replace(cast(Any, cur_cfg), **updates)
+                        except Exception:
+                            logger.debug("Could not update server_proc.config with reloaded settings", exc_info=True)
+
+                    self._sync_status_cloud()
             except (OSError, ValueError, Exception):
                 logger.exception("Failed to reload configuration")
                 await self._mount_message(
@@ -2802,6 +2980,37 @@ class OpsCloudApp(App):
                     )
                 )
                 return
+
+            # Diff snapshot for AWS and pool changes
+            new_snapshot = self._take_reload_snapshot()
+            self._last_reload_snapshot = new_snapshot
+
+            if old_snapshot.get("aws_profile") != new_snapshot.get("aws_profile"):
+                c_str = f"aws_profile: {old_snapshot.get('aws_profile')} -> {new_snapshot.get('aws_profile')}"
+                if not any(c.startswith("aws_profile:") for c in changes):
+                    changes.append(c_str)
+
+            if old_snapshot.get("aws_region") != new_snapshot.get("aws_region"):
+                c_str = f"aws_region: {old_snapshot.get('aws_region')} -> {new_snapshot.get('aws_region')}"
+                if not any(c.startswith("aws_region:") for c in changes):
+                    changes.append(c_str)
+
+            if old_snapshot.get("agent_pool") != new_snapshot.get("agent_pool"):
+                old_desc = format_agent_pool_summary(old_snapshot.get("agent_pool"))
+                new_desc = format_agent_pool_summary(new_snapshot.get("agent_pool"))
+                c_str = f"agent_pool: {old_desc} -> {new_desc}"
+                if not any(c.startswith("agent_pool:") for c in changes):
+                    changes.append(c_str)
+
+            if old_snapshot.get("default_model") != new_snapshot.get("default_model"):
+                c_str = f"default_model: {old_snapshot.get('default_model')} -> {new_snapshot.get('default_model')}"
+                if not any(c.startswith("default_model:") for c in changes):
+                    changes.append(c_str)
+
+            if old_snapshot.get("default_agent") != new_snapshot.get("default_agent"):
+                c_str = f"default_agent: {old_snapshot.get('default_agent')} -> {new_snapshot.get('default_agent')}"
+                if not any(c.startswith("default_agent:") for c in changes):
+                    changes.append(c_str)
 
             # 2. Reload themes
             theme_reload_ok = True
@@ -2823,6 +3032,7 @@ class OpsCloudApp(App):
 
             if hasattr(self, "_chat_input") and self._chat_input:
                 from opscloud.ui.command_registry import (
+                    build_agent_commands,
                     build_skill_commands,
                     build_workflow_commands,
                     get_all_entries,
@@ -2830,28 +3040,48 @@ class OpsCloudApp(App):
 
                 skill_commands = build_skill_commands(self._discovered_skills)
                 skill_commands.extend(build_workflow_commands(self._discovered_skills or []))
+                plugin_agents = self.get_discovered_plugin_agents()
+                self._discovered_plugin_agents = plugin_agents
+                skill_commands.extend(build_agent_commands(plugin_agents or []))
                 self._chat_input.update_slash_commands(get_all_entries(skill_commands))
 
             # 4. Compose initial report lines
+            report_lines = ["### Configuration Reloaded", ""]
             if changes:
-                report = "Configuration reloaded. Changes:\n" + "\n".join(
-                    f"  - {change}" for change in changes
+                report_lines.append("**Configuration reloaded. Changes:**")
+                report_lines.extend(f"  - `{change}`" for change in changes)
+            else:
+                report_lines.append("• **Configuration reloaded. No changes detected.**")
+
+            active_prof = new_snapshot.get("aws_profile") or (getattr(self._settings, "aws_profile", None) if self._settings else None) or "default"
+            active_reg = new_snapshot.get("aws_region") or (getattr(self._settings, "aws_region", None) if self._settings else None) or "us-east-1"
+            report_lines.append(f"• **AWS configuration:** profile `{active_prof}` ({active_reg})")
+
+            active_pool = new_snapshot.get("agent_pool")
+            if active_pool:
+                fast = active_pool.get("fast", "-")
+                std = active_pool.get("standard", "-")
+                pow_m = active_pool.get("powerful", "-")
+                prov = active_pool.get("provider", "multi")
+                report_lines.append(
+                    f"• **Agent model pool:** fast=`{fast}`, standard=`{std}`, powerful=`{pow_m}` (provider: {prov})"
                 )
             else:
-                report = "Configuration reloaded. No changes detected."
-            report += "\nModel config caches cleared."
+                report_lines.append("• **Agent model pool:** default dynamic routing")
+
+            report_lines.append("• **Model config caches cleared.**")
             if theme_reload_ok:
-                report += "\nTheme registry reloaded."
+                report_lines.append("• **Theme registry reloaded.**")
             else:
-                report += "\nTheme registry reload failed."
+                report_lines.append("• **Theme registry reload failed.**")
+
 
             if added_skills or removed_skills:
-                skill_lines = []
+                report_lines.append("• **Skills updated:**")
                 if added_skills:
-                    skill_lines.append(f"  - Added: {', '.join(added_skills)}")
+                    report_lines.append(f"  - **Added:** " + ", ".join(f"`{s}`" for s in added_skills))
                 if removed_skills:
-                    skill_lines.append(f"  - Removed: {', '.join(removed_skills)}")
-                report += "\nSkills updated:\n" + "\n".join(skill_lines)
+                    report_lines.append(f"  - **Removed:** " + ", ".join(f"`{s}`" for s in removed_skills))
 
             # 5. Discover plugins
             try:
@@ -2860,7 +3090,7 @@ class OpsCloudApp(App):
             except Exception:
                 logger.exception("Failed to discover plugins during /reload")
                 plugins = ()
-                report += "\nCouldn't read plugin state; run /reload to be safe."
+                report_lines.append("• ⚠ **Couldn't read plugin state; run /reload to be safe.**")
 
             plugin_count = len(plugins)
             mcp_configs = plugin_mcp_configs(plugins)
@@ -2872,14 +3102,14 @@ class OpsCloudApp(App):
             plugin_skill_count = sum(1 for name in new_skill_names if ":" in name)
             hook_count = sum(len(getattr(p.manifest, "hooks", ()) or ()) for p in plugins)
             separator = " · "
-            report += (
-                f"\nPlugins: {plugin_count} plugin"
+            report_lines.append(
+                f"• **Plugins: {plugin_count} plugin"
                 f"{'s' if plugin_count != 1 else ''}{separator}"
                 f"{plugin_skill_count} skill"
                 f"{'s' if plugin_skill_count != 1 else ''}{separator}"
                 f"{mcp_count} plugin MCP server"
                 f"{'s' if mcp_count != 1 else ''}{separator}"
-                f"{hook_count} hook{'s' if hook_count != 1 else ''}"
+                f"{hook_count} hook{'s' if hook_count != 1 else ''}**"
             )
 
             # 6. Restart owned server for plugin MCP
@@ -2900,29 +3130,32 @@ class OpsCloudApp(App):
                         self._sync_status_queued()
 
                 if restart_result.restarted:
-                    report += "\nAgent server restarted for plugin MCP."
+                    report_lines.append("• **Agent server restarted for plugin MCP.**")
                     if restart_result.mcp_status == "disabled":
-                        report += (
-                            "\nMCP is disabled for this session (--no-mcp); "
-                            "no servers were loaded."
+                        report_lines.append(
+                            "  _MCP is disabled for this session (--no-mcp); no servers were loaded._"
                         )
                     else:
-                        report += "\n" + _format_mcp_server_changes(
-                            old_mcp_server_info,
-                            restart_result.mcp_server_info,
-                            restart_result.mcp_error,
+                        report_lines.append(
+                            _format_mcp_server_changes(
+                                old_mcp_server_info,
+                                restart_result.mcp_server_info,
+                                restart_result.mcp_error,
+                            )
                         )
                 else:
-                    report += (
-                        "\nAgent server was not restarted; plugin MCP may be stale."
+                    report_lines.append(
+                        "• ⚠ **Agent server was not restarted; plugin MCP may be stale.**"
                     )
             elif self._server_kwargs is None:
-                report += (
-                    "\nMCP servers unchanged; this session uses a remote "
-                    "server and cannot reload MCP config."
+                report_lines.append(
+                    "• **MCP servers unchanged; this session uses a remote "
+                    "server and cannot reload MCP config.**"
                 )
 
-            await self._mount_message(SystemMessage(report))
+            report = "\n".join(report_lines)
+            from opscloud.ui.widgets.messages import CommandOutputMessage
+            await self._mount_message(CommandOutputMessage(report, command="/reload"))
         except Exception as exc:
             logger.exception("Detached /reload failed unexpectedly")
             await self._mount_message(
@@ -3637,20 +3870,37 @@ class OpsCloudApp(App):
         )
         return [dict(s) for s in skills]
 
+    def get_discovered_plugin_agents(self) -> list[dict[str, Any]]:
+        """Get list of discovered plugin subagents."""
+        from opscloud.config.settings import settings
+        from opscloud.plugins.adapters.agents import discover_plugin_subagents
+
+        project_root = (
+            getattr(self._settings, "project_root", None)
+            if hasattr(self, "_settings") and self._settings
+            else settings.project_root
+        )
+        agents = discover_plugin_subagents(project_root=project_root)
+        return [dict(a) for a in agents]
+
     async def _discover_startup_skills(self) -> None:
-        """Discover skills in the background on startup and populate autocomplete."""
+        """Discover skills and plugin agents in the background on startup and populate autocomplete."""
         try:
             skills = await asyncio.to_thread(self.get_discovered_skills)
             self._discovered_skills = skills
-            if skills and hasattr(self, "_chat_input") and self._chat_input:
+            plugin_agents = await asyncio.to_thread(self.get_discovered_plugin_agents)
+            self._discovered_plugin_agents = plugin_agents
+            if hasattr(self, "_chat_input") and self._chat_input:
                 from opscloud.ui.command_registry import (
+                    build_agent_commands,
                     build_skill_commands,
                     build_workflow_commands,
                     get_all_entries,
                 )
 
-                skill_commands = build_skill_commands(skills)
-                skill_commands.extend(build_workflow_commands(skills))
+                skill_commands = build_skill_commands(skills or [])
+                skill_commands.extend(build_workflow_commands(skills or []))
+                skill_commands.extend(build_agent_commands(plugin_agents or []))
                 self._chat_input.update_slash_commands(get_all_entries(skill_commands))
         except Exception as exc:
             logger.debug("Failed startup skill discovery: %s", exc)
@@ -3666,6 +3916,10 @@ class OpsCloudApp(App):
     async def set_default_model(self, model_name: str) -> None:
         """Set default model in settings."""
         self._model = model_name
+        self._manual_model = model_name
+        from opscloud.approval_mode import ApprovalMode
+        if getattr(self, "_approval_mode", ApprovalMode.MANUAL) is ApprovalMode.MANUAL:
+            await self._restore_manual_default_model()
 
     async def clear_default_model(self) -> None:
         """Clear default model setting."""
@@ -4245,6 +4499,15 @@ class OpsCloudApp(App):
         except NoMatches:
             pass
 
+    async def on_markdown_link_clicked(self, event: Any) -> None:
+        """Handle link clicks from any Markdown widget across the application."""
+        event.stop()
+        from opscloud.ui.widgets._links import open_link_or_file_async
+
+        href = getattr(event, "href", "")
+        if href:
+            await open_link_or_file_async(href, app=self, notify_on_success=True)
+
     # ── Global Actions ───────────────────────────────────
 
     def _cancel_worker(
@@ -4515,12 +4778,22 @@ class OpsCloudApp(App):
                 self.notify(f"{target.value.capitalize()} could not be persisted; remaining in Manual.", severity="warning")
                 return False
 
+        prev_mode = getattr(self, "_approval_mode", ApprovalMode.MANUAL)
         self._approval_mode = target
         self._auto_approve = False
         self._update_auto_mode_status_bar(target.value)
 
         if self._adapter:
             self._adapter._auto_approve = self._auto_approve
+
+        # When entering Smart mode, preserve the current manual model if not already smart-routed
+        if target is ApprovalMode.SMART:
+            if not getattr(self, "_smart_routed_active", False) and getattr(self, "_model", None):
+                self._manual_model = self._model
+        # When returning to Manual (or Auto) mode after Smart mode, restore the default model
+        elif target in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
+            if prev_mode is ApprovalMode.SMART or getattr(self, "_smart_routed_active", False):
+                await self._restore_manual_default_model()
 
         if target is ApprovalMode.AUTO:
             self.notify("Switched to Auto mode (Classic LLM).", severity="information", timeout=3)
@@ -4529,6 +4802,129 @@ class OpsCloudApp(App):
             self.notify("Switched to Smart mode (Jev System 1 Protected).", severity="information", timeout=3)
         elif target is ApprovalMode.MANUAL:
             self.notify("Switched to Manual approval mode.", severity="information", timeout=3)
+        return True
+
+    def _resolve_default_model_spec(self) -> str | None:
+        """Resolve the model specification to revert to when exiting smart mode.
+
+        Resolution precedence:
+        1. Explicitly configured default model in config.toml ([models].default).
+        2. Saved manual model from before entering/routing smart mode (self._manual_model).
+        3. Fallback default model from config.toml ([models].recent via load_default_model).
+        4. Auto-detected credential-based default model via _get_default_model_spec().
+        """
+        from opscloud.config.toml_config import read_config_toml, load_default_model
+
+        # 1. Check explicit [models].default first
+        try:
+            data = read_config_toml()
+            explicit_default = data.get("models", {}).get("default")
+            if isinstance(explicit_default, str) and explicit_default.strip():
+                return explicit_default.strip()
+        except Exception:
+            pass
+
+        # 2. Check saved manual model if available and not dynamic
+        manual_spec = getattr(self, "_manual_model", None)
+        if manual_spec and manual_spec not in ("auto", "dynamic"):
+            return manual_spec
+
+        # 3. Check load_default_model() (which falls back to [models].recent)
+        try:
+            recent_default = load_default_model()
+            if recent_default and recent_default not in ("auto", "dynamic"):
+                return recent_default
+        except Exception:
+            pass
+
+        # 4. Fallback to factory default model spec
+        try:
+            from opscloud.model.factory import _get_default_model_spec
+            settings_obj = getattr(self, "settings", None)
+            saved_name = getattr(settings_obj, "model_name", None) if settings_obj else None
+            if settings_obj and getattr(self, "_smart_routed_active", False):
+                settings_obj.model_name = None
+            try:
+                return _get_default_model_spec()
+            finally:
+                if settings_obj and settings_obj.model_name is None and saved_name:
+                    settings_obj.model_name = saved_name
+        except Exception:
+            return None
+
+    async def _restore_manual_default_model(self) -> bool:
+        """Restore active model and status bar to default model when exiting smart mode."""
+        default_spec = self._resolve_default_model_spec()
+        if not default_spec:
+            self._smart_routed_active = False
+            return False
+
+        from opscloud.model.config import apply_stored_credentials, resolve_model_context_limit
+        from opscloud.config.toml_config import load_effort_for_model
+        from opscloud.model.reasoning import default_effort_for_model
+        import os
+
+        provider = default_spec.split(":", 1)[0] if ":" in default_spec else ""
+        if provider:
+            apply_stored_credentials(provider)
+
+        os.environ["OPSCLOUD_SERVER_MODEL"] = default_spec
+        os.environ["OPSCLOUD_MODEL_NAME"] = default_spec
+        os.environ["OPSCODE_SERVER_MODEL"] = default_spec
+        os.environ["OPSCODE_MODEL_NAME"] = default_spec
+
+        self._model = default_spec
+        self._manual_model = default_spec
+        self._smart_routed_active = False
+
+        from opscloud.config.settings import get_settings
+        settings_obj = get_settings()
+        self._settings = settings_obj
+
+        if settings_obj is not None:
+            settings_obj.model = default_spec
+            settings_obj.model_name = default_spec
+            if provider:
+                settings_obj.model_provider = provider
+
+        # Resolve effort
+        eff_val = load_effort_for_model(default_spec) or default_effort_for_model(default_spec) or ""
+        eff_display: str = eff_val if eff_val else ""
+        self._reasoning_effort = eff_val or None
+        if settings_obj is not None:
+            settings_obj.reasoning_effort = eff_val or None
+
+        if eff_val:
+            os.environ["OPSCLOUD_REASONING_EFFORT"] = eff_val
+            os.environ["OPSCODE_REASONING_EFFORT"] = eff_val
+        else:
+            os.environ.pop("OPSCLOUD_REASONING_EFFORT", None)
+            os.environ.pop("OPSCODE_REASONING_EFFORT", None)
+
+        # Context limit
+        ctx_limit = resolve_model_context_limit(default_spec)
+        if ctx_limit and settings_obj is not None:
+            settings_obj.model_context_limit = ctx_limit
+
+        # Update status bar & banner
+        try:
+            status_bar = getattr(self, "_status_bar", None) or self.query_one("#status-bar", StatusBar)
+            _prov, _mdl = _split_model_spec(default_spec)
+            status_bar.set_model(provider=_prov, model=_mdl, effort=eff_display)
+            if ctx_limit:
+                status_bar.set_context_limit(ctx_limit)
+        except Exception:
+            pass
+
+        try:
+            self._sync_banner_model(default_spec, eff_display)
+        except Exception:
+            pass
+
+        server_kwargs = getattr(self, "_server_kwargs", None)
+        if isinstance(server_kwargs, dict):
+            server_kwargs["model_name"] = default_spec
+
         return True
 
     def _notify_auto_mode_enabled_once(self) -> None:
@@ -4912,14 +5308,15 @@ class OpsCloudApp(App):
         screen = CloudProfileSelectorScreen(current_profile=current_profile)
 
         def _on_cloud_selected(result: tuple[str, str | None] | None) -> None:
-            if not result:
-                return
-            profile, region = result
-            self.run_worker(
-                self._switch_cloud_profile(profile, region=region),
-                exclusive=False,
-                group="cloud-switch",
-            )
+            if result:
+                profile, region = result
+                self.run_worker(
+                    self._switch_cloud_profile(profile, region=region),
+                    exclusive=False,
+                    group="cloud-switch",
+                )
+            elif getattr(screen, "_mutated", False):
+                self._schedule_reload()
 
         self.push_screen(screen, _on_cloud_selected)
 
@@ -4935,7 +5332,31 @@ class OpsCloudApp(App):
         settings_obj = getattr(self, "_settings", None)
         if settings_obj is not None:
             settings_obj.aws_profile = profile
-            settings_obj.aws_region = effective_region or "us-east-1"
+            if effective_region:
+                settings_obj.aws_region = effective_region
+            settings_obj.export_to_environment()
+
+        os.environ["OPSCLOUD_SERVER_AWS_PROFILE"] = profile
+        if effective_region:
+            os.environ["OPSCLOUD_SERVER_AWS_REGION"] = effective_region
+
+        if self._server_kwargs is not None:
+            self._server_kwargs["aws_profile"] = profile
+            if effective_region:
+                self._server_kwargs["aws_region"] = effective_region
+
+        if self._server_proc is not None:
+            try:
+                from dataclasses import is_dataclass, replace
+                cur_cfg = getattr(self._server_proc, "config", None)
+                updates: dict[str, Any] = {"aws_profile": profile}
+                if effective_region:
+                    updates["aws_region"] = effective_region
+                if cur_cfg is not None and is_dataclass(cur_cfg):
+                    self._server_proc.config = replace(cast(Any, cur_cfg), **updates)
+            except Exception:
+                logger.debug("Could not update server process config with active cloud profile", exc_info=True)
+
 
         # Update status bar & welcome banner
         self._sync_status_cloud()
@@ -4947,6 +5368,7 @@ class OpsCloudApp(App):
                 "(saved to `config.toml` — active across all sessions)."
             )
         )
+        self._schedule_reload()
 
     # ── Screen Stack Safety ───────────────────────────────
 
@@ -5182,6 +5604,7 @@ class OpsCloudApp(App):
                 status_bar.set_model(provider="typesafe", model="jev-router", effort="auto")
             except NoMatches:
                 pass
+            self._sync_banner_model("typesafe:jev-router", "auto")
             await self._mount_message(
                 SystemMessage("Switched to **Autonomous Tier Routing (TypeSafe Jev System 1)**.")
             )
@@ -5197,10 +5620,16 @@ class OpsCloudApp(App):
         os.environ["OPSCODE_SERVER_MODEL"] = spec
         os.environ["OPSCODE_MODEL_NAME"] = spec
         self._model = spec
+        from opscloud.approval_mode import ApprovalMode
+        if getattr(self, "_approval_mode", ApprovalMode.MANUAL) is not ApprovalMode.SMART:
+            self._manual_model = spec
+        self._smart_routed_active = False
         settings_obj = getattr(self, "settings", None)
         if settings_obj:
             settings_obj.model = spec
             settings_obj.model_name = spec
+            if provider:
+                settings_obj.model_provider = provider
         if effort is not None:
             self._reasoning_effort = effort
             os.environ["OPSCLOUD_REASONING_EFFORT"] = effort
@@ -5220,6 +5649,7 @@ class OpsCloudApp(App):
             status_bar = self.query_one("#status-bar", StatusBar)
             _prov, _mdl = _split_model_spec(spec)
             status_bar.set_model(provider=_prov, model=_mdl, effort=eff_display)
+            self._sync_banner_model(spec, eff_display)
             from opscloud.model.config import resolve_model_context_limit
 
             _ctx_limit = resolve_model_context_limit(spec)
@@ -5318,6 +5748,7 @@ class OpsCloudApp(App):
                         SystemMessage("Agent model pool cleared. Reverted to automatic dynamic discovery.")
                     )
                 )
+                self._schedule_reload()
                 return
 
             fast = result.get("fast", "")
@@ -5339,6 +5770,7 @@ class OpsCloudApp(App):
                 f"In smart mode, Jev dynamically routes requests across these pool models."
             )
             self.run_worker(self._mount_message(SystemMessage(msg)))
+            self._schedule_reload()
 
         self.push_screen(screen, _on_pool_selected)
 
@@ -5362,6 +5794,7 @@ class OpsCloudApp(App):
                 from opscloud.model.reasoning import default_effort_for_model
                 def_eff = default_effort_for_model(model_spec) or ""
                 sb.set_model(provider=_prov, model=_mdl, effort=def_eff)
+                self._sync_banner_model(model_spec, def_eff)
             except Exception:
                 pass
             await self._mount_message(SystemMessage(f"Reasoning effort override cleared for `{model_spec}`."))
@@ -5379,22 +5812,44 @@ class OpsCloudApp(App):
             sb.set_model(provider=_prov, model=_mdl, effort=effort)
         except Exception:
             pass
+        self._sync_banner_model(model_spec, effort)
 
         await self._mount_message(SystemMessage(f"Reasoning effort for `{model_spec}` set to `{effort}`."))
 
     # ── Agent Selector Integration ────────────────────────
 
     async def _show_agent_selector(self) -> None:
-        """Open the interactive agent picker modal."""
-        from opscloud.agent.config import get_available_agent_names, load_default_agent
+        """Open the interactive agent picker modal with plugin subagents."""
+        from opscloud.commands.power.agents import get_agent_session_state
+        current_state = get_agent_session_state(self)
+        current_agent = current_state.short_name or current_state.agent_id
 
-        agent_names = get_available_agent_names()
-        default_agent = load_default_agent()
+        plugin_agents = self.get_discovered_plugin_agents()
+        agent_names: list[str] = []
+        for a in plugin_agents:
+            raw_name = a.get("name") or ""
+            short = raw_name.rsplit(":", 1)[-1]
+            if "@" in short:
+                short = short.split("@", 1)[0]
+            if short and short not in agent_names:
+                agent_names.append(short)
+
+        is_plugin_picker = bool(agent_names)
+
+        if not agent_names:
+            from opscloud.agent.config import get_available_agent_names, load_default_agent
+            agent_names = get_available_agent_names()
+            default_agent = load_default_agent()
+        else:
+            default_agent = None
 
         def _on_agent_selected(result: str | None) -> None:
             """Callback when the agent selector is dismissed."""
-            if result is not None and result != self._assistant_id:
-                self._switch_agent(result)
+            if result is not None:
+                if is_plugin_picker:
+                    asyncio.create_task(self._activate_selected_agent(result))
+                elif result != self._assistant_id:
+                    self._switch_agent(result)
             # Refocus input
             if self._chat_input:
                 self._chat_input.focus()
@@ -5402,11 +5857,22 @@ class OpsCloudApp(App):
         from opscloud.ui.widgets.agent_selector import AgentSelectorScreen
 
         screen = AgentSelectorScreen(
-            current_agent=self._assistant_id,
+            current_agent=current_agent or self._assistant_id,
             agent_names=agent_names,
             default_agent=default_agent,
         )
         self.push_screen(screen, _on_agent_selected)
+
+    async def _activate_selected_agent(self, agent_name: str, prompt: str = "") -> None:
+        """Activate a plugin agent persona session."""
+        from opscloud.commands._base import CommandContext
+        from opscloud.commands.power.agents import activate_agent_session
+        from opscloud.ui.widgets.messages import CommandOutputMessage
+
+        ctx = CommandContext(app=self, raw_command=f"/agent:{agent_name}", args=agent_name)
+        res = await activate_agent_session(ctx, agent_name, prompt=prompt)
+        if res.message:
+            await self._mount_message(CommandOutputMessage(res.message, command=f"/agent:{agent_name}"))
 
     def _switch_agent(self, agent_name: str) -> None:
         """Switch to a different agent and start a new thread.
@@ -5468,17 +5934,85 @@ class OpsCloudApp(App):
 
     # ── Plugin Manager ───────────────────────────────────
 
+    def _snapshot_plugin_state(self) -> tuple[frozenset[str], dict[str, Any]]:
+        """Snapshot enabled plugin ids and installed plugin metadata for change detection."""
+        from opscloud.plugins.store import (
+            load_all_enabled_plugin_ids,
+            load_installed_plugins,
+            load_marketplace_records,
+        )
+
+        project_root = getattr(self._settings, "project_root", None) if self._settings else None
+        p_root = Path(project_root) if project_root else None
+        enabled = load_all_enabled_plugin_ids(project_root=p_root)
+        installed = {
+            k: (v.scope, v.install_path)
+            for k, v in load_installed_plugins(project_root=p_root).items()
+        }
+        marketplaces = {
+            k: v.source
+            for k, v in load_marketplace_records(project_root=p_root).items()
+        }
+        return enabled, {"installed": installed, "marketplaces": marketplaces}
+
+    async def _check_plugin_manager_changes(
+        self,
+        baseline_enabled: frozenset[str],
+        baseline_meta: dict[str, Any],
+    ) -> bool | None:
+        """Check whether plugin state changed while the manager was open."""
+        try:
+            curr_enabled, curr_meta = await asyncio.to_thread(self._snapshot_plugin_state)
+            return curr_enabled != baseline_enabled or curr_meta != baseline_meta
+        except Exception:
+            logger.exception("Failed to snapshot plugin state while closing manager")
+            return None
+
     async def _show_plugin_manager(self) -> None:
         """Push the plugin manager modal screen for /plugins."""
-        from opscloud.ui.widgets.plugin_manager import PluginManagerScreen
+        from opscloud.plugins.store import load_all_enabled_plugin_ids
+        from opscloud.ui.widgets.plugin_manager import (
+            PluginManagerResult,
+            PluginManagerScreen,
+        )
+
+        try:
+            baseline = await asyncio.to_thread(self._snapshot_plugin_state)
+        except Exception:
+            logger.exception("Failed to snapshot plugin state before opening manager")
+            baseline = None
+
+        async def check_changes() -> bool | None:
+            if baseline is None:
+                return None
+            baseline_enabled, baseline_meta = baseline
+            return await self._check_plugin_manager_changes(baseline_enabled, baseline_meta)
+
+        def on_close(result: PluginManagerResult) -> None:
+            if result in ("reload", "later"):
+                self._schedule_reload()
+            elif result == "check_failed":
+                from opscloud.ui.widgets.messages import SystemMessage
+
+                self.run_worker(
+                    self._mount_message(
+                        SystemMessage("Could not verify plugin changes. Run `/reload` to apply.")
+                    ),
+                    exclusive=False,
+                )
 
         mcp_info = self.get_mcp_servers() if hasattr(self, "get_mcp_servers") else ()
         project_root = getattr(self._settings, "project_root", None) if self._settings else None
+        p_root = Path(project_root) if project_root else None
+        loaded_ids = load_all_enabled_plugin_ids(project_root=p_root)
+
         screen = PluginManagerScreen(
             mcp_server_info=mcp_info,
-            project_root=project_root,
+            loaded_plugin_ids=loaded_ids,
+            project_root=p_root,
+            check_reload_required=check_changes,
         )
-        self.push_screen(screen)
+        self.push_screen(screen, on_close)
 
     # ── Skills Viewer ────────────────────────────────────
 
@@ -5642,6 +6176,88 @@ class OpsCloudApp(App):
         GoalHandler._sync_status_rubric(self, state)
         self._focus_chat_input_after_refresh()
 
+    # ── Agent Persona Session (/agent) ───────────────────
+    #
+    # Plugin subagents run in an isolated session agent inside the server graph;
+    # the TUI submits typed requests and mirrors AgentSessionState.
+
+    async def _run_agent_session_request(self, request: dict[str, Any]) -> None:
+        """Submit one typed agent session request through the normal agent stream."""
+        if not self._adapter or not self._adapter.connected:
+            await self._mount_message(ErrorMessage("Agent sessions require a connected server."))
+            return
+        from opscloud.commands.power.agents import get_agent_session_state
+
+        state = get_agent_session_state(self)
+        state.thread_id = self._agent_thread_id
+        kind = request.get("kind")
+
+        # Pure activation without a prompt: AgentSessionState is already updated in memory;
+        # bypass running an empty server graph turn to prevent app locking and queuing lag.
+        if kind == "start" and not request.get("prompt"):
+            return
+
+        if kind == "clear":
+            spinner = "Detaching agent"
+        else:
+            name = state.short_name or "Agent"
+            spinner = f"Thinking ({name})"
+        self._agent_turn_started = False
+        self._agent_running = True
+        await self._set_spinner(spinner)
+        prompt_text = str(request.get("message") or request.get("prompt") or "")
+        self._agent_worker = self.run_worker(
+            self._run_agent_task(
+                prompt_text,
+                graph_input={
+                    "messages": [],
+                    "agent_session_request": request,
+                },
+            ),
+            exclusive=False,
+        )
+
+    async def _maybe_continue_agent_session(self, message: str) -> bool:
+        """Route plain chat input to an active, attached plugin agent session.
+
+        Returns:
+            Whether the message was consumed by the active agent.
+        """
+        from opscloud.commands.power.agents import get_agent_session_state
+        from opscloud.input import parse_file_mentions
+        from opscloud.ui.textual_adapter import _read_mentioned_file
+
+        state = get_agent_session_state(self)
+        if state.thread_id not in {None, self._agent_thread_id}:
+            state.clear()
+            return False
+        if not state.accepts_replies:
+            return False
+
+        prompt_text, mentioned_files = parse_file_mentions(message)
+        max_embed_bytes = 256 * 1024
+        if mentioned_files:
+            context_parts = [prompt_text, "\n\n## Referenced Files\n"]
+            for file_path in mentioned_files:
+                try:
+                    part = _read_mentioned_file(file_path, max_embed_bytes)
+                    context_parts.append(part)
+                except Exception as e:
+                    context_parts.append(f"\n### {file_path.name}\n[Error reading file: {e}]")
+            final_content = "\n".join(context_parts)
+        else:
+            final_content = prompt_text
+
+        await self._run_agent_session_request(
+            {
+                "kind": "continue",
+                "request_id": str(uuid.uuid4()),
+                "agent_name": state.agent_id,
+                "message": final_content,
+            }
+        )
+        return True
+
     # ── Workflow (/workflow) ─────────────────────────────
     #
     # Workflows run in an isolated workflow agent inside the server graph;
@@ -5736,14 +6352,14 @@ class OpsCloudApp(App):
 
         label = f"`{state.name}`" if state.name else "Workflow"
         if state.status == "complete":
-            body = f"✓ Workflow {label} complete."
+            body = f"Workflow {label} complete."
             if state.note:
                 body += f"\n\n{state.note}"
             if state.artifacts:
                 body += "\n\n**Artifacts:**\n" + "\n".join(f"- `{a}`" for a in state.artifacts)
             await self._mount_message(AppMessage(body))
         elif state.status == "blocked":
-            body = f"⚠ Workflow {label} needs your input."
+            body = f"Workflow {label} needs your input."
             if state.note:
                 body += f"\n\n{state.note}"
             body += "\n\nReply to continue, or `/workflow cancel`."
@@ -5865,6 +6481,15 @@ class OpsCloudApp(App):
         self._exit = True
         self._pending_messages.clear()
         self._queued_widgets.clear()
+        # Cancel any active restart tasks so they cannot spawn servers post-exit (IA-07)
+        for task in list(self._server_restart_tasks):
+            if not task.done():
+                task.cancel()
+        # Cancel background workers (including server-startup)
+        try:
+            self.workers.cancel_all()
+        except Exception:
+            pass
         if self._adapter:
             self._adapter.cancel()
         if self._server_proc is not None:
@@ -5876,6 +6501,39 @@ class OpsCloudApp(App):
         if result is None:
             result = self._agent_thread_id
         super().exit(result=result, return_code=return_code, message=message)
+
+    async def on_unmount(self) -> None:
+        """Asynchronous shutdown coordinator ensuring lifecycle tasks and processes are drained (DV-05, DV-10)."""
+        self._exit = True
+        # 1. Drain and await restart tasks
+        pending_restart = [t for t in list(self._server_restart_tasks) if not t.done()]
+        for t in pending_restart:
+            t.cancel()
+        if pending_restart:
+            await asyncio.gather(*pending_restart, return_exceptions=True)
+        self._server_restart_tasks.clear()
+
+        # 2. Drain adapter maintenance and cancel in-flight stream
+        if self._adapter:
+            try:
+                self._adapter.cancel()
+                await self._adapter.drain_maintenance(timeout=1.5)
+            except Exception:
+                pass
+
+        # 3. Explicitly close remote client connection pool (DV-10)
+        if self._client and hasattr(self._client, "aclose"):
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+
+        # 4. Stop server process
+        if self._server_proc is not None:
+            try:
+                self._server_proc.stop()
+            except Exception:
+                pass
 
     def action_quit_app(self) -> None:
         self.exit()

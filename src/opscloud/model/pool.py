@@ -484,6 +484,15 @@ def get_model_pool_manager() -> DynamicModelPoolManager:
     return _GLOBAL_POOL_MANAGER
 
 
+def clear_pool_caches() -> None:
+    """Clear cached model instances and reset the global pool manager."""
+    global _GLOBAL_POOL_MANAGER
+    if _GLOBAL_POOL_MANAGER is not None:
+        with _GLOBAL_POOL_MANAGER._lock:
+            _GLOBAL_POOL_MANAGER._instances.clear()
+    _GLOBAL_POOL_MANAGER = None
+
+
 __all__ = [
     "DEFAULT_ROUTE_CRITERIA",
     "DynamicModelPoolManager",
@@ -494,5 +503,6 @@ __all__ = [
     "SUBAGENT_ROUTE_CRITERIA",
     "TIER_TO_ROUTE_MAP",
     "TierResolution",
+    "clear_pool_caches",
     "get_model_pool_manager",
 ]

@@ -8,13 +8,29 @@ LangChain message objects for TextualAdapter.
 from __future__ import annotations
 
 import asyncio
-from opscloud.utils.logger import get_logger
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, Callable
+
+import httpx
+
+from opscloud.utils.logger import get_logger
+
+from dataclasses import dataclass, field
 
 logger = get_logger(__name__)
 
 _RUN_CANCEL_WAIT_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class CancellationResult:
+    """Structured outcome of run cancellation on a thread (DV-09)."""
+
+    success: bool
+    cancelled_run_ids: tuple[str, ...] = ()
+    failed_run_ids: tuple[str, ...] = ()
+    terminal_statuses: dict[str, str] = field(default_factory=dict)
+    error: str | None = None
 
 
 def normalize_thread_id(thread_id: str | None) -> str:
@@ -116,16 +132,36 @@ class RemoteAgent:
         self._api_key = api_key
         self._headers = dict(headers or {})
         self._graph: Any = None
+        self._active_run_id: str | None = None
+
+    async def aclose(self) -> None:
+        """Explicitly close SDK client and underlying httpx connection pool (DV-10)."""
+        graph = self._graph
+        self._graph = None
+        if graph is not None and hasattr(graph, "_validate_client"):
+            try:
+                client = graph._validate_client()
+                if hasattr(client, "http") and hasattr(client.http, "aclose"):
+                    await client.http.aclose()
+            except Exception:
+                pass
 
     def _get_graph(self) -> Any:
         if self._graph is None:
+            from langgraph_sdk import get_client
             from langgraph.pregel.remote import RemoteGraph
 
-            self._graph = RemoteGraph(
-                self._graph_name,
+            # Timeout tuple conforming to langgraph_sdk.client.TimeoutTypes:
+            # (connect, read, write, pool) in seconds
+            client = get_client(
                 url=self._url,
                 api_key=self._api_key,
                 headers=self._headers if self._headers else None,
+                timeout=(10.0, 600.0, 300.0, 10.0),
+            )
+            self._graph = RemoteGraph(
+                self._graph_name,
+                client=client,
             )
         return self._graph
 
@@ -143,7 +179,6 @@ class RemoteAgent:
 
         _require_thread_id(config)
 
-        graph = self._get_graph()
         prepared_config = _prepare_config(config)
 
         # In LangGraph 0.6.0+, runs reject specifying both `configurable` (with non-thread_id keys)
@@ -177,45 +212,79 @@ class RemoteAgent:
 
             ACTIVE_SESSION_THREAD_ID.set(str(active_tid))
 
-        async for raw_item in graph.astream(
-            input,
-            stream_mode=stream_mode or ["messages", "updates"],
-            subgraphs=subgraphs,
-            config=prepared_config,
-            context=stream_context,
-        ):
-            parsed = _parse_stream_item(raw_item)
-            if parsed is None:
-                continue
-            ns, mode, data = parsed
+        # DV-09: Register on_run_created callback to capture active_run_id immediately upon creation
+        def _on_run_created(run_meta: Any) -> None:
+            rid = getattr(run_meta, "run_id", None) or (run_meta.get("run_id") if isinstance(run_meta, dict) else None)
+            if rid:
+                self._active_run_id = str(rid)
+                logger.debug("Captured active run_id on creation: %s", self._active_run_id)
 
-            logger.debug("RemoteGraph event ns=%s mode=%s data_type=%s", ns, mode, type(data).__name__)
+        stream_kwargs: dict[str, Any] = {
+            "on_run_created": _on_run_created,
+        }
+        if durability is not None:
+            stream_kwargs["durability"] = durability
 
-            if mode == "messages":
-                msg_dict, meta = data if isinstance(data, tuple) else (data, {})
-                if isinstance(msg_dict, dict):
-                    msg_obj = _convert_message_data(msg_dict)
-                    if msg_obj is not None:
-                        yield (ns, "messages", (msg_obj, meta or {}))
+        graph = self._get_graph()
+        try:
+            async for raw_item in graph.astream(
+                input,
+                stream_mode=stream_mode or ["messages", "updates"],
+                subgraphs=subgraphs,
+                config=prepared_config,
+                context=stream_context,
+                **stream_kwargs,
+            ):
+                parsed = _parse_stream_item(raw_item)
+                if parsed is None:
+                    continue
+                ns, mode, data = parsed
+
+                logger.debug("RemoteGraph event ns=%s mode=%s data_type=%s", ns, mode, type(data).__name__)
+
+                if mode == "messages":
+                    msg_dict, meta = data if isinstance(data, tuple) else (data, {})
+                    if isinstance(meta, dict) and meta.get("run_id"):
+                        self._active_run_id = str(meta["run_id"])
+                    if isinstance(msg_dict, dict):
+                        msg_obj = _convert_message_data(msg_dict)
+                        if msg_obj is not None:
+                            yield (ns, "messages", (msg_obj, meta or {}))
+                        else:
+                            dropped_count += 1
+                    elif isinstance(msg_dict, BaseMessage):
+                        yield (ns, "messages", (msg_dict, meta or {}))
                     else:
-                        dropped_count += 1
-                elif isinstance(msg_dict, BaseMessage):
-                    yield (ns, "messages", (msg_dict, meta or {}))
-                else:
-                    logger.warning("Unexpected message data type in stream: %s", type(msg_dict).__name__)
-                continue
+                        logger.warning("Unexpected message data type in stream: %s", type(msg_dict).__name__)
+                    continue
 
-            if mode == "updates" and isinstance(data, dict):
-                update_data = data
-                if "__interrupt__" in data:
-                    update_data = {
-                        **data,
-                        "__interrupt__": _convert_interrupts(data["__interrupt__"]),
-                    }
-                yield (ns, "updates", update_data)
-                continue
+                if mode == "updates" and isinstance(data, dict):
+                    update_data = data
+                    if "__interrupt__" in data:
+                        update_data = {
+                            **data,
+                            "__interrupt__": _convert_interrupts(data["__interrupt__"]),
+                        }
+                    yield (ns, "updates", update_data)
+                    continue
 
-            yield (ns, mode, data)
+                yield (ns, mode, data)
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            old_graph = self._graph
+            self._graph = None  # Reset client connection pool
+            if old_graph is not None and hasattr(old_graph, "_validate_client"):
+                try:
+                    c = old_graph._validate_client()
+                    if hasattr(c, "http") and hasattr(c.http, "aclose"):
+                        await c.http.aclose()
+                except Exception:
+                    pass
+            logger.error(
+                "Remote stream transport/timeout failure (%s: %s). Input re-submission suppressed to prevent duplicate tool execution.",
+                type(exc).__name__,
+                exc,
+            )
+            raise
 
         if dropped_count:
             logger.warning("Dropped %d message(s) during stream due to conversion failures", dropped_count)
@@ -236,17 +305,20 @@ class RemoteAgent:
                 return None
             raise
 
-    async def acancel_active_runs(self, config: dict[str, Any]) -> None:
-        """Cancel any in-flight runs on the thread so the server is not left busy."""
+    async def acancel_active_runs(self, config: dict[str, Any]) -> CancellationResult:
+        """Cancel any in-flight runs on the thread, keeping active_run_id until terminal state confirmed (DV-09)."""
         thread_id = _require_thread_id(config)
         graph = self._get_graph()
         try:
             client = graph._validate_client()
-        except Exception:
+        except Exception as exc:
             logger.debug("Failed to get SDK client to cancel runs for thread %s", thread_id, exc_info=True)
-            return
+            return CancellationResult(success=False, cancelled_run_ids=(), failed_run_ids=(), error=str(exc))
 
         run_ids: set[str] = set()
+        if self._active_run_id:
+            run_ids.add(self._active_run_id)
+
         for status in ("running", "pending"):
             try:
                 runs = await client.runs.list(thread_id, status=status, limit=10)
@@ -273,7 +345,12 @@ class RemoteAgent:
                 pass
 
         if not run_ids:
-            return
+            self._active_run_id = None
+            return CancellationResult(success=True, cancelled_run_ids=(), failed_run_ids=(), terminal_statuses={})
+
+        cancelled_ids: list[str] = []
+        failed_ids: list[str] = []
+        terminal_statuses: dict[str, str] = {}
 
         async def _cancel_one(run_id: str) -> None:
             try:
@@ -281,10 +358,35 @@ class RemoteAgent:
                     client.runs.cancel(thread_id, run_id, wait=True, action="interrupt"),
                     timeout=_RUN_CANCEL_WAIT_SECONDS,
                 )
+            except Exception as exc:
+                logger.warning("Cancellation wait failed for run %s on thread %s: %s", run_id, thread_id, exc)
+
+            try:
+                info = await client.runs.get(thread_id, run_id)
+                st = info.get("status") if isinstance(info, dict) else getattr(info, "status", "")
+                st = str(st).lower()
+                terminal_statuses[run_id] = st
+                if st in ("interrupted", "cancelled", "error", "success"):
+                    cancelled_ids.append(run_id)
+                else:
+                    failed_ids.append(run_id)
             except Exception:
-                pass
+                failed_ids.append(run_id)
 
         await asyncio.gather(*(_cancel_one(rid) for rid in set(run_ids)))
+
+        # DV-09: Only clear _active_run_id if it was confirmed terminal
+        if self._active_run_id:
+            if self._active_run_id in cancelled_ids:
+                self._active_run_id = None
+
+        all_ok = len(failed_ids) == 0
+        return CancellationResult(
+            success=all_ok,
+            cancelled_run_ids=tuple(cancelled_ids),
+            failed_run_ids=tuple(failed_ids),
+            terminal_statuses=terminal_statuses,
+        )
 
     async def aupdate_state(
         self,

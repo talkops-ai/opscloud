@@ -111,7 +111,7 @@ class PoolHandler(BaseCommandHandler):
                 warnings = []
                 for p in provs:
                     if has_provider_credentials(p) is False:
-                        warnings.append(f"⚠️ Notice: Credentials for provider '{p}' are not configured.")
+                        warnings.append(f"Notice: Credentials for provider '{p}' are not configured.")
                 warn_msg = ("\n\n" + "\n".join(warnings)) if warnings else ""
 
                 return CommandResult(

@@ -42,8 +42,11 @@ from opscloud.utils.logger import (
 )
 
 
-def test_default_log_paths():
+def test_default_log_paths(monkeypatch):
     """Default log directory and file point to /tmp/opscloud_logs."""
+    monkeypatch.delenv("OPSCLOUD_LOG_DIR", raising=False)
+    monkeypatch.delenv("OPSCLOUD_LOG_DIRECTORY", raising=False)
+    monkeypatch.delenv("OPSCLOUD_LOG_FILE", raising=False)
     assert resolve_log_dir() == DEFAULT_LOG_DIR
     assert resolve_log_file() == DEFAULT_LOG_DIR / DEFAULT_LOG_FILE
 

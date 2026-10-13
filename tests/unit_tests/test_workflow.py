@@ -333,3 +333,27 @@ def test_workflow_state_reply_routing() -> None:
     assert not state.accepts_replies and not state.is_open
     state.clear()
     assert state.status is None and state.attached
+
+
+def test_create_workflow_agent_no_duplicate_middleware(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+    from deepagents.backends import FilesystemBackend
+    from opscloud.workflows.agent import create_workflow_agent
+
+    backend = FilesystemBackend()
+    model = MagicMock()
+    agent = create_workflow_agent(
+        model=model,
+        backend=backend,
+        tools=[],
+        worktree_root=tmp_path,
+        assistant_id="opscloud",
+        interactive=True,
+        auto_approve=False,
+        shell_allow_list=["ls"],
+        interrupt_on={"execute": True},
+        mcp_server_info=[{"name": "test"}],
+        mcp_config={"test": {}},
+        mcp_tools=[MagicMock(name="mcp_tool")],
+    )
+    assert agent is not None

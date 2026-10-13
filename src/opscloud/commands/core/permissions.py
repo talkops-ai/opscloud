@@ -9,14 +9,13 @@ from __future__ import annotations
 
 from opscloud.utils.logger import get_logger
 
+from typing import TYPE_CHECKING
+
 from opscloud.commands._base import BaseCommandHandler, CommandContext, CommandResult
 from opscloud.commands._types import BypassTier, CommandCategory, SafetyLevel
-from opscloud.ui.permission_store import (
-    PERMISSION_MODES,
-    PermissionStore,
-    VALID_SCOPES,
-    save_permission_store,
-)
+
+if TYPE_CHECKING:
+    from opscloud.ui.permission_store import PermissionStore
 
 logger = get_logger(__name__)
 
@@ -48,6 +47,8 @@ class PermissionsHandler(BaseCommandHandler):
         return BypassTier.IMMEDIATE_UI
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
+        from opscloud.ui.permission_store import PERMISSION_MODES, VALID_SCOPES
+
         parts = ctx.args.strip().split(maxsplit=1)
         sub = parts[0].lower() if parts and parts[0] else "show"
 
@@ -98,6 +99,8 @@ class PermissionsHandler(BaseCommandHandler):
 
     def _show_text_fallback(self, ctx: CommandContext) -> CommandResult:
         """Text-only fallback when no app context is available."""
+        from opscloud.ui.permission_store import VALID_SCOPES
+
         store = _get_store(ctx)
         if store is None:
             return CommandResult(success=False, message="Permission store not available.")
@@ -156,6 +159,8 @@ class PermissionsHandler(BaseCommandHandler):
 
     def _set_mode(self, ctx: CommandContext, mode_name: str) -> CommandResult:
         """Set a permission mode preset."""
+        from opscloud.ui.permission_store import PERMISSION_MODES
+
         store = _get_store(ctx)
         if store is None:
             return CommandResult(success=False, message="Permission store not available (no app context).")
@@ -173,6 +178,8 @@ class PermissionsHandler(BaseCommandHandler):
 
     def _show_mode(self, ctx: CommandContext) -> CommandResult:
         """Show current permission mode and available modes."""
+        from opscloud.ui.permission_store import PERMISSION_MODES
+
         store = _get_store(ctx)
         if store is None:
             return CommandResult(success=False, message="Permission store not available (no app context).")
@@ -187,6 +194,8 @@ class PermissionsHandler(BaseCommandHandler):
     @staticmethod
     def _persist(store: PermissionStore) -> None:
         """Save permission state to disk."""
+        from opscloud.ui.permission_store import save_permission_store
+
         try:
             save_permission_store(store)
         except Exception:

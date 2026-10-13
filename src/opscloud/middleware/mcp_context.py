@@ -117,10 +117,30 @@ class MCPContextMiddleware(AgentMiddleware):
         self._server_info = list(mcp_server_info) if mcp_server_info else []
         self._config = mcp_config or {}
 
+    def _get_applicable_server_infos(self) -> list[Any]:
+        """Filter server infos to only those declared in config, if config is present."""
+        if not self._server_info:
+            return []
+        if not self._config:
+            return self._server_info
+        raw_servers = (
+            self._config.get("mcpServers")
+            or self._config.get("mcp_servers")
+            or self._config
+        )
+        if not isinstance(raw_servers, dict):
+            return self._server_info
+        allowed_names = set(raw_servers.keys())
+        return [
+            s for s in self._server_info
+            if getattr(s, "name", str(s)) in allowed_names
+        ]
+
     def _build_mcp_context(self) -> str:
         """Build MCP context string — prefers MCPServerInfo, falls back to config."""
-        if self._server_info:
-            return _build_mcp_context_from_infos(self._server_info)
+        applicable = self._get_applicable_server_infos()
+        if applicable:
+            return _build_mcp_context_from_infos(applicable)
         if self._config:
             return _build_mcp_context_from_config(self._config)
         return ""

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 from opscloud.utils.logger import get_logger
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from rich.markup import escape
 from textual import events, on
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.content import Content
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static, TextArea
+
+from opscloud.ui.widgets.modal_base import OpsModalScreen
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
@@ -43,6 +47,68 @@ _SHELL_COMMAND_TRUNCATE_LENGTH: int = 120
 _SHELL_COMMAND_TRUNCATE_LINES: int = 5
 _WARNING_PREVIEW_LIMIT: int = 3
 _WARNING_TEXT_TRUNCATE_LENGTH: int = 220
+
+_DESTRUCTIVE_PATTERN = re.compile(
+    r"\b(rm\s+-rf|rm\s+-r|rm|destroy|drop\s+database|drop\s+table|drop|delete|terminate)\b",
+    re.IGNORECASE,
+)
+
+
+def get_target_context_pill(
+    *,
+    aws_profile: str = "",
+    aws_region: str = "",
+    k8s_context: str = "",
+    tf_workspace: str = "",
+) -> str:
+    """Build a compact target context pill, e.g. '[aws: client-prod · us-east-1]'."""
+    from opscloud.ui.context_detection import current_k8s_context
+
+    p_aws = (
+        aws_profile
+        or os.environ.get("AWS_PROFILE")
+        or os.environ.get("AWS_DEFAULT_PROFILE")
+        or ""
+    )
+    p_reg = (
+        aws_region
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or ""
+    )
+    p_k8s = k8s_context or current_k8s_context()
+    p_tf = tf_workspace or os.environ.get("TF_WORKSPACE", "")
+
+    parts: list[str] = []
+    if p_aws:
+        aws_str = f"aws: {p_aws}"
+        if p_reg:
+            aws_str += f" · {p_reg}"
+        parts.append(aws_str)
+    if p_k8s:
+        parts.append(f"k8s: {p_k8s}")
+    if p_tf:
+        parts.append(f"tf: {p_tf}")
+
+    if parts:
+        return f"[{' | '.join(parts)}]"
+    return ""
+
+
+def highlight_command(command: str) -> Content:
+    """Format shell command with '$ ' prefix and highlight destructive verbs in $error bold."""
+    lines = command.split("\n")
+    formatted_lines: list[str] = []
+    for i, line in enumerate(lines):
+        prefix = "[dim]$[/dim] " if i == 0 else "  "
+        escaped_line = escape(line)
+        highlighted = _DESTRUCTIVE_PATTERN.sub(
+            lambda m: f"[bold $error]{m.group(0)}[/bold $error]",
+            escaped_line,
+        )
+        formatted_lines.append(f"{prefix}{highlighted}")
+
+    return Content.from_markup("\n".join(formatted_lines))
 
 
 def _is_command_too_long(command: str) -> bool:
@@ -95,18 +161,32 @@ class ApprovalMenu(Container):
         margin: 1 0;
         padding: 0 1;
         background: $surface;
-        border: solid $warning;
+        border: round $primary;
+        border-title-align: left;
+        border-subtitle-align: left;
     }
     ApprovalMenu .approval-title {
-        text-style: bold;
-        color: $warning;
-        margin-bottom: 0;
+        display: none;
+    }
+    ApprovalMenu .approval-header-info {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    ApprovalMenu .approval-meta-line {
+        height: auto;
+        color: $text;
+    }
+    ApprovalMenu .approval-command-box {
+        height: auto;
+        background: $background;
+        border: round $panel;
+        padding: 0 1;
+        margin: 0 0 1 0;
+        border-title-align: left;
     }
     ApprovalMenu .approval-command {
         height: auto;
-        margin: 0 0 1 0;
-        padding: 0 1;
-        color: $warning;
+        color: $text;
     }
     ApprovalMenu .tool-info-scroll {
         height: auto;
@@ -119,33 +199,31 @@ class ApprovalMenu(Container):
     }
     ApprovalMenu .approval-separator {
         height: 1;
-        color: $warning;
+        border-top: solid $panel;
         margin: 0;
     }
     ApprovalMenu .approval-options-container {
         height: auto;
         background: $surface;
-        padding: 0 1;
-        margin-top: 0;
+        padding: 0 0;
+        margin: 0 0 1 0;
     }
     ApprovalMenu .approval-option {
         height: 1;
         padding: 0 1;
     }
     ApprovalMenu .approval-option-selected {
-        background: $primary;
+        background: $primary 12%;
+        color: $text;
         text-style: bold;
     }
     ApprovalMenu .approval-reason-input {
         margin: 1 0 0 0;
-        border: solid $warning;
+        border: round $warning;
         background: $surface;
     }
     ApprovalMenu .approval-help {
-        color: $text-muted;
-        text-style: italic;
-        margin-top: 0;
-        margin-bottom: 0;
+        display: none;
     }
     """
 
@@ -179,6 +257,7 @@ class ApprovalMenu(Container):
         *,
         auto_mode_eligible: bool = True,
         risk: str = "low",
+        is_prod: bool | None = None,
         **kwargs: Any,
     ) -> None:
         menu_id = id if (id and id != "approval-menu") else f"approval-menu-{uuid.uuid4().hex[:8]}"
@@ -212,6 +291,25 @@ class ApprovalMenu(Container):
         self._tool_names: list[str] = [
             str(r.get("name") or r.get("action", "unknown")) for r in self._action_requests
         ]
+
+        # Determine risk: assess from requests if not explicitly high/prod
+        first_tool = self._tool_names[0] if self._tool_names else ""
+        first_args = (
+            self._action_requests[0].get("args", {})
+            if self._action_requests
+            else {}
+        )
+        computed_risk = assess_tool_risk(
+            first_tool,
+            first_args if isinstance(first_args, dict) else {},
+            is_prod=is_prod,
+        )
+        if risk and risk not in ("low", ""):
+            self._risk = risk
+        else:
+            self._risk = computed_risk
+
+        self.add_class(f"risk-{self._risk}")
         self._is_auto_fallback = any(
             isinstance(request.get("description"), str)
             and request["description"].startswith("Auto human fallback ")
@@ -248,6 +346,25 @@ class ApprovalMenu(Container):
         command = str(req.get("args", {}).get("command", "") or req.get("args", {}).get("CommandLine", ""))
         return _is_command_too_long(command)
 
+    def _build_border_title(self) -> str:
+        return " Tool Approval "
+
+    def _format_option_display(self, text: str) -> str:
+        """Format option text for card display."""
+        if text == "Approve (y)":
+            return "(y) Approve once"
+        if text.startswith("Approve all ") and text.endswith(" (y)"):
+            return f"(y) {text[:-4]}"
+        if text == "Enable Smart mode for this thread (s)":
+            return "(s) Enable Smart mode for this session"
+        if text == "Switch to Manual (s)":
+            return "(s) Switch to Manual mode"
+        if text == "Reject (n)":
+            return "(n) Reject"
+        if text.startswith("Reject all ") and text.endswith(" (n)"):
+            return f"(n) {text[:-4]}"
+        return text
+
     def _get_command_display(self, *, expanded: bool) -> Content:
         """Get the command display content (truncated or full)."""
         if not self._action_requests:
@@ -263,13 +380,12 @@ class ApprovalMenu(Container):
         else:
             command_display = _truncate_command(command)
 
+        display = highlight_command(command_display)
         if not expanded and too_long:
-            display = Content.from_markup(
-                "[bold]$cmd[/bold] [dim](press 'e' to expand)[/dim]",
-                cmd=command_display,
+            display = Content.assemble(
+                display,
+                Content.from_markup("  [dim](press 'e' to expand)[/dim]"),
             )
-        else:
-            display = Content.from_markup("[bold]$cmd[/bold]", cmd=command_display)
 
         if not issues:
             return display
@@ -283,7 +399,7 @@ class ApprovalMenu(Container):
         return Content.assemble(
             display,
             Content.from_markup(
-                "\n[yellow]Warning:[/yellow] hidden chars detected ($summary)\n"
+                "\n[$warning]Warning:[/$warning] hidden chars detected ($summary)\n"
                 "[dim]raw: $raw[/dim]",
                 summary=summarize_issues(issues),
                 raw=raw_with_markers,
@@ -292,19 +408,12 @@ class ApprovalMenu(Container):
 
     def compose(self) -> ComposeResult:
         """Compose the widget."""
-        count = len(self._action_requests)
-        if count == 1:
-            title = Content.from_markup(
-                ">>> $name Requires Approval <<<", name=self._tool_names[0]
-            )
-        else:
-            title = Content(f">>> {count} Tool Calls Require Approval <<<")
-        yield Static(title, classes="approval-title")
+        yield Static("", classes="approval-title")
 
         if self._security_warnings:
             parts: list[Content] = [
                 Content.from_markup(
-                    "[yellow]Warning:[/yellow] Potentially deceptive text"
+                    "[$warning]Warning:[/$warning] Potentially deceptive text"
                 ),
             ]
             parts.extend(
@@ -320,13 +429,44 @@ class ApprovalMenu(Container):
             )
 
         if self._is_minimal and len(self._action_requests) == 1:
-            self._command_widget = Static(
-                self._get_command_display(expanded=self._command_expanded),
-                classes="approval-command",
-            )
-            yield self._command_widget
+            req = self._action_requests[0]
+            cmd = str(req.get("args", {}).get("command", "") or req.get("args", {}).get("CommandLine", ""))
+            first_line = cmd.strip().split("\n")[0] if cmd.strip() else "execute"
+            if len(first_line) > 60:
+                first_line = first_line[:57] + get_glyphs().ellipsis
+
+            with Vertical(classes="approval-header-info"):
+                yield Static(
+                    Content.from_markup("  [dim]Tool:[/dim]   [bold]$name[/bold]", name=self._tool_names[0]),
+                    classes="approval-meta-line",
+                )
+                yield Static(
+                    Content.from_markup("  [dim]Target:[/dim] $target", target=first_line),
+                    classes="approval-meta-line",
+                )
+
+            with Container(classes="approval-command-box") as box:
+                box.border_title = " Command "
+                self._command_widget = Static(
+                    self._get_command_display(expanded=self._command_expanded),
+                    classes="approval-command",
+                )
+                yield self._command_widget
 
         if not self._is_minimal:
+            with Vertical(classes="approval-header-info"):
+                count = len(self._action_requests)
+                if count == 1:
+                    yield Static(
+                        Content.from_markup("  [dim]Tool:[/dim]   [bold]$name[/bold]", name=self._tool_names[0]),
+                        classes="approval-meta-line",
+                    )
+                else:
+                    yield Static(
+                        Content.from_markup("  [dim]Tools:[/dim]  [bold]$count tool calls require approval[/bold]", count=count),
+                        classes="approval-meta-line",
+                    )
+
             with VerticalScroll(classes="tool-info-scroll"):
                 self._tool_info_container = Vertical(classes="tool-info-container")
                 yield self._tool_info_container
@@ -353,30 +493,28 @@ class ApprovalMenu(Container):
         yield self._help_widget
 
     def _compose_help_text(self) -> str:
-        """Build the help-line content."""
+        """Build the help-line content for bottom border subtitle."""
         glyphs = get_glyphs()
+        sep = f" {glyphs.bullet} "
         if self._reason_input_active:
-            return (
-                f"Enter submit {glyphs.bullet} Esc cancel {glyphs.bullet} "
-                "leave blank to reject without a reason"
-            )
+            return f"enter submit{sep}esc cancel{sep}leave blank to reject without a reason"
+
         quick_keys = "y/s/n" if self._show_auto_option else "y/n"
-        help_parts = [
-            (
-                f"{glyphs.arrow_up}/{glyphs.arrow_down} navigate "
-                f"{glyphs.bullet} Enter select {glyphs.bullet} {quick_keys} quick keys"
-            ),
-        ]
+        parts = ["y approve", "s smart" if self._show_auto_option else "", "n reject"]
+        parts = [p for p in parts if p]
+
         if self._selected == self._reject_index:
-            help_parts.append("Tab amend")
-        help_parts.append("Esc reject")
-        help_text = f" {glyphs.bullet} ".join(help_parts)
+            parts.append("tab reason")
         if self._has_expandable_command:
-            help_text += f" {glyphs.bullet} e expand"
-        return help_text
+            parts.append("e expand")
+
+        return sep.join(parts) + f" ({quick_keys} quick keys)"
 
     async def on_mount(self) -> None:
-        """Focus self on mount and update tool info."""
+        """Focus self on mount, set border chrome, and update tool info."""
+        self.border_title = self._build_border_title()
+        self.border_subtitle = f" {self._compose_help_text()} "
+
         if is_ascii_mode():
             colors = theme.get_theme_colors(self)
             self.styles.border = ("ascii", colors.warning)
@@ -410,11 +548,24 @@ class ApprovalMenu(Container):
 
             description = action_request.get("description")
             if description:
-                desc_widget = Static(
-                    Content.from_markup("[dim]$desc[/dim]", desc=str(description)),
-                    classes="approval-description",
+                desc_str = str(description).strip()
+                file_target = str(
+                    tool_args.get("file_path")
+                    or tool_args.get("TargetFile")
+                    or tool_args.get("path")
+                    or ""
                 )
-                await self._tool_info_container.mount(desc_widget)
+                is_redundant = bool(file_target) and (
+                    desc_str == f"Write file: {file_target}"
+                    or desc_str == f"Edit file: {file_target}"
+                    or desc_str == file_target
+                )
+                if not is_redundant:
+                    desc_widget = Static(
+                        Content.from_markup("[dim]$desc[/dim]", desc=desc_str),
+                        classes="approval-description",
+                    )
+                    await self._tool_info_container.mount(desc_widget)
 
             renderer = get_renderer(tool_name)
             widget_class, data = renderer.get_approval_widget(
@@ -439,17 +590,24 @@ class ApprovalMenu(Container):
 
     def _update_options(self) -> None:
         """Update option widgets based on selection."""
+        bar = "▌" if not is_ascii_mode() else "|"
         for i, ((text, _decision), widget) in enumerate(
             zip(self._options, self._option_widgets)
         ):
-            cursor = f"{get_glyphs().cursor} " if i == self._selected else "  "
-            widget.update(f"{cursor}{i + 1}. {text}")
-
-            widget.remove_class("approval-option-selected")
+            display_text = self._format_option_display(text)
+            escaped_display = escape(display_text)
             if i == self._selected:
+                cursor = f"[bold $primary]{bar}[/bold $primary] "
+                widget.update(Content.from_markup(f"{cursor}{escaped_display}"))
                 widget.add_class("approval-option-selected")
+            else:
+                cursor = "  "
+                widget.update(Content.from_markup(f"{cursor}{escaped_display}"))
+                widget.remove_class("approval-option-selected")
+
         if self._help_widget is not None:
             self._help_widget.update(self._compose_help_text())
+        self.border_subtitle = f" {self._compose_help_text()} "
 
     def action_move_up(self) -> None:
         """Move selection up."""
@@ -622,14 +780,55 @@ class ApprovalMenu(Container):
         self.call_after_refresh(self.focus)
 
 
-def assess_tool_risk(tool_name: str, args: dict[str, Any], is_prod: bool = False) -> str:
-    """Assess risk level (low, medium, high) for tool call."""
-    if is_prod:
-        return "high"
-    name = tool_name.lower()
-    cmd = str(args.get("command", "") or args.get("CommandLine", "")).lower()
+def assess_tool_risk(
+    tool_name: str,
+    args: dict[str, Any] | None = None,
+    is_prod: bool | None = None,
+    *,
+    aws_profile: str = "",
+    k8s_context: str = "",
+    tf_workspace: str = "",
+) -> str:
+    """Assess risk level (low, medium, high, prod) for tool call.
 
-    if any(k in name or k in cmd for k in ("destroy", "delete", "apply", "drop", "terminate", "rm -rf")):
+    Automatically upgrades to 'prod' if active cloud context is production.
+    """
+    args = args or {}
+    if is_prod is None:
+        from opscloud.ui.context_detection import current_k8s_context, detect_production
+
+        p_aws = (
+            aws_profile
+            or os.environ.get("AWS_PROFILE")
+            or os.environ.get("AWS_DEFAULT_PROFILE")
+            or ""
+        )
+        p_k8s = k8s_context or current_k8s_context()
+        p_tf = tf_workspace or os.environ.get("TF_WORKSPACE", "")
+        source = detect_production(aws_profile=p_aws, k8s_context=p_k8s, tf_workspace=p_tf)
+        is_prod = source is not None
+
+    if is_prod:
+        return "prod"
+
+    name = tool_name.lower()
+    cmd = str(
+        args.get("command", "")
+        or args.get("CommandLine", "")
+        or args.get("raw_command", "")
+    ).lower()
+
+    destructive_keywords = (
+        "destroy",
+        "delete",
+        "apply",
+        "drop",
+        "terminate",
+        "rm -rf",
+        "rm -r",
+        "drop database",
+    )
+    if any(k in name or k in cmd for k in destructive_keywords):
         return "high"
     if any(k in name or k in cmd for k in ("write", "replace", "patch", "edit")):
         return "medium"
@@ -653,43 +852,45 @@ class ApprovalDecided(Message):
         self.comment = comment
 
 
-class ApprovalModalScreen(ModalScreen[ApprovalDecided]):
+class ApprovalModalScreen(OpsModalScreen[ApprovalDecided]):
     """Full-screen modal screen for high-risk / production tool executions."""
 
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
+
     DEFAULT_CSS = """
-    ApprovalModalScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
+    ApprovalModalScreen .modal-title {
+        display: none;
     }
-    #modal-container {
-        width: 70;
+    ApprovalModalScreen .modal-meta-line {
         height: auto;
-        max-height: 25;
-        background: $surface;
-        border: double $error;
-        padding: 1 2;
-    }
-    .modal-title {
-        color: $error;
-        text-style: bold;
         margin-bottom: 1;
     }
-    .modal-buttons {
-        layout: horizontal;
-        height: 3;
-        margin-top: 1;
-    }
-    #modal-args-scroll {
-        max-height: 10;
+    ApprovalModalScreen #modal-args-scroll {
+        height: auto;
+        max-height: 12;
         background: $background;
-        border: solid $panel;
-        padding: 1;
+        border: round $panel;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    ApprovalModalScreen #modal-comment {
+        height: 3;
+        margin-bottom: 1;
+        border: round $panel;
+    }
+    ApprovalModalScreen .modal-buttons {
+        layout: horizontal;
+        height: auto;
+        align-horizontal: right;
+    }
+    ApprovalModalScreen .modal-buttons Button {
+        margin-left: 1;
     }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("y", "approve", "Approve", show=True),
-        Binding("n", "reject", "Reject", show=True),
+        Binding("y", "approve", "Approve", show=False),
+        Binding("n", "reject", "Reject", show=False),
         Binding("escape", "reject", "Cancel", show=False),
     ]
 
@@ -705,31 +906,60 @@ class ApprovalModalScreen(ModalScreen[ApprovalDecided]):
         self._call_id = call_id
         self._args = args
 
-    def compose(self) -> ComposeResult:
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.set_modal_title("Tool Execution Approval")
+        self.set_modal_subtitle([
+            ("y", "confirm execution"),
+            ("n", "cancel / reject"),
+            ("esc", "close"),
+        ])
+
+    def compose_modal(self) -> ComposeResult:
         rendered = render_tool_approval(self._tool_name, self._args)
-        with VerticalScroll(id="modal-container"):
-            yield Static("HIGH RISK / PRODUCTION OPERATION APPROVAL", classes="modal-title")
-            yield Static(f"Tool: {rendered.title}", classes="modal-title")
-            with VerticalScroll(id="modal-args-scroll"):
-                if rendered.diff_lines:
-                    patch = "\n".join(rendered.diff_lines)
-                    yield from compose_diff_lines(patch)
+        yield Static(
+            Content.from_markup(
+                "  [dim]Tool:[/dim] [bold]$name[/bold]",
+                name=rendered.title or self._tool_name,
+            ),
+            classes="modal-meta-line",
+        )
+        with VerticalScroll(id="modal-args-scroll"):
+            if rendered.diff_lines:
+                patch = "\n".join(rendered.diff_lines)
+                yield from compose_diff_lines(patch)
+            else:
+                raw_cmd = (
+                    self._args.get("command")
+                    or self._args.get("CommandLine")
+                    or self._args.get("raw_command")
+                )
+                if raw_cmd:
+                    yield Static(highlight_command(str(raw_cmd)))
                 else:
                     details = rendered.details or [f"{k}: {v}" for k, v in self._args.items()]
                     yield Static("\n".join(details))
-            yield TextArea(placeholder="Rejection reason / comments...", id="modal-comment")
-            with Container(classes="modal-buttons"):
-                yield Button("CONFIRM EXECUTION (y)", variant="error", id="btn-modal-approve")
-                yield Button("CANCEL / REJECT (n)", variant="primary", id="btn-modal-reject")
+        yield TextArea(placeholder="Rejection reason / comments...", id="modal-comment")
+        with Container(classes="modal-buttons"):
+            yield Button("CONFIRM EXECUTION (y)", variant="error", id="btn-modal-approve")
+            yield Button("CANCEL / REJECT (n)", variant="default", id="btn-modal-reject")
 
     @on(Button.Pressed, "#btn-modal-approve")
     def action_approve(self) -> None:
-        comment = self.query_one("#modal-comment", TextArea).text
+        comment = ""
+        try:
+            comment = self.query_one("#modal-comment", TextArea).text
+        except Exception:
+            pass
         self.dismiss(ApprovalDecided(True, self._tool_name, self._call_id, comment))
 
     @on(Button.Pressed, "#btn-modal-reject")
     def action_reject(self) -> None:
-        comment = self.query_one("#modal-comment", TextArea).text
+        comment = ""
+        try:
+            comment = self.query_one("#modal-comment", TextArea).text
+        except Exception:
+            pass
         self.dismiss(ApprovalDecided(False, self._tool_name, self._call_id, comment))
 
 
@@ -738,4 +968,6 @@ __all__ = [
     "ApprovalMenu",
     "ApprovalModalScreen",
     "assess_tool_risk",
+    "get_target_context_pill",
+    "highlight_command",
 ]

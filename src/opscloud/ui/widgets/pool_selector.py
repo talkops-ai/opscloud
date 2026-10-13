@@ -7,13 +7,13 @@ from typing import Any, ClassVar
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Click
-from textual.screen import ModalScreen
 from textual.widgets import Button, Select, Static
 from textual.widgets._select import SelectOverlay
 
+from opscloud.config.settings import get_glyphs
 from opscloud.config.toml_config import clear_agent_pool, load_agent_pool, save_agent_pool
 from opscloud.model.config import (
     AVAILABLE_MODELS,
@@ -21,16 +21,18 @@ from opscloud.model.config import (
     get_curated_models_for_provider,
     get_provider_display_name,
     has_provider_credentials,
-    normalize_model_spec,
     resolve_model_spec,
 )
 from opscloud.model.pool import get_model_pool_manager
+from opscloud.ui.widgets.modal_base import OpsModalScreen
 
 logger = get_logger(__name__)
 
 
-class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
+class PoolSelectorScreen(OpsModalScreen[dict[str, Any] | None]):
     """Modal dialog for configuring execution models for agent tiers."""
+
+    DIALOG_CLASSES: ClassVar[str] = "-workspace"
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False),
@@ -39,30 +41,12 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
     ]
 
     DEFAULT_CSS = """
-    PoolSelectorScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    PoolSelectorScreen > Vertical {
-        width: 86;
-        max-width: 95%;
-        height: 85%;
-        min-height: 20;
-        max-height: 46;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
     PoolSelectorScreen .pool-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     PoolSelectorScreen .pool-subtitle {
+        height: auto;
         color: $text-muted;
         text-align: center;
         margin-bottom: 1;
@@ -96,20 +80,20 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
     PoolSelectorScreen .tier-header {
         text-style: bold;
         color: $text;
-        margin-top: 1;
+        margin-top: 0;
     }
 
     PoolSelectorScreen .tier-hint {
         color: $text-muted;
         text-style: italic;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
 
     PoolSelectorScreen .tier-row {
         height: auto;
         width: 100%;
         margin-top: 0;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
 
     PoolSelectorScreen .tier-field-prov {
@@ -130,17 +114,22 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
     }
 
     PoolSelectorScreen Select {
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
 
     PoolSelectorScreen Select:focus > SelectCurrent {
         border: tall $primary;
     }
 
+    PoolSelectorScreen .ops-modal-dialog.-workspace SelectOverlay,
+    PoolSelectorScreen SelectOverlay,
     PoolSelectorScreen Select > SelectOverlay {
+        height: auto;
         max-height: 10;
         background: $surface;
         border: solid $primary;
+        padding: 0 1;
+        overflow-x: hidden;
     }
 
     PoolSelectorScreen Select > SelectOverlay > .option-list--option {
@@ -170,11 +159,7 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
     }
 
     PoolSelectorScreen .pool-help {
-        height: auto;
-        color: $text-muted;
-        text-style: italic;
-        text-align: center;
-        margin-top: 1;
+        display: none;
     }
     """
 
@@ -215,7 +200,7 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
             options.append((f"{provider} (default)", f"{provider}:default"))
         return options
 
-    def compose(self) -> ComposeResult:
+    def compose_modal(self) -> ComposeResult:
         provider_options = self._get_provider_options()
 
         # Pre-select initial values from saved pool or dynamic discovery
@@ -252,103 +237,113 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
         std_prov, std_val, std_opts = _resolve_tier_init("standard", 1)
         pow_prov, pow_val, pow_opts = _resolve_tier_init("powerful", 2)
 
-        with Vertical():
-            yield Static("Model Pool Configuration", classes="pool-title")
-            yield Static(
-                "Configure execution models for fast, standard, and powerful tiers.\n"
-                "Tiers can use different providers (e.g. Fast: OpenAI, Standard: Gemini, Powerful: Anthropic).",
-                classes="pool-subtitle",
-            )
+        yield Static("Model Pool Configuration", classes="pool-title")
+        yield Static(
+            "Configure execution models for fast, standard, and powerful tiers.\n"
+            "Tiers can use different providers (e.g. Fast: OpenAI, Standard: Gemini, Powerful: Anthropic).",
+            classes="pool-subtitle",
+        )
 
-            with VerticalScroll(classes="pool-section-container"):
-                # Quick Bulk Preset
-                with Vertical(classes="bulk-row"):
-                    yield Static("Quick Preset: Set all tiers to one provider", classes="tier-label")
-                    bulk_options = [("-- Keep current tier selections --", "")] + [
-                        (disp, prov) for (disp, prov) in provider_options
-                    ]
-                    yield Select(
-                        bulk_options,
-                        value="",
-                        allow_blank=False,
-                        id="select-provider",
-                    )
+        with VerticalScroll(classes="pool-section-container"):
+            # Quick Bulk Preset
+            with Vertical(classes="bulk-row"):
+                yield Static("Quick Preset: Set all tiers to one provider", classes="tier-label")
+                bulk_options = [("-- Keep current tier selections --", "")] + [
+                    (disp, prov) for (disp, prov) in provider_options
+                ]
+                yield Select(
+                    bulk_options,
+                    value="",
+                    allow_blank=False,
+                    id="select-provider",
+                )
 
-                # Tier 0: Fast
-                with Vertical(classes="tier-block"):
-                    yield Static("Fast Tier (Tier 0)", classes="tier-header")
-                    yield Static("Low-latency reflex model. Best for greetings, lookups, and simple queries.", classes="tier-hint")
-                    with Horizontal(classes="tier-row"):
-                        with Vertical(classes="tier-field-prov"):
-                            yield Static("Provider", classes="tier-label")
-                            yield Select(
-                                provider_options,
-                                value=fast_prov,
-                                allow_blank=False,
-                                id="select-provider-fast",
-                            )
-                        with Vertical(classes="tier-field-model"):
-                            yield Static("Model", classes="tier-label")
-                            yield Select(
-                                fast_opts,
-                                value=fast_val,
-                                allow_blank=False,
-                                id="select-fast",
-                            )
+            # Tier 0: Fast
+            with Vertical(classes="tier-block"):
+                yield Static("Fast Tier (Tier 0)", classes="tier-header")
+                yield Static("Low-latency reflex model. Best for greetings, lookups, and simple queries.", classes="tier-hint")
+                with Horizontal(classes="tier-row"):
+                    with Vertical(classes="tier-field-prov"):
+                        yield Static("Provider", classes="tier-label")
+                        yield Select(
+                            provider_options,
+                            value=fast_prov,
+                            allow_blank=False,
+                            id="select-provider-fast",
+                        )
+                    with Vertical(classes="tier-field-model"):
+                        yield Static("Model", classes="tier-label")
+                        yield Select(
+                            fast_opts,
+                            value=fast_val,
+                            allow_blank=False,
+                            id="select-fast",
+                        )
 
-                # Tier 1: Standard
-                with Vertical(classes="tier-block"):
-                    yield Static("Standard Tier (Tier 1)", classes="tier-header")
-                    yield Static("Balanced execution model. Best for single-domain coding, operations, and routine tasks.", classes="tier-hint")
-                    with Horizontal(classes="tier-row"):
-                        with Vertical(classes="tier-field-prov"):
-                            yield Static("Provider", classes="tier-label")
-                            yield Select(
-                                provider_options,
-                                value=std_prov,
-                                allow_blank=False,
-                                id="select-provider-standard",
-                            )
-                        with Vertical(classes="tier-field-model"):
-                            yield Static("Model", classes="tier-label")
-                            yield Select(
-                                std_opts,
-                                value=std_val,
-                                allow_blank=False,
-                                id="select-standard",
-                            )
+            # Tier 1: Standard
+            with Vertical(classes="tier-block"):
+                yield Static("Standard Tier (Tier 1)", classes="tier-header")
+                yield Static("Balanced execution model. Best for single-domain coding, operations, and routine tasks.", classes="tier-hint")
+                with Horizontal(classes="tier-row"):
+                    with Vertical(classes="tier-field-prov"):
+                        yield Static("Provider", classes="tier-label")
+                        yield Select(
+                            provider_options,
+                            value=std_prov,
+                            allow_blank=False,
+                            id="select-provider-standard",
+                        )
+                    with Vertical(classes="tier-field-model"):
+                        yield Static("Model", classes="tier-label")
+                        yield Select(
+                            std_opts,
+                            value=std_val,
+                            allow_blank=False,
+                            id="select-standard",
+                        )
 
-                # Tier 2: Powerful
-                with Vertical(classes="tier-block"):
-                    yield Static("Powerful Tier (Tier 2)", classes="tier-header")
-                    yield Static("Frontier deep reasoning model. Best for multi-agent planning, root-cause analysis, and architecture.", classes="tier-hint")
-                    with Horizontal(classes="tier-row"):
-                        with Vertical(classes="tier-field-prov"):
-                            yield Static("Provider", classes="tier-label")
-                            yield Select(
-                                provider_options,
-                                value=pow_prov,
-                                allow_blank=False,
-                                id="select-provider-powerful",
-                            )
-                        with Vertical(classes="tier-field-model"):
-                            yield Static("Model", classes="tier-label")
-                            yield Select(
-                                pow_opts,
-                                value=pow_val,
-                                allow_blank=False,
-                                id="select-powerful",
-                            )
+            # Tier 2: Powerful
+            with Vertical(classes="tier-block"):
+                yield Static("Powerful Tier (Tier 2)", classes="tier-header")
+                yield Static("Frontier deep reasoning model. Best for multi-agent planning, root-cause analysis, and architecture.", classes="tier-hint")
+                with Horizontal(classes="tier-row"):
+                    with Vertical(classes="tier-field-prov"):
+                        yield Static("Provider", classes="tier-label")
+                        yield Select(
+                            provider_options,
+                            value=pow_prov,
+                            allow_blank=False,
+                            id="select-provider-powerful",
+                        )
+                    with Vertical(classes="tier-field-model"):
+                        yield Static("Model", classes="tier-label")
+                        yield Select(
+                            pow_opts,
+                            value=pow_val,
+                            allow_blank=False,
+                            id="select-powerful",
+                        )
 
-            with Horizontal(classes="pool-buttons"):
-                yield Button("Save Pool", variant="primary", id="btn-save")
-                yield Button("Reset Defaults", variant="default", id="btn-reset")
-                yield Button("Cancel", variant="error", id="btn-cancel")
+        with Horizontal(classes="pool-buttons"):
+            yield Button("Save Pool", variant="primary", id="btn-save")
+            yield Button("Reset Defaults", variant="default", id="btn-reset")
+            yield Button("Cancel", variant="error", id="btn-cancel")
 
-            yield Static(
-                "Tab Navigate  •  Enter Select  •  Ctrl+S Save  •  Ctrl+R Reset  •  Esc Dismiss",
-                classes="pool-help",
-            )
+        yield Static(
+            "Tab Navigate  •  Enter Select  •  Ctrl+S Save  •  Ctrl+R Reset  •  Esc Dismiss",
+            classes="pool-help",
+        )
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        glyphs = get_glyphs()
+        self.set_modal_title("Model Pool Configuration", counter=self._provider)
+        self.set_modal_subtitle([
+            (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+            ("ctrl+s", "save"),
+            ("ctrl+r", "reset"),
+            ("esc", "cancel"),
+        ])
 
     def on_click(self, event: Click) -> None:
         """Handle clicks on the modal backdrop or outside open dropdowns."""
@@ -399,6 +394,24 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
         except NoMatches:
             pass
 
+    def _refresh_title_counter(self) -> None:
+        """Update dialog border title counter to reflect current providers."""
+        try:
+            f_p = self.query_one("#select-provider-fast", Select).value
+            s_p = self.query_one("#select-provider-standard", Select).value
+            p_p = self.query_one("#select-provider-powerful", Select).value
+            provs: set[str] = {
+                str(p)
+                for p in (f_p, s_p, p_p)
+                if p is not Select.NULL and bool(p)
+            }
+            if len(provs) == 1:
+                self.set_modal_title("Model Pool Configuration", counter=next(iter(provs)))
+            else:
+                self.set_modal_title("Model Pool Configuration", counter="multi")
+        except Exception:
+            pass
+
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle provider change for individual tiers or bulk sync."""
         if getattr(self, "_dismissed", False) or getattr(self, "_updating", False):
@@ -422,6 +435,7 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
                     except NoMatches:
                         pass
                     self._update_tier_models(tier_name, val, tier_num)
+                self._refresh_title_counter()
             finally:
                 self._updating = False
             return
@@ -430,6 +444,22 @@ class PoolSelectorScreen(ModalScreen[dict[str, Any] | None]):
         for tier_name, tier_num in (("fast", 0), ("standard", 1), ("powerful", 2)):
             if sid == f"select-provider-{tier_name}":
                 self._update_tier_models(tier_name, val, tier_num)
+                # Keep preset dropdown in sync with tier selections
+                try:
+                    f_val = self.query_one("#select-provider-fast", Select).value
+                    s_val = self.query_one("#select-provider-standard", Select).value
+                    p_val = self.query_one("#select-provider-powerful", Select).value
+                    bulk_sel = self.query_one("#select-provider", Select)
+                    target_preset = f_val if (f_val == s_val == p_val and f_val != Select.NULL) else ""
+                    if bulk_sel.value != target_preset:
+                        self._updating = True
+                        try:
+                            bulk_sel.value = target_preset
+                        finally:
+                            self._updating = False
+                except NoMatches:
+                    pass
+                self._refresh_title_counter()
                 break
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

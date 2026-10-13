@@ -21,6 +21,10 @@ class SkillCreatorHandler(BaseCommandHandler):
         return "/skill-creator"
 
     @property
+    def aliases(self) -> tuple[str, ...]:
+        return ("/skill:skill-creator",)
+
+    @property
     def category(self) -> CommandCategory:
         return CommandCategory.POWER
 

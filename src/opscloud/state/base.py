@@ -16,6 +16,7 @@ from langchain.agents.middleware.types import (
     PrivateStateAttr,
 )
 
+from opscloud.state.agent_session_channels import AgentSessionChannels
 from opscloud.state.cloud_context import CloudContextState
 from opscloud.state.goal_channels import GoalRubricChannels
 from opscloud.state.resume_state import ResumeState
@@ -40,6 +41,7 @@ class OpsCloudAgentState(
     ResumeState,
     GoalRubricChannels,
     WorkflowChannels,
+    AgentSessionChannels,
     CloudContextState,
     ServiceContextState,
 ):

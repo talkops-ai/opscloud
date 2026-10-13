@@ -307,10 +307,19 @@ def _build_cached_mcp_tool(
     raw_input_schema = getattr(mcp_tool, "inputSchema", None) or getattr(mcp_tool, "input_schema", None) or {}
     input_schema = _clean_mcp_schema(raw_input_schema)
 
+    base_server = server_name.rsplit("__", 1)[-1] if "__" in server_name else server_name
+    subagent_owner = (
+        server_name[10:].split("__", 1)[0]
+        if server_name.startswith("subagent__") and "__" in server_name[10:]
+        else None
+    )
+
     metadata: dict[str, Any] = {
         "_opscloud_mcp": True,
         "_mcp_server": server_name,
+        "_mcp_base_server": base_server,
         "_mcp_original_name": original_tool_name,
+        "_mcp_subagent_owner": subagent_owner,
     }
     from opscloud.mcp.semantic_profiler import MCPSemanticProfiler
 

@@ -141,3 +141,54 @@ def test_click_on_chat_input_focuses_text_area(chat_input):
     event = MagicMock(spec=Click)
     chat_input.on_click(event)
     assert focused is True
+
+
+def test_submit_command_clears_argument_hint(chat_input):
+    """Submitting a command like /cloud clears the argument hint ghost text."""
+    chat_input.mode = "command"
+    chat_input._text_area.text = "cloud "
+    chat_input._text_area.argument_hint = "[profile-name | status | list]"
+
+    chat_input._submit_value()
+
+    assert chat_input.mode == "normal"
+    assert chat_input.text == ""
+    assert chat_input._text_area.argument_hint == ""
+
+
+def test_clear_clears_argument_hint(chat_input):
+    """Calling clear() resets argument_hint on the internal text area."""
+    chat_input.mode = "command"
+    chat_input._text_area.argument_hint = "[profile-name | status | list]"
+
+    chat_input.clear()
+
+    assert chat_input.mode == "normal"
+    assert chat_input._text_area.argument_hint == ""
+
+
+def test_exit_mode_clears_argument_hint(chat_input):
+    """Exiting command mode resets argument_hint."""
+    chat_input.mode = "command"
+    chat_input._text_area.argument_hint = "[profile-name | status | list]"
+
+    chat_input.exit_mode()
+
+    assert chat_input.mode == "normal"
+    assert chat_input._text_area.argument_hint == ""
+
+
+@pytest.mark.asyncio
+async def test_chat_text_area_render_line_ignores_hint_when_line_empty():
+    """render_line does not draw ghost text if the document line is empty."""
+    from tests.unit_tests.test_chat_input_chrome import _ThemedApp
+
+    app = _ThemedApp()
+    async with app.run_test():
+        ci = app.query_one(ChatInput)
+        ci._text_area.text = ""
+        ci._text_area.argument_hint = "[profile-name | status | list]"
+
+        strip = ci._text_area.render_line(0)
+        rendered_plain = strip.text
+        assert "[profile-name | status | list]" not in rendered_plain

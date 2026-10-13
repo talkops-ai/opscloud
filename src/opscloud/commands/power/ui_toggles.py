@@ -6,6 +6,7 @@ from opscloud.utils.logger import get_logger
 
 from opscloud.commands._base import BaseCommandHandler, CommandContext, CommandResult
 from opscloud.commands._types import BypassTier, CommandCategory, SafetyLevel
+from opscloud.security.approval_mode import ApprovalMode
 
 logger = get_logger(__name__)
 
@@ -132,4 +133,121 @@ class NotificationsHandler(BaseCommandHandler):
         )
 
 
-__all__ = ["NotificationsHandler", "ScrollbarHandler", "TimestampsHandler"]
+class ThemeHandler(BaseCommandHandler):
+    """Handler for /theme command to select or switch theme."""
+
+    @property
+    def name(self) -> str:
+        return "/theme"
+
+    @property
+    def category(self) -> CommandCategory:
+        return CommandCategory.POWER
+
+    @property
+    def safety_level(self) -> SafetyLevel:
+        return SafetyLevel.READ_ONLY
+
+    @property
+    def bypass_tier(self) -> BypassTier:
+        return BypassTier.IMMEDIATE_UI
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if ctx.app is not None:
+            arg = ctx.args.strip()
+            if arg and hasattr(ctx.app, "_switch_theme"):
+                await ctx.app._switch_theme(arg)
+                return CommandResult(success=True, mount_as_app_message=False)
+            elif hasattr(ctx.app, "_show_theme_selector"):
+                await ctx.app._show_theme_selector()
+                return CommandResult(success=True, mount_as_app_message=False)
+        return CommandResult(success=False, message="Theme selector requires active TUI application.")
+
+
+class AutoApprovalHandler(BaseCommandHandler):
+    """Handler for /auto command to switch to Auto approval mode."""
+
+    @property
+    def name(self) -> str:
+        return "/auto"
+
+    @property
+    def category(self) -> CommandCategory:
+        return CommandCategory.CORE
+
+    @property
+    def safety_level(self) -> SafetyLevel:
+        return SafetyLevel.READ_ONLY
+
+    @property
+    def bypass_tier(self) -> BypassTier:
+        return BypassTier.SIDE_EFFECT_FREE
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if ctx.app is not None and hasattr(ctx.app, "_set_approval_mode"):
+            await ctx.app._set_approval_mode(ApprovalMode.AUTO)
+            return CommandResult(success=True, mount_as_app_message=False)
+        return CommandResult(success=False, message="Approval mode toggle requires active TUI application.")
+
+
+class ManualApprovalHandler(BaseCommandHandler):
+    """Handler for /manual command to switch to Manual approval mode."""
+
+    @property
+    def name(self) -> str:
+        return "/manual"
+
+    @property
+    def category(self) -> CommandCategory:
+        return CommandCategory.CORE
+
+    @property
+    def safety_level(self) -> SafetyLevel:
+        return SafetyLevel.READ_ONLY
+
+    @property
+    def bypass_tier(self) -> BypassTier:
+        return BypassTier.SIDE_EFFECT_FREE
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if ctx.app is not None and hasattr(ctx.app, "_set_approval_mode"):
+            await ctx.app._set_approval_mode(ApprovalMode.MANUAL)
+            return CommandResult(success=True, mount_as_app_message=False)
+        return CommandResult(success=False, message="Approval mode toggle requires active TUI application.")
+
+
+class SmartApprovalHandler(BaseCommandHandler):
+    """Handler for /smart command to switch to Smart approval mode."""
+
+    @property
+    def name(self) -> str:
+        return "/smart"
+
+    @property
+    def category(self) -> CommandCategory:
+        return CommandCategory.CORE
+
+    @property
+    def safety_level(self) -> SafetyLevel:
+        return SafetyLevel.READ_ONLY
+
+    @property
+    def bypass_tier(self) -> BypassTier:
+        return BypassTier.SIDE_EFFECT_FREE
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if ctx.app is not None and hasattr(ctx.app, "_set_approval_mode"):
+            await ctx.app._set_approval_mode(ApprovalMode.SMART)
+            return CommandResult(success=True, mount_as_app_message=False)
+        return CommandResult(success=False, message="Approval mode toggle requires active TUI application.")
+
+
+__all__ = [
+    "AutoApprovalHandler",
+    "ManualApprovalHandler",
+    "NotificationsHandler",
+    "ScrollbarHandler",
+    "SmartApprovalHandler",
+    "ThemeHandler",
+    "TimestampsHandler",
+]

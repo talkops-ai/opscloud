@@ -27,16 +27,21 @@ from opscloud.agent.config import (
     save_default_agent,
 )
 
+from opscloud.config.settings import get_glyphs
+from opscloud.ui.widgets.modal_base import OpsModalScreen, format_modal_option_row
+
 logger = get_logger(__name__)
 
 
-class AgentSelectorScreen(ModalScreen[str | None]):
+class AgentSelectorScreen(OpsModalScreen[str | None]):
     """Modal dialog for switching between available agents.
 
     Displays agents found in ``~/.opscloud/`` in an ``OptionList``.
     Returns the selected agent name on Enter, or ``None`` on Esc.
     ``Ctrl+S`` toggles the highlighted agent as the persisted default.
     """
+
+    DIALOG_CLASSES: ClassVar[str] = ""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False),
@@ -45,32 +50,14 @@ class AgentSelectorScreen(ModalScreen[str | None]):
         Binding("ctrl+s", "set_default", "Set default", show=False, priority=True),
     ]
 
-    CSS = """
-    AgentSelectorScreen {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.7);
-    }
-
-    AgentSelectorScreen > Vertical {
-        width: 60;
-        max-width: 90%;
-        height: auto;
-        max-height: 90vh;
-        background: $surface;
-        border: solid $primary;
-        padding: 1 2;
-    }
-
+    DEFAULT_CSS = """
     AgentSelectorScreen .agent-selector-title {
-        text-style: bold;
-        color: $primary;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     AgentSelectorScreen .agent-selector-subtitle {
         height: auto;
-        color: $foreground;
+        color: $text-muted;
         text-align: center;
         margin-bottom: 1;
     }
@@ -79,14 +66,25 @@ class AgentSelectorScreen(ModalScreen[str | None]):
         height: auto;
         max-height: 16;
         background: $background;
+        border: solid $primary 20%;
+    }
+
+    AgentSelectorScreen OptionList > .option-list--option-highlighted {
+        background: $primary 18%;
+        color: $text;
+        text-style: bold;
     }
 
     AgentSelectorScreen .agent-selector-help {
+        display: none;
+    }
+
+    AgentSelectorScreen .agent-selector-empty {
+        display: block;
         height: auto;
-        color: $foreground;
-        text-style: italic;
-        margin-top: 1;
+        color: $text-muted;
         text-align: center;
+        padding: 1;
     }
     """
 
@@ -109,36 +107,101 @@ class AgentSelectorScreen(ModalScreen[str | None]):
         self._agent_names = agent_names
         self._default_agent = default_agent
 
-    def compose(self):
-        with Vertical():
-            yield Static("Select Agent", classes="agent-selector-title")
-            if self._agent_names:
-                yield Static(
-                    "Switching restarts the agent and starts a new thread.",
-                    classes="agent-selector-subtitle",
-                )
-                option_list = OptionList(
-                    *self._build_options(),
-                    id="agent-options",
-                )
-                option_list.highlighted = self._current_index()
-                yield option_list
-                help_text = (
-                    "↑/↓ or Tab switch • Enter select\n"
-                    "Ctrl+S set default • Esc cancel"
-                )
-            else:
-                yield Static(
-                    "No agents found in ~/.opscloud/.\n"
-                    "Run opscloud with -a <name> to create one.",
-                    classes="agent-selector-help",
-                )
-                help_text = "Esc close"
-            yield Static(help_text, classes="agent-selector-help", id="agent-help")
+    def compose_modal(self):
+        yield Static("Select Agent", classes="agent-selector-title")
+        if self._agent_names:
+            yield Static(
+                "Select an agent persona to activate in this session.",
+                classes="agent-selector-subtitle",
+            )
+            option_list = OptionList(
+                *self._build_options(),
+                id="agent-options",
+            )
+            option_list.highlighted = self._current_index()
+            yield option_list
+            help_text = (
+                "↑/↓ or Tab switch • Enter select\n"
+                "Ctrl+S set default • Esc cancel"
+            )
+        else:
+            yield Static(
+                "No agents found in ~/.opscloud/ or plugins.\n"
+                "Run opscloud with -a <name> to create one.",
+                classes="agent-selector-empty",
+            )
+            help_text = "Esc close"
+        yield Static(help_text, classes="agent-selector-help", id="agent-help")
 
-    def _build_options(self) -> list[Option]:
-        """Build option entries with (current) / (default) suffixes."""
-        return [Option(self._format_label(name), id=name) for name in self._agent_names]
+    def on_mount(self) -> None:
+        super().on_mount()
+        glyphs = get_glyphs()
+        if self._agent_names:
+            self.set_modal_title("Select Agent", counter=f"{len(self._agent_names)} available")
+            self.set_modal_subtitle([
+                (f"{glyphs.arrow_up}{glyphs.arrow_down}", "navigate"),
+                ("enter", "select"),
+                ("ctrl+s", "set default"),
+                ("esc", "cancel"),
+            ])
+            try:
+                self.query_one("#agent-options", OptionList).focus()
+            except NoMatches:
+                pass
+            self.call_after_refresh(self._reformat_options)
+        else:
+            self.set_modal_title("Select Agent")
+            self.set_modal_subtitle([("esc", "close")])
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._reformat_options)
+
+    def _row_width(self) -> int:
+        try:
+            ol = self.query_one("#agent-options", OptionList)
+            region_w = ol.scrollable_content_region.width
+            if region_w > 0:
+                return region_w
+        except Exception:
+            pass
+        if self.dialog is not None and self.dialog.region.width > 0:
+            return max(32, self.dialog.region.width - 6)
+        return 72
+
+    def _reformat_options(self) -> None:
+        try:
+            ol = self.query_one("#agent-options", OptionList)
+        except NoMatches:
+            return
+        if not self._agent_names:
+            return
+        highlighted = ol.highlighted if ol.highlighted is not None else 0
+        new_options = self._build_options()
+        ol.clear_options()
+        ol.add_options(new_options)
+        if 0 <= highlighted < len(self._agent_names):
+            ol.highlighted = highlighted
+
+    def _build_options(self, width: int | None = None) -> list[Option]:
+        """Build option entries with badges for current and default status."""
+        options: list[Option] = []
+        w = width if width is not None else self._row_width()
+        for idx, name in enumerate(self._agent_names):
+            badges: list[tuple[str, str]] = []
+            if name == self._current_agent:
+                badges.append(("ACTIVE", "bold $success"))
+            if name == self._default_agent:
+                badges.append(("DEFAULT", "bold $primary"))
+
+            is_selected = (idx == self._current_index())
+            content = format_modal_option_row(
+                label=name,
+                badges=badges if badges else None,
+                width=w,
+                is_selected=is_selected,
+            )
+            options.append(Option(content, id=name))
+        return options
 
     def _format_label(self, name: str) -> Content:
         """Render an agent's label with (current) / (default) markers."""
@@ -165,15 +228,6 @@ class AgentSelectorScreen(ModalScreen[str | None]):
             return self._agent_names.index(self._current_agent)
         except ValueError:
             return 0
-
-    # ── Mount ────────────────────────────────────────────
-
-    def on_mount(self) -> None:
-        """Focus the option list on mount."""
-        try:
-            self.query_one("#agent-options", OptionList).focus()
-        except NoMatches:
-            pass
 
     # ── Events ───────────────────────────────────────────
 

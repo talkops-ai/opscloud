@@ -27,8 +27,26 @@ AVAILABLE_AGENTS: list[str] = [
 
 
 def get_available_agent_names() -> list[str]:
-    """Return the list of available agent modes."""
-    return list(AVAILABLE_AGENTS)
+    """Return the list of available agent modes and discovered custom agents."""
+    from pathlib import Path
+    from opscloud.config import paths as config_paths
+
+    names = list(AVAILABLE_AGENTS)
+    search_dirs: list[Path] = [
+        config_paths.user_agents_dir(),
+        Path.cwd() / ".opscloud" / "agents",
+    ]
+    for base in search_dirs:
+        if not base.is_dir():
+            continue
+        try:
+            for child in sorted(base.iterdir()):
+                if child.is_dir() and child.name not in names:
+                    if (child / "AGENTS.md").is_file():
+                        names.append(child.name)
+        except OSError:
+            pass
+    return names
 
 
 def load_default_agent() -> str | None:

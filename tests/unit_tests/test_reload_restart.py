@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 
 from opscloud.commands._base import CommandContext
 from opscloud.commands.power.runtime import ReloadHandler, RestartHandler
@@ -428,3 +430,146 @@ async def test_restart_lifecycle_remote_detection():
     assert success is False
     assert len(restored_notices) == 1
     assert "connected to a remote LangGraph server" in restored_notices[0]
+
+
+@pytest.mark.asyncio
+async def test_run_reload_reports_aws_and_pool_state():
+    """Verify /reload report includes active AWS configuration and Agent model pool lines."""
+    app = OpsCloudApp(defer_server_start=True)
+    app._settings = MagicMock()
+    app._settings.reload_from_environment.return_value = []
+    app._settings.aws_profile = "test-profile"
+    app._settings.aws_region = "us-west-2"
+
+    mounted_messages = []
+    app._mount_message = AsyncMock(side_effect=lambda msg: mounted_messages.append(msg))
+    app.get_discovered_skills = MagicMock(return_value=[])
+
+    with patch("opscloud.ui.theme.reload_registry"), patch("opscloud.ui.theme.register_app_themes"), patch(
+        "opscloud.plugins.discovery.discover_plugins",
+        return_value=MagicMock(plugins=()),
+    ), patch(
+        "opscloud.plugins.adapters.mcp.plugin_mcp_configs",
+        return_value=[],
+    ), patch(
+        "opscloud.model.config.clear_caches"
+    ), patch(
+        "opscloud.config.toml_config.load_agent_pool",
+        return_value={"fast": "gpt-4o-mini", "standard": "gpt-4o", "powerful": "o3", "provider": "openai"},
+    ), patch(
+        "opscloud.config.cloud_profiles.get_active_aws_profile",
+        return_value="test-profile",
+    ), patch(
+        "opscloud.config.cloud_profiles.get_active_aws_region",
+        return_value="us-west-2",
+    ):
+        await app._run_reload_unlocked()
+
+    assert len(mounted_messages) == 1
+    content = getattr(mounted_messages[0], "_raw_content", "")
+    assert "**AWS configuration:** profile `test-profile` (us-west-2)" in content
+    assert "**Agent model pool:** fast=`gpt-4o-mini`, standard=`gpt-4o`, powerful=`o3` (provider: openai)" in content
+    assert "Model config caches cleared." in content
+
+
+
+@pytest.mark.asyncio
+async def test_run_reload_detects_aws_profile_and_pool_changes():
+    """Verify /reload report highlights changes when AWS profile or agent pool are updated."""
+    app = OpsCloudApp(defer_server_start=True)
+    app._settings = MagicMock()
+    app._settings.reload_from_environment.return_value = []
+
+    # Prior snapshot was default / None
+    app._last_reload_snapshot = {
+        "aws_profile": "default",
+        "aws_region": "us-east-1",
+        "agent_pool": None,
+        "default_model": None,
+        "default_agent": None,
+        "theme": "dark",
+    }
+
+    mounted_messages = []
+    app._mount_message = AsyncMock(side_effect=lambda msg: mounted_messages.append(msg))
+    app.get_discovered_skills = MagicMock(return_value=[])
+
+    new_pool = {"fast": "fast-m", "standard": "std-m", "powerful": "pow-m", "provider": "multi"}
+
+    with patch("opscloud.ui.theme.reload_registry"), patch("opscloud.ui.theme.register_app_themes"), patch(
+        "opscloud.plugins.discovery.discover_plugins",
+        return_value=MagicMock(plugins=()),
+    ), patch(
+        "opscloud.plugins.adapters.mcp.plugin_mcp_configs",
+        return_value=[],
+    ), patch(
+        "opscloud.model.config.clear_caches"
+    ), patch(
+        "opscloud.config.toml_config.load_agent_pool",
+        return_value=new_pool,
+    ), patch(
+        "opscloud.config.cloud_profiles.get_active_aws_profile",
+        return_value="prod-profile",
+    ), patch(
+        "opscloud.config.cloud_profiles.get_active_aws_region",
+        return_value="eu-west-1",
+    ):
+        await app._run_reload_unlocked()
+
+    assert len(mounted_messages) == 1
+    content = getattr(mounted_messages[0], "_raw_content", "")
+    assert "Configuration reloaded. Changes:" in content
+    assert "aws_profile: default -> prod-profile" in content
+    assert "aws_region: us-east-1 -> eu-west-1" in content
+    assert "agent_pool: default (dynamic discovery) -> fast='fast-m', standard='std-m', powerful='pow-m' (provider: multi)" in content
+
+
+def test_clear_caches_flushes_pool_and_aws_caches():
+    """Verify clear_caches flushes model pool manager instances and AWS profile cache."""
+    from opscloud.model.config import clear_caches
+    from opscloud.model.pool import get_model_pool_manager
+    from opscloud.config import cloud_profiles
+
+    pool_mgr = get_model_pool_manager()
+    mock_instance = MagicMock()
+    pool_mgr._instances["test_key"] = mock_instance  # type: ignore[assignment]
+    assert "test_key" in pool_mgr._instances
+
+
+    cloud_profiles._cached_profiles = [MagicMock()]
+    assert cloud_profiles._cached_profiles is not None
+
+    clear_caches()
+
+    # Model pool manager singleton reset or instances cleared
+    new_pool_mgr = get_model_pool_manager()
+    assert "test_key" not in new_pool_mgr._instances
+    assert cloud_profiles._cached_profiles is None
+
+
+def test_settings_reload_from_environment_picks_up_toml_aws_and_pool(monkeypatch):
+    """Verify settings.reload_from_environment reloads AWS profile/region and pool from config.toml."""
+    from opscloud.config.settings import Settings
+
+    # Isolate environment from outer shell environment variables (e.g. AWS_REGION)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+    s = Settings(aws_profile="old-prof", aws_region="us-east-1", agent_pool=None)
+
+    with patch(
+        "opscloud.config.settings.load_config_toml",
+        return_value={
+            "aws": {"profile": "new-prof", "region": "eu-central-1"},
+            "agent_pool": {"fast": "gpt-5-mini", "standard": "gpt-5", "powerful": "gpt-5-max", "provider": "openai"},
+        },
+    ):
+        changes = s.reload_from_environment()
+
+    assert s.aws_profile == "new-prof"
+    assert s.aws_region == "eu-central-1"
+    assert s.agent_pool == {"fast": "gpt-5-mini", "standard": "gpt-5", "powerful": "gpt-5-max", "provider": "openai"}
+    assert any("aws_profile: old-prof -> new-prof" in c for c in changes)
+    assert any("aws_region: us-east-1 -> eu-central-1" in c for c in changes)
+    assert any("agent_pool: default (dynamic discovery) -> fast='gpt-5-mini'" in c for c in changes)

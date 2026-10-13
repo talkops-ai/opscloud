@@ -1,4 +1,6 @@
-"""Unit tests for subagent metadata and prompt block generation."""
+from __future__ import annotations
+
+from typing import Any
 
 from opscloud.middleware.subagents import SubagentsMiddleware
 
@@ -277,6 +279,46 @@ def test_subagent_panel_model_and_activity():
     })
     assert record.status == "done"
     assert record.current_action is None
+
+
+def test_subagent_panel_semantic_colors_and_phase_nav():
+    """Verify SubagentPanel uses primary for running, success for done, error for failed, and accent bar for phase."""
+    from opscloud.ui.widgets.subagent_panel import SubagentPanel, _SubagentRecord, _Phase
+    from opscloud.ui.theme import DARK_COLORS
+    from opscloud.config.settings import get_glyphs
+
+    glyphs = get_glyphs()
+    panel = SubagentPanel()
+
+    # Running record
+    rec_run = _SubagentRecord(id="sub-run", label="infra-agent: Provision VPC", status="running")
+    row_run = panel._render_row(rec_run, 80, glyphs, DARK_COLORS)
+    # Primary tint (teal) for running status icon/label
+    assert any(DARK_COLORS.primary in str(s.style) for s in row_run.spans)
+    assert not any(DARK_COLORS.warning in str(s.style) for s in row_run.spans)
+
+    # Done record
+    rec_done = _SubagentRecord(id="sub-done", label="infra-agent: Provision VPC", status="done")
+    row_done = panel._render_row(rec_done, 80, glyphs, DARK_COLORS)
+    assert any(DARK_COLORS.success in str(s.style) for s in row_done.spans)
+
+    # Error record
+    rec_err = _SubagentRecord(id="sub-err", label="infra-agent: Provision VPC", status="error", error="AccessDenied")
+    row_err = panel._render_row(rec_err, 80, glyphs, DARK_COLORS)
+    assert any(DARK_COLORS.error in str(s.style) for s in row_err.spans)
+
+    # Cancelled record
+    rec_cancel = _SubagentRecord(id="sub-cancel", label="infra-agent: Provision VPC", status="cancelled")
+    row_cancel = panel._render_row(rec_cancel, 80, glyphs, DARK_COLORS)
+    assert any(DARK_COLORS.muted in str(s.style) for s in row_cancel.spans)
+
+    # Phase row accent bar
+    phase = _Phase(index=1, eval_id="eval-1")
+    phase.add(rec_run)
+    phase_row = panel._phase_row(phase, selected=True, colors=DARK_COLORS)
+    assert "▌" in phase_row.plain or "|" in phase_row.plain
+    assert "(0/1)" in phase_row.plain
+
 
 
 def test_subagent_cli_middleware_hitl():

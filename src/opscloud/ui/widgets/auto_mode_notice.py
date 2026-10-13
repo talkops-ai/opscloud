@@ -16,6 +16,8 @@ from textual.widgets import Markdown, Static
 
 from opscloud.ui.widgets._links import open_checked_url_async
 
+from opscloud.ui.widgets.modal_base import OpsModalScreen
+
 if TYPE_CHECKING:
     from textual.app import ComposeResult
 
@@ -38,37 +40,28 @@ AUTO_MODE_NOTICE_BODY = (
 """Default Markdown body shown on first successful Auto enable."""
 
 
-class AutoModeNoticeScreen(ModalScreen[bool]):
+class AutoModeNoticeScreen(OpsModalScreen[bool]):
     """In-TUI first-run notice describing what Auto mode does.
 
     Dismisses with `True` on Enter (keep Auto) and `False` on Esc (return to
     Manual).
     """
 
+    DIALOG_CLASSES: ClassVar[str] = "-compact"
+
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("enter", "confirm", "Keep Auto", show=False, priority=True),
         Binding("escape", "cancel", "Manual", show=False, priority=True),
     ]
 
-    CSS = """
-    AutoModeNoticeScreen {
-        align: center middle;
-    }
-
-    AutoModeNoticeScreen > Vertical {
-        width: 72;
-        max-width: 90%;
-        height: auto;
-        background: $surface;
+    DEFAULT_CSS = """
+    AutoModeNoticeScreen .ops-modal-dialog {
         border: solid $warning;
-        padding: 1 2;
+        border-title-color: $warning;
     }
 
     AutoModeNoticeScreen .auto-mode-notice-title {
-        text-style: bold;
-        color: $warning;
-        text-align: center;
-        margin-bottom: 1;
+        display: none;
     }
 
     AutoModeNoticeScreen .auto-mode-notice-body {
@@ -87,11 +80,7 @@ class AutoModeNoticeScreen(ModalScreen[bool]):
     }
 
     AutoModeNoticeScreen .auto-mode-notice-help {
-        height: 1;
-        color: $text-muted;
-        text-style: italic;
-        text-align: center;
-        margin-top: 1;
+        display: none;
     }
     """
 
@@ -102,28 +91,32 @@ class AutoModeNoticeScreen(ModalScreen[bool]):
         super().__init__()
         self._body = AUTO_MODE_NOTICE_BODY if body is None else body
 
-    def on_mount(self) -> None:
-        """Take focus so priority bindings receive Enter/Esc."""
-        self.focus()
-
-    def compose(self) -> ComposeResult:
+    def compose_modal(self):
         """Compose the Auto first-enable notice."""
-        with Vertical():
-            yield Static(
-                "Auto mode",
-                classes="auto-mode-notice-title",
-                markup=False,
-            )
-            yield Markdown(
-                self._body,
-                classes="auto-mode-notice-body",
-                open_links=False,
-            )
-            yield Static(
-                "Enter to keep Auto · Esc for Manual",
-                classes="auto-mode-notice-help",
-                markup=False,
-            )
+        yield Static(
+            "Auto mode",
+            classes="auto-mode-notice-title",
+            markup=False,
+        )
+        yield Markdown(
+            self._body,
+            classes="auto-mode-notice-body",
+            open_links=False,
+        )
+        yield Static(
+            "Enter to keep Auto · Esc for Manual",
+            classes="auto-mode-notice-help",
+            markup=False,
+        )
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.set_modal_title("Auto mode")
+        self.set_modal_subtitle([
+            ("enter", "keep auto"),
+            ("esc", "manual"),
+        ])
+        self.focus()
 
     async def on_markdown_link_clicked(self, event: Markdown.LinkClicked) -> None:
         """Open docs (or any body link) with the shared URL helper."""

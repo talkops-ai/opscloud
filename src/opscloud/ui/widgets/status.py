@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import inspect
+import math
 import os
 from contextlib import suppress
 from opscloud.utils.logger import get_logger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from rich.text import Text
 from textual import events, on
 from textual.containers import Horizontal
 from textual.content import Content
@@ -19,7 +19,8 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from opscloud.config.env_vars import HIDE_CWD, HIDE_GIT_BRANCH, is_env_truthy
-from opscloud.config.settings import get_glyphs
+from opscloud.config.settings import ASCII_GLYPHS, UNICODE_GLYPHS, get_glyphs
+from opscloud.ui import context_detection
 from opscloud.ui.widgets.loading import Spinner
 from opscloud.utils.session_stats import format_cost
 
@@ -43,6 +44,69 @@ CONNECTION_STATES = frozenset(get_args(ConnectionState))
 """Runtime view of `ConnectionState` for `set_connection`'s defensive guard.
 
 Derived from the `Literal` so the two can never drift."""
+
+CONTEXT_WARNING_PERCENT = 60.0
+"""Context usage above which the meter turns from calm to caution."""
+
+CONTEXT_CRITICAL_PERCENT = 80.0
+"""Context usage above which the meter turns to alert."""
+
+METER_CELLS = 5
+"""Cells in the context meter; each stands for 20% of the window."""
+
+
+def context_percent_style(percent: float) -> str:
+    """Content style encoding how full the context window is.
+
+    Returns:
+        ``"dim"`` up to 60%, ``"$warning"`` above 60%, ``"$error"`` above 80%.
+    """
+    if percent > CONTEXT_CRITICAL_PERCENT:
+        return "$error"
+    if percent > CONTEXT_WARNING_PERCENT:
+        return "$warning"
+    return "dim"
+
+
+def format_context_meter(percent: float, *, ascii: bool | None = None) -> Content:
+    """Render ``▰▰▱▱▱ 34%`` coloured by threshold.
+
+    Any non-zero usage fills at least one cell, so a fresh-but-used window
+    never looks empty. Empty cells stay dim; filled cells and the number
+    take `context_percent_style`.
+
+    Args:
+        percent: Context usage, clamped to ``0..100``.
+        ascii: Force the ASCII (``#``/``-``) or Unicode set; ``None`` follows
+            the configured charset.
+    """
+    percent = min(100.0, max(0.0, percent))
+    glyphs = (ASCII_GLYPHS if ascii else UNICODE_GLYPHS) if ascii is not None else get_glyphs()
+    filled = min(METER_CELLS, math.ceil(percent / (100 / METER_CELLS))) if percent > 0 else 0
+    style = context_percent_style(percent)
+    return Content.assemble(
+        (glyphs.meter_filled * filled, style),
+        (glyphs.meter_empty * (METER_CELLS - filled), "dim"),
+        (f" {percent:.0f}%", style),
+    )
+
+
+def format_cwd_short(path: str) -> str:
+    """Collapse a display path to its anchor and last component.
+
+    ``~/Documents/work/opscloud`` becomes ``~/…/opscloud``; paths with at
+    most one component under the anchor are returned unchanged.
+    """
+    if path.startswith("~/"):
+        anchor, rest = "~/", path[2:]
+    elif path.startswith("/"):
+        anchor, rest = "/", path[1:]
+    else:
+        anchor, rest = "", path
+    parts = [p for p in rest.split("/") if p]
+    if len(parts) <= 2:
+        return path
+    return f"{anchor}{get_glyphs().ellipsis}/{parts[-1]}"
 
 
 class ModelLabel(Widget):
@@ -225,8 +289,8 @@ class StatusBar(Horizontal):
     }
 
     StatusBar .status-auto-approve.smart {
-        background: #06b6d4;
-        color: #0f172a;
+        background: $secondary;
+        color: $background;
         text-style: bold;
     }
 
@@ -305,9 +369,26 @@ class StatusBar(Horizontal):
         text-style: underline;
     }
 
+    /* Production alert: the one loud element in the bar, on purpose. */
+    StatusBar .status-prod {
+        display: none;
+        width: auto;
+        padding: 0 1;
+        margin: 0 0 0 1;
+        background: $ctx-prod;
+        color: $background;
+        text-style: bold;
+    }
+
+    /* Dim rule between right-hand segments; hidden with its neighbour. */
+    StatusBar .status-sep {
+        width: auto;
+        color: $text-muted;
+    }
+
     StatusBar ModelLabel {
         width: auto;
-        padding: 0 2;
+        padding: 0 2 0 1;
         color: $text-muted;
         text-align: right;
     }
@@ -364,6 +445,8 @@ class StatusBar(Horizontal):
         self._spinner = Spinner()
         self._spinner_timer: Timer | None = None
         self._busy_message = ""
+        self._k8s_context = ""
+        self._production_source: context_detection.ProductionSource | None = None
 
     def compose(self) -> ComposeResult:  # noqa: PLR6301 — Textual widget method
         """Compose the status bar layout.
@@ -384,15 +467,28 @@ class StatusBar(Horizontal):
             yield Static("", classes="status-cwd", id="cwd-display")
             yield BranchLabel(classes="status-branch", id="branch-display")
         yield Static("", classes="status-rubric", id="rubric-display")
+        yield Static("PROD", classes="status-prod", id="prod-pill")
         yield Static("", classes="status-cloud", id="cloud-display")
+        sep = get_glyphs().box_vertical
+        yield Static(sep, classes="status-sep", id="sep-tokens")
         yield Static("", classes="status-tokens", id="tokens-display")
+        yield Static(sep, classes="status-sep", id="sep-model")
         yield ModelLabel(id="model-display")
 
     _CWD_WIDTH_THRESHOLD = 70
     """Hide cwd display below this terminal width."""
 
+    _MODEL_WIDTH_THRESHOLD = 60
+    """Hide the model label below this terminal width (after cwd and region)."""
+
+    _TOKENS_COMPACT_THRESHOLD = 70
+    """Below this width the token segment drops the cumulative count."""
+
+    _K8S_RECHECK_SECONDS = 15.0
+    """How often to re-read the kube context for the PROD pill."""
+
     def on_resize(self, event: events.Resize) -> None:
-        """Hide the cwd on very narrow terminals.
+        """Drop segments on narrow terminals: cwd, then region, then model.
 
         The git branch stays visible at any width (unless disabled via
         `HIDE_GIT_BRANCH`) and ellipsizes to fit; only the cwd is dropped
@@ -400,7 +496,12 @@ class StatusBar(Horizontal):
         """
         width = event.size.width
         self._set_cwd_visible(not self._hide_cwd and width >= self._CWD_WIDTH_THRESHOLD)
+        with suppress(NoMatches):
+            self.query_one("#model-display", ModelLabel).display = (
+                width >= self._MODEL_WIDTH_THRESHOLD
+            )
         self._render_cloud()
+        self._render_tokens(self.tokens, approximate=self._approximate)
 
     def _set_cwd_visible(self, visible: bool) -> None:
         """Show or hide cwd and keep adjacent branch spacing in sync."""
@@ -432,6 +533,27 @@ class StatusBar(Horizontal):
                     widget.add_class("after-status")
                 else:
                     widget.remove_class("after-status")
+
+    def _sync_segment_separators(self) -> None:
+        """Show a `│` before tokens / model only when both sides are visible."""
+        seen = False
+        for segment_ids, sep_id in (
+            (("#prod-pill", "#cloud-display"), None),
+            (("#tokens-display",), "#sep-tokens"),
+            (("#model-display",), "#sep-model"),
+        ):
+            visible = False
+            for segment_id in segment_ids:
+                with suppress(NoMatches):
+                    widget = self.query_one(segment_id)
+                    shown = bool(widget.display)
+                    if isinstance(widget, ModelLabel):
+                        shown = shown and bool(widget.model)
+                    visible = visible or shown
+            if sep_id is not None:
+                with suppress(NoMatches):
+                    self.query_one(sep_id).display = visible and seen
+            seen = seen or visible
 
     def on_unmount(self) -> None:
         """Stop the spinner timer so it can't tick on a detached widget."""
@@ -478,6 +600,7 @@ class StatusBar(Horizontal):
         except Exception:
             with suppress(NoMatches):
                 self.query_one("#cloud-display", Static).display = False
+            self._refresh_production()
         # Initialize active model context limit
         try:
             from opscloud.config.settings import settings
@@ -485,6 +608,9 @@ class StatusBar(Horizontal):
             self.set_context_limit(settings.model_context_limit)
         except Exception:
             pass
+        # The kube context can change under us (kubectx in another shell).
+        self.set_interval(self._K8S_RECHECK_SECONDS, self._refresh_production)
+        self._sync_segment_separators()
 
     def watch_context_limit(self, _new_value: int | None) -> None:
         """Update the combined token and cost display when context limit changes."""
@@ -528,7 +654,9 @@ class StatusBar(Horizontal):
             display = self.query_one("#cwd-display", Static)
         except NoMatches:
             return
-        display.update(self._format_cwd(new_value))
+        full = self._format_cwd(new_value)
+        display.update(format_cwd_short(full))
+        display.tooltip = full
 
     def watch_branch(self, new_value: str) -> None:
         """Update branch display when it changes."""
@@ -800,16 +928,66 @@ class StatusBar(Horizontal):
 
     def watch_cloud_profile(self, _new_value: str) -> None:
         """Update cloud profile indicator when profile changes."""
+        self._update_production()
         self._render_cloud()
 
     def watch_cloud_region(self, _new_value: str) -> None:
         """Update cloud profile indicator when region changes."""
         self._render_cloud()
 
+    def _refresh_production(self) -> None:
+        """Re-read the kube context (a file read, no subprocess) and re-detect PROD."""
+        try:
+            self._k8s_context = context_detection.current_k8s_context()
+        except Exception:
+            logger.debug("kube context read failed", exc_info=True)
+            self._k8s_context = ""
+        self._update_production()
+        self._render_cloud()
+
+    def _update_production(self) -> None:
+        """Recompute the production source from cached inputs and sync the pill."""
+        values = {
+            "aws": self.cloud_profile,
+            "k8s": self._k8s_context,
+            "tf": os.environ.get("TF_WORKSPACE", ""),
+        }
+        source = context_detection.detect_production(
+            aws_profile=values["aws"],
+            k8s_context=values["k8s"],
+            tf_workspace=values["tf"],
+        )
+        self._production_source = source
+        try:
+            pill = self.query_one("#prod-pill", Static)
+        except NoMatches:
+            return
+        pill.display = source is not None
+        pill.tooltip = (
+            f"Production context ({source}: {values[source]})" if source is not None else None
+        )
+
+    @property
+    def production_source(self) -> context_detection.ProductionSource | None:
+        """Which context flagged production (``'aws'``/``'k8s'``/``'tf'``), or ``None``."""
+        return self._production_source
+
     _CLOUD_NARROW_THRESHOLD = 90
 
+    def _terminal_width(self) -> int:
+        """Current app width, or a roomy default before the app is running."""
+        try:
+            return self.app.size.width
+        except Exception:
+            return 120
+
     def _render_cloud(self) -> None:
-        """Render the active AWS cloud profile and region concisely with responsive truncation."""
+        """Render ``aws profile · region`` with responsive truncation.
+
+        The profile is `$secondary` normally and `$error` when the AWS
+        profile itself is the production source; the region drops below
+        ``_CLOUD_NARROW_THRESHOLD`` columns.
+        """
         try:
             display = self.query_one("#cloud-display", Static)
         except NoMatches:
@@ -817,26 +995,23 @@ class StatusBar(Horizontal):
         if not self.cloud_profile:
             display.display = False
             display.update("")
+            self._sync_segment_separators()
             return
 
         display.display = True
-        t = Text()
-        t.append("aws:", style="dim")
-
-        try:
-            width = self.app.size.width
-        except Exception:
-            width = 120
-        is_narrow = width < self._CLOUD_NARROW_THRESHOLD
+        glyphs = get_glyphs()
+        is_narrow = self._terminal_width() < self._CLOUD_NARROW_THRESHOLD
 
         prof_name = self.cloud_profile
         if is_narrow and len(prof_name) > 16:
-            prof_name = prof_name[:13] + "…"
+            prof_name = prof_name[:13] + glyphs.ellipsis
 
-        t.append(prof_name, style="bold #7DCFFF")
+        profile_style = "bold $error" if self._production_source == "aws" else "bold $secondary"
+        parts: list[tuple[str, str]] = [("aws ", "dim"), (prof_name, profile_style)]
         if self.cloud_region and not is_narrow:
-            t.append(f" ({self.cloud_region})", style="dim")
-        display.update(t)
+            parts += [(f" {glyphs.separator} ", "dim"), (self.cloud_region, "dim")]
+        display.update(Content.assemble(*parts))
+        self._sync_segment_separators()
 
     @on(events.Click, "#cloud-display")
     def _on_cloud_clicked(self, event: events.Click) -> None:
@@ -848,19 +1023,15 @@ class StatusBar(Horizontal):
             if inspect.isawaitable(res):
                 self.app.run_worker(res)
 
-    _CONTEXT_WARNING_PERCENT = 60.0
+    _CONTEXT_WARNING_PERCENT = CONTEXT_WARNING_PERCENT
     """Context usage at which the percentage turns from calm to caution."""
 
-    _CONTEXT_CRITICAL_PERCENT = 80.0
+    _CONTEXT_CRITICAL_PERCENT = CONTEXT_CRITICAL_PERCENT
     """Context usage at which the percentage turns to alert."""
 
-    def _percent_color(self, percent: float) -> str:
-        """Return the color that encodes how full the context window is."""
-        if percent > self._CONTEXT_CRITICAL_PERCENT:
-            return "bold red"
-        if percent > self._CONTEXT_WARNING_PERCENT:
-            return "bold yellow"
-        return "dim"
+    def _percent_color(self, percent: float) -> str:  # noqa: PLR6301
+        """Return the Content style that encodes how full the context window is."""
+        return context_percent_style(percent)
 
     @staticmethod
     def _compact_tokens(count: int) -> str:
@@ -880,9 +1051,11 @@ class StatusBar(Horizontal):
         return format_cost(self.cost_usd) if self.cost_usd > 0 else ""
 
     def _render_tokens(self, count: int, *, approximate: bool = False) -> None:
-        """Render context percentage, cumulative tokens, and cumulative cost.
+        """Render the context meter, cumulative tokens, and cumulative cost.
 
-        Format: Context: {percent}% • {compact_count} tokens • ${cost}
+        Format: ``ctx ▰▱▱▱▱ {percent}% │ {compact_count} tok · ${cost}``.
+        Below ``_TOKENS_COMPACT_THRESHOLD`` columns the cumulative count is
+        dropped so the meter and cost still fit.
 
         Args:
             count: Total cumulative session token count.
@@ -898,42 +1071,43 @@ class StatusBar(Horizontal):
         if count <= 0 and ctx_count <= 0 and self.cost_usd <= 0 and not self._tokens_pending:
             display.display = False
             display.update("")
+            self._sync_segment_separators()
             return
 
         display.display = True
         suffix = "+" if approximate else ""
         cost = self._cost_text()
-        bullet = get_glyphs().bullet
+        glyphs = get_glyphs()
+        show_count = self._terminal_width() >= self._TOKENS_COMPACT_THRESHOLD
 
-        t = Text()
+        ctx: Content | None = None
+        usage: Content | None = None
         if self._tokens_pending:
-            t.append("Context: ", style="dim")
-            t.append("...", style="dim")
-            if count > 0:
-                t.append(f" {bullet} ")
-                t.append(f"~{self._compact_tokens(count)} tokens...", style="dim")
+            ctx = Content.styled("ctx ...", "dim")
+            if count > 0 and show_count:
+                usage = Content.styled(f"~{self._compact_tokens(count)} tok...", "dim")
         else:
             if ctx_count > 0 or count > 0:
-                t.append("Context: ", style="dim")
                 if self.context_limit is not None and self.context_limit > 0:
                     percent = min(100.0, max(0.0, ctx_count / self.context_limit * 100))
-                    color = self._percent_color(percent)
-                    t.append(f"{percent:.0f}%", style=color)
+                    ctx = Content.assemble(("ctx ", "dim"), format_context_meter(percent))
                 else:
-                    t.append("--", style="dim")
-
-            if count > 0:
-                count_str = f"{self._compact_tokens(count)}{suffix} tokens"
-                if len(t) > 0:
-                    t.append(f" {bullet} ")
-                t.append(count_str, style="")
+                    ctx = Content.styled("ctx --", "dim")
+            if count > 0 and show_count:
+                usage = Content(f"{self._compact_tokens(count)}{suffix} tok")
 
         if cost:
-            if len(t) > 0:
-                t.append(f" {bullet} ")
-            t.append(cost)
+            cost_content = Content(cost)
+            usage = (
+                Content.assemble(usage, (f" {glyphs.separator} ", "dim"), cost_content)
+                if usage is not None
+                else cost_content
+            )
 
-        display.update(t)
+        segment_sep = Content.styled(f" {glyphs.box_vertical} ", "dim")
+        parts = [part for part in (ctx, usage) if part is not None]
+        display.update(segment_sep.join(parts))
+        self._sync_segment_separators()
 
     def set_rubric_label(self, label: str) -> None:
         """Set the rubric status label.
@@ -946,13 +1120,15 @@ class StatusBar(Horizontal):
     def set_cloud(self, *, profile: str, region: str = "") -> None:
         """Update the active cloud profile and region shown on the status bar.
 
+        Also re-reads the kube context, so a `/cloud` switch re-checks PROD.
+
         Args:
             profile: Name of active AWS profile (e.g. 'default', 'krayak').
             region: Optional AWS region (e.g. 'ap-south-1', 'us-east-1').
         """
         self.cloud_profile = profile
         self.cloud_region = region
-        self._render_cloud()
+        self._refresh_production()
 
     def set_context_limit(self, limit: int | None) -> None:
         """Set the active model's context limit."""
@@ -1035,3 +1211,4 @@ class StatusBar(Horizontal):
         display.model = model
         display.effort = effort
         display.refresh(layout=True)
+        self._sync_segment_separators()

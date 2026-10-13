@@ -12,10 +12,6 @@ Screen {
     color: $foreground;
 }
 
-ModalScreen {
-    align: center middle;
-    background: rgba(0, 0, 0, 0.7);
-}
 
 /* ── Universal Scrollbar Styling ────────────────────────── */
 
@@ -58,13 +54,13 @@ Scrollbar:hover {
 /* ── Diff lines ──────────────────────────────────────── */
 
 .diff-line-added, .diff-added {
-    background: #1D2D20;
-    color: #9ECE6A;
+    background: $success 20%;
+    color: $success;
 }
 
 .diff-line-removed, .diff-removed {
-    background: #2D2030;
-    color: #F7768E;
+    background: $error 20%;
+    color: $error;
 }
 
 .diff-line-hunk {
@@ -94,47 +90,8 @@ StatusBar {
 
 /* ── Chat input ──────────────────────────────────────── */
 
-ChatInput {
-    height: auto;
-}
-
-ChatInput #input-box {
-    height: auto;
-    max-height: 20;
-    min-height: 3;
-    border: solid $primary;
-    background: $background;
-    color: $foreground;
-    padding: 0;
-}
-
-ChatInput .input-row {
-    height: auto;
-    width: 100%;
-    layout: horizontal;
-    padding: 0 1;
-}
-
-ChatInput .input-prompt {
-    width: 2;
-    height: 1;
-    color: $primary;
-    text-style: bold;
-}
-
-ChatInput ChatTextArea {
-    width: 1fr;
-    height: auto;
-    min-height: 1;
-    max-height: 10;
-    border: none;
-    background: transparent;
-    padding: 0;
-}
-
-ChatInput:focus #input-box {
-    border: solid $primary;
-}
+/* Styled in ChatInput.DEFAULT_CSS (widgets/chat_input.py). Rules here
+   would override the mode-coloured borders, so keep this section empty. */
 
 
 /* ── Messages ────────────────────────────────────────── */
@@ -150,8 +107,8 @@ AssistantMessage {
 }
 
 ToolCallMessage {
-    padding: 0 1;
-    margin: 0 0 0 0;
+    /* Spacing lives in ToolCallMessage.DEFAULT_CSS (standalone rows get a
+       top margin, expanded group members nest without one). */
     color: $foreground;
 }
 
@@ -177,14 +134,27 @@ SystemMessage {
     pointer: text;
 }
 
+SystemMessage.-card,
+SystemMessage.-command-output,
+CommandOutputMessage {
+    height: auto;
+    padding: 1 2;
+    margin: 1 0 1 0;
+    background: $surface 45%;
+    border-left: wide $primary;
+    color: $foreground;
+    pointer: text;
+}
+
+
 /* ── Queued User Message ─────────────────────────────── */
 
 QueuedUserMessage {
     padding: 0 1;
-    margin: 1 0 0 4;
-    background: $surface;
-    color: $foreground;
-    border-left: solid $panel;
+    margin: 1 0 0 0;
+    background: transparent;
+    color: $text-muted;
+    border-left: wide $warning 45%;
 }
 
 /* ── Skill Message ──────────────────────────────────── */
@@ -390,25 +360,23 @@ SubagentPanel {
     margin: 1 0;
     padding: 0 1;
     background: $surface;
-    border: solid $warning;
+    border: round $primary;
 }
 
 .approval-menu .approval-title {
-    text-style: bold;
-    color: $warning;
-    margin-bottom: 0;
+    display: none;
 }
 
 .approval-menu .approval-command {
     height: auto;
     margin: 0 0 1 0;
     padding: 0 1;
-    color: $warning;
+    color: $text;
 }
 
 .approval-menu .approval-separator {
     height: 1;
-    color: $warning;
+    border-top: solid $panel;
     margin: 0;
 }
 
@@ -425,7 +393,7 @@ SubagentPanel {
 .approval-menu .approval-options-container {
     height: auto;
     background: $surface;
-    padding: 0 1;
+    padding: 0 0;
     margin-top: 0;
 }
 
@@ -435,21 +403,19 @@ SubagentPanel {
 }
 
 .approval-menu .approval-option-selected {
-    background: $primary;
+    background: $primary 12%;
+    color: $text;
     text-style: bold;
 }
 
 .approval-menu .approval-reason-input {
     margin: 1 0 0 0;
-    border: solid $warning;
+    border: round $warning;
     background: $surface;
 }
 
 .approval-menu .approval-help {
-    color: $foreground;
-    text-style: italic;
-    margin-top: 0;
-    margin-bottom: 0;
+    display: none;
 }
 
 /* Tool approval widgets & diff styling */

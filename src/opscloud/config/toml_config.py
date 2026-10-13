@@ -72,6 +72,44 @@ def _save_toml_field(
     return True
 
 
+save_toml_field = _save_toml_field
+
+
+def delete_toml_field(
+    section: str,
+    field: str,
+    config_path: Path | None = None,
+) -> bool:
+    """Read-modify-write: delete a key under a section in config.toml atomically."""
+    target_path = config_path or CONFIG_PATH
+    if not target_path.exists():
+        return True
+    try:
+        with _config_write_lock:
+            with target_path.open("rb") as f:
+                data = tomllib.load(f)
+            sec = data.get(section)
+            if not isinstance(sec, dict) or field not in sec:
+                return True
+            del sec[field]
+            if not sec:
+                del data[section]
+
+            fd, tmp_path = tempfile.mkstemp(dir=target_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    tomli_w.dump(data, f)
+                Path(tmp_path).replace(target_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    Path(tmp_path).unlink()
+                raise
+    except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        logger.exception("Could not delete %s.%s from %s", section, field, target_path)
+        return False
+    return True
+
+
 def save_recent_model(model_spec: str, config_path: Path | None = None) -> bool:
     """Persist recent model selection to [models].recent in config.toml and MRU cache."""
     if not isinstance(model_spec, str) or not model_spec:
@@ -373,6 +411,18 @@ def load_agent_pool(config_path: Path | None = None) -> dict[str, str] | None:
     if not any(k in res for k in ("fast", "standard", "powerful")):
         return None
     return res
+
+
+def format_agent_pool_summary(pool: dict[str, str] | None) -> str:
+    """Return a compact human-readable summary of an agent model pool dictionary."""
+    if not pool:
+        return "default (dynamic discovery)"
+    fast = pool.get("fast", "-")
+    std = pool.get("standard", "-")
+    pow_m = pool.get("powerful", "-")
+    prov = pool.get("provider", "multi")
+    return f"fast='{fast}', standard='{std}', powerful='{pow_m}' (provider: {prov})"
+
 
 
 def clear_agent_pool(config_path: Path | None = None) -> bool:
