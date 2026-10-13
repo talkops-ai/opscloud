@@ -237,12 +237,16 @@ async def test_assistant_fence_click_opens_file(tmp_path: Path) -> None:
         mock_open.return_value = True
         async with app.run_test() as pilot:
             await pilot.pause()
-            # Wait for background markdown rendering worker to populate DOM
+            # Wait for background markdown rendering worker to populate DOM and apply link styling
+            fence = None
             for _ in range(50):
-                if msg.query(MarkdownFence):
+                fences = msg.query(MarkdownFence)
+                if fences and "-is-file-link" in fences.first().classes:
+                    fence = fences.first()
                     break
                 await pilot.pause(0.05)
-            fence = msg.query_one(MarkdownFence)
+            if fence is None:
+                fence = msg.query_one(MarkdownFence)
             assert "-is-file-link" in fence.classes
             assert fence.border_subtitle == "click to open"
 

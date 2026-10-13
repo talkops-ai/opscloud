@@ -3645,6 +3645,10 @@ def _assistant_markdown_class() -> type[Markdown]:
     class AssistantFence(MarkdownFence):
         """Code fence that shows its language label and opens file paths on click."""
 
+        def __init__(self, markdown: Any, token: Any, code: str) -> None:
+            super().__init__(markdown, token, code)
+            self._apply_language_title()
+
         def _get_target_path(self, line_index: int | None = None) -> str | None:
             from opscloud.editor import extract_file_path
 
