@@ -29,27 +29,52 @@ APPROVAL_MODE_NAMESPACE: tuple[str, str] = ("opscloud", "approval_mode")
 """Store namespace for per-thread approval-mode control records."""
 
 AUTO_NOTICE_VERSION = "2026-08-23"
+YOLO_ACKNOWLEDGEMENT_POLICY_VERSION = "2026-04-13"
 
 
 class ApprovalMode(StrEnum):
-    """Tool-approval policy selected for an interactive thread.
+    """Tool-approval policy selected for a thread.
 
     - MANUAL: Prompt human for confirmation on risky or mutating actions (safe default).
     - AUTO: Classic agent LLM classifier decides (uses primary reasoning model).
     - SMART: Jev System One classifier decides (ultra-fast <100ms, calibrated risk probabilities).
+    - YOLO: Execute gated tools without human confirmation or classifier review
+      (restricted to CLI headless and webhook server flows).
     """
 
     MANUAL = "manual"
     AUTO = "auto"
     SMART = "smart"
+    YOLO = "yolo"
 
     # Compatibility alias
     ALWAYS = "manual"
 
     @classmethod
-    def from_str(cls, value: str | None) -> ApprovalMode:
+    def from_str(
+        cls,
+        value: str | None,
+        *,
+        allow_yolo: bool = True,
+    ) -> ApprovalMode:
         """Parse string to ApprovalMode, failing closed to MANUAL."""
-        return coerce_approval_mode(value)
+        return coerce_approval_mode(value, allow_yolo=allow_yolo)
+
+
+INTERACTIVE_APPROVAL_MODES: tuple[ApprovalMode, ...] = (
+    ApprovalMode.MANUAL,
+    ApprovalMode.SMART,
+    ApprovalMode.AUTO,
+)
+"""Approval modes supported in interactive TUI flows (excludes YOLO)."""
+
+ALL_APPROVAL_MODES: tuple[ApprovalMode, ...] = (
+    ApprovalMode.MANUAL,
+    ApprovalMode.SMART,
+    ApprovalMode.AUTO,
+    ApprovalMode.YOLO,
+)
+"""All approval modes supported in CLI headless (-p) and webhook (serve) flows."""
 
 
 class ApprovalModePayload(TypedDict):
@@ -58,13 +83,25 @@ class ApprovalModePayload(TypedDict):
     mode: str
 
 
-def coerce_approval_mode(value: object) -> ApprovalMode:
-    """Return a validated mode, failing closed to `MANUAL`."""
+def coerce_approval_mode(
+    value: object,
+    *,
+    allow_yolo: bool = True,
+) -> ApprovalMode:
+    """Return a validated mode, failing closed to `MANUAL`.
+
+    Args:
+        value: Mode string, enum, or boolean.
+        allow_yolo: Whether `yolo` is permitted in the calling flow. Interactive
+            TUI flows pass `allow_yolo=False` so `yolo` falls back to `MANUAL`.
+    """
     if isinstance(value, bool):
         return ApprovalMode.AUTO if value else ApprovalMode.MANUAL
     if value is None:
         return ApprovalMode.MANUAL
     if isinstance(value, ApprovalMode):
+        if value is ApprovalMode.YOLO and not allow_yolo:
+            return ApprovalMode.MANUAL
         return value
     if isinstance(value, str):
         normalized = value.strip().lower()
@@ -74,6 +111,8 @@ def coerce_approval_mode(value: object) -> ApprovalMode:
             return ApprovalMode.AUTO
         if normalized in {"smart", "s", "jev"}:
             return ApprovalMode.SMART
+        if normalized in {"yolo", "y"}:
+            return ApprovalMode.YOLO if allow_yolo else ApprovalMode.MANUAL
     return ApprovalMode.MANUAL
 
 
@@ -111,9 +150,10 @@ def next_approval_mode(
     auto_eligible: bool = True,
     smart_eligible: bool = True,
 ) -> ApprovalMode:
-    """Cycle to the next approval mode (Manual → Auto → Smart → Manual).
+    """Cycle to the next interactive approval mode (Manual → Auto → Smart → Manual).
 
     Used by the Textual TUI (`Shift+Tab` switcher) and CLI interactive cycles.
+    Never cycles into `YOLO`; if called from `YOLO`, exits to `MANUAL`.
     """
     mode = current if isinstance(current, ApprovalMode) else coerce_approval_mode(current)
 
@@ -483,6 +523,29 @@ def _merge_approval_state(
         return False
 
 
+def has_yolo_acknowledgement(path: Path | None = None) -> bool:
+    """Return whether the current YOLO acknowledgement policy is accepted."""
+    target = path or approval_state_path()
+    data = _load_approval_state(target)
+    return (
+        data.get("yolo_acknowledged") is True
+        and data.get("policy_version") == YOLO_ACKNOWLEDGEMENT_POLICY_VERSION
+    )
+
+
+def save_yolo_acknowledgement(path: Path | None = None) -> bool:
+    """Persist that the current YOLO acknowledgement policy was accepted."""
+    target = path or approval_state_path()
+    return _merge_approval_state(
+        target,
+        {
+            "policy_version": YOLO_ACKNOWLEDGEMENT_POLICY_VERSION,
+            "yolo_acknowledged": True,
+        },
+        failure_label="YOLO acknowledgement",
+    )
+
+
 def has_auto_mode_notice(path: Path | None = None) -> bool:
     """Return whether the current Auto first-enable notice was already shown."""
     target = path or approval_state_path()
@@ -507,8 +570,11 @@ def save_auto_mode_notice(path: Path | None = None) -> bool:
 
 
 __all__ = [
+    "ALL_APPROVAL_MODES",
     "APPROVAL_MODE_NAMESPACE",
     "AUTO_NOTICE_VERSION",
+    "INTERACTIVE_APPROVAL_MODES",
+    "YOLO_ACKNOWLEDGEMENT_POLICY_VERSION",
     "ApprovalMode",
     "ApprovalModePayload",
     "approval_mode_key",
@@ -520,9 +586,11 @@ __all__ = [
     "coerce_approval_mode",
     "get_approval_mode",
     "has_auto_mode_notice",
+    "has_yolo_acknowledgement",
     "next_approval_mode",
     "read_approval_mode_from_store",
     "save_auto_mode_notice",
+    "save_yolo_acknowledgement",
     "set_approval_mode",
 ]
 

@@ -151,8 +151,11 @@ def format_input_hints(hints: list[tuple[str, str]], max_width: int) -> Content:
 
 CompletionKind = Literal["command", "file"]
 
-_LABEL_COLUMN_MAX = 22
+_LABEL_COLUMN_MAX = 48
 """Widest the command label column grows before labels get an ellipsis."""
+
+_HINT_COLUMN_MAX = 22
+"""Widest a short command label grows from inline argument hints alone."""
 
 _ROW_PREFIX_CELLS = 2
 """Selection bar plus one space, in front of every row."""
@@ -297,11 +300,14 @@ def completion_label_width(
 ) -> int:
     """Width of the label column for one popup rebuild.
 
-    Commands: the longest ``name [hint]``, capped at ``_LABEL_COLUMN_MAX``.
+    Commands: the longest ``name`` (up to ``_LABEL_COLUMN_MAX`` so namespaced
+    plugin skills like ``chrome-devtools-plugin:memory-leak-debugging`` fit
+    in full), while inline argument hints widen short command names up to
+    ``_HINT_COLUMN_MAX``.
     Hints are dropped from the sizing when they would leave descriptions
-    fewer than ``_MIN_DESC_CELLS``; they then get an ellipsis instead.
+    fewer than ``_MIN_DESC_CELLS``.
     Files: the longest path, allowed to use whatever the (short) type
-    column leaves free, since a 22-cell path hides the part that matters.
+    column leaves free.
 
     Args:
         suggestions: ``(label, description)`` pairs being shown.
@@ -314,7 +320,9 @@ def completion_label_width(
     hints = argument_hints or [""] * len(suggestions)
     names = [cell_len(_completion_name(label, kind)) for label, _desc in suggestions]
     with_hints = [
-        cell_len(f"{_completion_name(label, kind)} {hint}") if hint and kind == "command" else n
+        min(cell_len(f"{_completion_name(label, kind)} {hint}"), max(n, _HINT_COLUMN_MAX))
+        if hint and kind == "command"
+        else n
         for (label, _desc), hint, n in zip(suggestions, hints, names, strict=False)
     ]
     cap = _LABEL_COLUMN_MAX
@@ -324,7 +332,8 @@ def completion_label_width(
     column = min(max(with_hints), cap)
     room = width - _ROW_PREFIX_CELLS - column - _COLUMN_GAP
     if kind == "command" and width > 0 and room < _MIN_DESC_CELLS:
-        column = min(max(names), cap)
+        name_cap = max(_HINT_COLUMN_MAX, width - _ROW_PREFIX_CELLS - _COLUMN_GAP - _MIN_DESC_CELLS)
+        column = min(max(names), min(cap, name_cap))
     if width > 0:
         column = min(column, width - _ROW_PREFIX_CELLS)
     return max(column, 0)
@@ -373,7 +382,8 @@ def format_completion_row(
     matches = set(_match_spans(query, name))
     base = "bold" if selected else ""
     if kind == "file":
-        dir_end = name.rfind("/") + 1
+        trimmed = name.rstrip("/")
+        dir_end = trimmed.rfind("/") + 1
         styles = [
             _MATCH_STYLE if i in matches else ("dim" if i < dir_end else base)
             for i in range(len(name))
@@ -980,7 +990,7 @@ class ChatInput(Widget):
         self._prompt_widget = Static("❯", id="input-prompt", classes="input-prompt")
         self._text_area = ChatTextArea(id="chat-text-area")
         self._autocomplete = CompletionPopup(id="completion-popup")
-        self._history: list[str] = []
+        self._history: list[str] = self._load_persisted_history()
         self._history_index: int = -1
         self._saved_draft: str = ""
         self._pasted_full_text: str | None = None
@@ -1051,6 +1061,7 @@ class ChatInput(Widget):
             self.mode = mode
             self._text_area.text = value[len(prefix) :]
         else:
+            self.mode = "normal"
             self._text_area.text = value
             self._sync_mode()
         self._update_argument_hint()
@@ -1410,6 +1421,36 @@ class ChatInput(Widget):
             self._submit_value()
             return True
 
+        # When `/btw` card is open and the input is empty in normal mode,
+        # route Enter (dismiss/cancel), Tab (expand/collapse), and Left/Right (history).
+        if (
+            app is not None
+            and hasattr(app, "is_btw_open")
+            and app.is_btw_open()
+            and self.mode == "normal"
+            and not self.text.strip()
+        ):
+            if key == "enter":
+                event.prevent_default()
+                event.stop()
+                app.dismiss_btw_response()
+                return True
+            if key == "tab":
+                event.prevent_default()
+                event.stop()
+                app.toggle_btw_expanded()
+                return True
+            if key == "left":
+                event.prevent_default()
+                event.stop()
+                app.navigate_btw(-1)
+                return True
+            if key == "right":
+                event.prevent_default()
+                event.stop()
+                app.navigate_btw(1)
+                return True
+
         if key == "enter":
             event.prevent_default()
             event.stop()
@@ -1427,6 +1468,24 @@ class ChatInput(Widget):
             event.stop()
             self.action_history_next()
             return True
+
+        if key == "up" and self._history:
+            row, _col = self._text_area.cursor_location if self._text_area else (0, 0)
+            last_row = max(0, self._text_area.document.line_count - 1) if self._text_area else 0
+            if row == 0 or (self._history_index != -1 and row >= last_row):
+                event.prevent_default()
+                event.stop()
+                self.action_history_prev()
+                return True
+
+        if key == "down" and self._history_index != -1:
+            row, _col = self._text_area.cursor_location if self._text_area else (0, 0)
+            last_row = max(0, self._text_area.document.line_count - 1) if self._text_area else 0
+            if row >= last_row or row == 0:
+                event.prevent_default()
+                event.stop()
+                self.action_history_next()
+                return True
 
         if key == "ctrl+c" and not self.text.strip():
             event.prevent_default()
@@ -1509,8 +1568,7 @@ class ChatInput(Widget):
         if prefix and not content.startswith(prefix):
             content = prefix + content
 
-        if not self._history or self._history[-1] != content:
-            self._history.append(content)
+        self.add_history_entry(content, persist=True)
         self._history_index = -1
         self._saved_draft = ""
 
@@ -1522,8 +1580,58 @@ class ChatInput(Widget):
 
     # ── History ─────────────────────────────────────────
 
+    @staticmethod
+    def _load_persisted_history(max_entries: int = 200) -> list[str]:
+        """Load persisted prompt history from ~/.opscloud/.state/history.jsonl."""
+        import json
+        import os
+
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return []
+        try:
+            from opscloud.config.paths import HISTORY_PATH
+
+            if not HISTORY_PATH.is_file():
+                return []
+            entries: list[str] = []
+            for raw_line in HISTORY_PATH.read_text(encoding="utf-8").splitlines()[-max_entries:]:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    text = data.get("text") if isinstance(data, dict) else None
+                except Exception:
+                    text = line
+                if isinstance(text, str) and text.strip():
+                    if not entries or entries[-1] != text:
+                        entries.append(text)
+            return entries[-max_entries:]
+        except Exception:
+            return []
+
+    def add_history_entry(self, content: str, *, persist: bool = True) -> None:
+        """Append a prompt to in-memory history and optionally persist to disk."""
+        import json
+        import os
+
+        clean = content.strip()
+        if not clean:
+            return
+        if not self._history or self._history[-1] != clean:
+            self._history.append(clean)
+            if persist and not os.environ.get("PYTEST_CURRENT_TEST"):
+                try:
+                    from opscloud.config.paths import HISTORY_PATH
+
+                    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(HISTORY_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"text": clean}) + "\n")
+                except Exception:
+                    pass
+
     def action_history_prev(self) -> None:
-        """Navigate backward in history."""
+        """Navigate backward in history and place cursor at the end."""
         if not self._history:
             return
         if self._history_index == -1:
@@ -1532,18 +1640,18 @@ class ChatInput(Widget):
         elif self._history_index > 0:
             self._history_index -= 1
 
-        self.text = self._history[self._history_index]
+        self.set_value_at_end(self._history[self._history_index])
 
     def action_history_next(self) -> None:
-        """Navigate forward in history."""
+        """Navigate forward in history and place cursor at the end."""
         if self._history_index == -1:
             return
         if self._history_index < len(self._history) - 1:
             self._history_index += 1
-            self.text = self._history[self._history_index]
+            self.set_value_at_end(self._history[self._history_index])
         else:
             self._history_index = -1
-            self.text = self._saved_draft
+            self.set_value_at_end(self._saved_draft)
 
     def action_dismiss_or_clear(self) -> None:
         """Clear input text and end slash command mode."""

@@ -75,7 +75,7 @@ class MCPToolMiddleware(AgentMiddleware):
             if getattr(request, "tool_call", None) and isinstance(request.tool_call, dict)
             else ""
         )
-        return ":" in tool_name or tool_name.startswith("mcp__")
+        return tool_name == "call_mcp_tool" or ":" in tool_name or tool_name.startswith("mcp__")
 
     def _preprocess_request(self, request: ToolCallRequest) -> ToolCallRequest:
         if not self._is_mcp_call(request):

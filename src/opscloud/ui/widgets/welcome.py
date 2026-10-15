@@ -14,8 +14,7 @@ Health colour language (shared by the beam and the row dots):
 Lists that exceed the available width show a clickable "+N more" span that
 opens a WelcomeDetailPopup modal with the full list and descriptions.
 
-The banner stays in the scrollback (industry standard, as in Claude Code /
-Gemini CLI) and never collapses.
+The banner stays in the scrollback and never collapses.
 """
 
 from __future__ import annotations

@@ -13,6 +13,8 @@ from typing import (
     Any,
     Literal,
     NotRequired,
+    Sequence,
+    cast,
 )
 
 from langchain.agents.middleware.types import (
@@ -21,8 +23,38 @@ from langchain.agents.middleware.types import (
     PrivateStateAttr,
 )
 from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
 
-from opscloud.state.workflow_channels import _replace_or_reset_messages
+
+def _replace_or_reset_messages(
+    existing: Sequence[AnyMessage] | None,
+    new: Sequence[AnyMessage] | dict[str, Any] | None,
+) -> list[AnyMessage]:
+    """Reducer for ``_agent_session_messages``.
+
+    Behaves like ``add_messages`` but accepts ``None`` / ``{"reset": True}`` to
+    wipe the isolated transcript, and ``{"reset": True, "messages": [...]}`` to
+    replace it atomically (used when a fresh session starts).
+    """
+    if new is None:
+        return []
+    if isinstance(new, dict):
+        if new.get("reset"):
+            replacement = new.get("messages") or []
+            return (
+                cast(
+                    "list[AnyMessage]",
+                    list(add_messages(cast(Any, []), cast(Any, list(replacement)))),
+                )
+                if replacement
+                else []
+            )
+        return list(existing or [])
+    return cast(
+        "list[AnyMessage]",
+        list(add_messages(cast(Any, existing or []), cast(Any, new))),
+    )
+
 
 AgentSessionRequestKind = Literal["start", "continue", "clear"]
 """Typed operations the TUI can submit through ``agent_session_request``."""

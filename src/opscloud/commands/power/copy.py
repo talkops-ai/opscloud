@@ -30,6 +30,10 @@ class CopyHandler(BaseCommandHandler):
         return BypassTier.SIDE_EFFECT_FREE
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
+        subcmd = (ctx.args or "").strip().lower()
+        if subcmd == "btw":
+            return self._execute_copy_btw(ctx)
+
         content: str | None = None
         streaming_pending = False
 
@@ -65,20 +69,7 @@ class CopyHandler(BaseCommandHandler):
                 notify_severity="warning",
             )
 
-        copied = False
-        try:
-            import pyperclip
-            pyperclip.copy(content)
-            copied = True
-        except Exception:
-            if ctx.app is not None and hasattr(ctx.app, "copy_to_clipboard"):
-                try:
-                    ctx.app.copy_to_clipboard(content)
-                    copied = True
-                except Exception:
-                    pass
-
-        if copied:
+        if self._copy_text(ctx.app, content):
             return CommandResult(
                 success=True,
                 message="Copied latest assistant message to clipboard.",
@@ -92,6 +83,57 @@ class CopyHandler(BaseCommandHandler):
             notify="Clipboard support unavailable.",
             notify_severity="error",
         )
+
+    def _execute_copy_btw(self, ctx: CommandContext) -> CommandResult:
+        """Copy the visible or latest `/btw` answer (`copyBtwAnswer` parity)."""
+        app = ctx.app
+        answer: str | None = None
+        err_msg: str | None = None
+
+        if app is not None and hasattr(app, "get_btw_copy_status"):
+            answer, err_msg = app.get_btw_copy_status()
+        else:
+            err_msg = "No /btw response to copy."
+
+        if err_msg or not answer:
+            msg = err_msg or "No /btw response to copy."
+            return CommandResult(
+                success=False,
+                message=msg,
+                notify=msg,
+                notify_severity="warning",
+            )
+
+        if self._copy_text(app, answer):
+            return CommandResult(
+                success=True,
+                message="Copied /btw response to clipboard.",
+                notify="Copied /btw response to clipboard.",
+                notify_severity="information",
+            )
+
+        return CommandResult(
+            success=False,
+            message="Clipboard support unavailable.",
+            notify="Clipboard support unavailable.",
+            notify_severity="error",
+        )
+
+    @staticmethod
+    def _copy_text(app: object | None, content: str) -> bool:
+        copied = False
+        try:
+            import pyperclip
+            pyperclip.copy(content)
+            copied = True
+        except Exception:
+            if app is not None and hasattr(app, "copy_to_clipboard"):
+                try:
+                    app.copy_to_clipboard(content)  # type: ignore[attr-defined]
+                    copied = True
+                except Exception:
+                    pass
+        return copied
 
 
 __all__ = ["CopyHandler"]

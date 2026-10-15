@@ -42,6 +42,8 @@ class AgentSessionState:
         self.description: str | None = None
         self.attached: bool = True
         """Whether plain chat input is routed to the active agent."""
+        self.needs_server_reset: bool = False
+        """Whether the next continue request should reset server-side session messages."""
 
     def clear(self) -> None:
         """Clear the active agent session."""
@@ -51,6 +53,7 @@ class AgentSessionState:
         self.plugin_id = None
         self.description = None
         self.attached = True
+        self.needs_server_reset = False
 
     @property
     def is_active(self) -> bool:
@@ -83,16 +86,9 @@ def sync_agent_session_status_label(app: object, state: AgentSessionState) -> No
         elif state.agent_id and not state.attached and state.short_name:
             set_label(f"▷ Agent: {state.short_name} (detached)")
         else:
-            # Check if workflow is running, else hand back to /goal
-            from opscloud.commands.power.workflow import get_workflow_state, sync_workflow_status_label
+            from opscloud.commands.power.goal import GoalHandler, get_goal_state
 
-            wf_state = get_workflow_state(app)
-            if wf_state.is_open:
-                sync_workflow_status_label(app, wf_state)
-            else:
-                from opscloud.commands.power.goal import GoalHandler, get_goal_state
-
-                GoalHandler._sync_status_rubric(app, get_goal_state(app))
+            GoalHandler._sync_status_rubric(app, get_goal_state(app))
     except Exception:
         pass  # Status bar may not be mounted yet
 
@@ -257,20 +253,6 @@ async def activate_agent_session(
             message=f"Plugin agent `{name}` not found.\n\nRun `/agent` to list available plugin agents.",
         )
 
-    # Check if a workflow is open
-    if app is not None:
-        from opscloud.commands.power.workflow import get_workflow_state
-
-        wf_state = get_workflow_state(app)
-        if wf_state.is_open:
-            return CommandResult(
-                success=False,
-                message=(
-                    f"Workflow `{wf_state.name}` is currently active. "
-                    "Finish or cancel it (`/workflow cancel`) before activating an agent persona."
-                ),
-            )
-
     full_name = str(spec.get("name") or "")
     short_name = _clean_short_name(full_name)
     plugin_id = str(spec.get("plugin_id") or "")
@@ -283,6 +265,7 @@ async def activate_agent_session(
     state.description = description
     state.attached = True
     state.thread_id = ctx.thread_id
+    state.needs_server_reset = not bool(prompt and prompt.strip())
 
     if app is not None:
         sync_agent_session_status_label(app, state)
@@ -318,13 +301,23 @@ async def clear_agent_session(ctx: CommandContext) -> CommandResult:
     if not state.agent_id:
         return CommandResult(success=False, message="No active plugin agent session to clear.")
 
+    old_agent_id = state.agent_id
     old_name = state.short_name or state.agent_id
     state.clear()
     if app is not None:
         sync_agent_session_status_label(app, state)
         runner: Any = getattr(app, "_run_agent_session_request", None)
         if callable(runner):
-            await cast("Any", runner({"kind": "clear", "request_id": str(uuid.uuid4())}))
+            await cast(
+                "Any",
+                runner(
+                    {
+                        "kind": "clear",
+                        "request_id": str(uuid.uuid4()),
+                        "agent_name": old_agent_id,
+                    }
+                ),
+            )
 
     return CommandResult(
         success=True,

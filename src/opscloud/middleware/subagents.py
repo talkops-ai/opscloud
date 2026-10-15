@@ -162,7 +162,13 @@ class SubagentsMiddleware(AgentMiddleware):
         lines.append("\n---\n")
         lines.append("### Automatic Routing Rules\n")
         lines.append("1. **Direct Built-in Call**: For Built-in subagents, invoke `task(...)` directly.")
-        lines.append("2. **Plugin Parallelization**: For multiple resources or files, prefer `js_eval` with `Promise.all`.\n")
+        lines.append("2. **Plugin Parallelization**: For multiple resources or files, prefer `js_eval` with `Promise.all`.")
+        lines.append(
+            "3. **Synthesize Before Delegating (No Lazy Delegation)**: Subagents do not share your conversation history. "
+            "NEVER write `'based on your findings'` or `'look at the research above'`. Read prior outputs, synthesize the root cause, "
+            "and write a self-contained delegation brief containing exact file paths, line numbers, cloud resource ARNs/IDs, "
+            "account/region/namespace context, and the specific verification or remediation objective.\n"
+        )
 
         lines.append("\n---\n")
         lines.append("### Subagent Deliverable Presentation Protocol\n")

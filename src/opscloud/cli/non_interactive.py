@@ -170,6 +170,7 @@ async def _run_headless(
             "approval_mode_key": approval_mode_key(effective_thread),
             "thread_id": effective_thread,
             "read_only": read_only,
+            "yolo": str(approval_mode).lower() in {"yolo", "y"},
             "smart": str(approval_mode).lower() in {"smart", "jev"},
         }
         if model_params:

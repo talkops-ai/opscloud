@@ -735,10 +735,10 @@ class StatusBar(Horizontal):
     def _tick_spinner(self) -> None:
         """Advance the spinner frame and re-render the animated indicators."""
         self._spinner.next_frame()
-        self._render_connection()
-        self._render_busy()
+        self._render_connection(layout=False)
+        self._render_busy(layout=False)
 
-    def _render_connection(self) -> None:
+    def _render_connection(self, *, layout: bool = True) -> None:
         """Render the combined connection + queued-count indicator text."""
         try:
             widget = self.query_one("#connection-indicator", Static)
@@ -759,11 +759,15 @@ class StatusBar(Horizontal):
         text = separator.join(parts)
         # Hide the widget entirely when empty so its `padding: 0 1` doesn't
         # leave a 2-column gap between the auto-approve pill and the cwd.
-        widget.display = bool(text)
-        widget.update(text)
-        self._sync_left_separator()
+        visible = bool(text)
+        visibility_changed = widget.display != visible
+        if visibility_changed:
+            widget.display = visible
+        widget.update(text, layout=layout or visibility_changed)
+        if layout or visibility_changed:
+            self._sync_left_separator()
 
-    def _render_busy(self) -> None:
+    def _render_busy(self, *, layout: bool = True) -> None:
         """Render the animated busy indicator into the status-message slot."""
         if not self._busy_message:
             return
@@ -772,10 +776,16 @@ class StatusBar(Horizontal):
         except NoMatches:
             return
         widget.remove_class("thinking")
-        widget.display = True
+        visibility_changed = not widget.display
+        if visibility_changed:
+            widget.display = True
         frame = self._spinner.current_frame()
-        widget.update(Content.assemble(frame, " ", Content(self._busy_message)))
-        self._sync_left_separator()
+        widget.update(
+            Content.assemble(frame, " ", Content(self._busy_message)),
+            layout=layout or visibility_changed,
+        )
+        if layout or visibility_changed:
+            self._sync_left_separator()
 
     def set_busy(self, message: str) -> None:
         """Show or clear an animated busy indicator in the status-message slot.

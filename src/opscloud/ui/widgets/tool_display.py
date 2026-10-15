@@ -19,7 +19,10 @@ _CUSTOM_DISPLAY_NAMES: dict[str, str] = {
     "read_file": "Read",
     "view_file": "Read",
     "write_file": "Write",
+    "write_to_file": "Write",
     "edit_file": "Edit",
+    "replace_file_content": "Edit",
+    "multi_replace_file_content": "Edit",
     "delete": "Delete",
     "execute": "Execute",
     "exec": "Execute",
@@ -35,8 +38,40 @@ _CUSTOM_DISPLAY_NAMES: dict[str, str] = {
 }
 
 _CUSTOM_SUMMARY_FORMATTERS: dict[str, Callable[[str], str]] = {}
+_SCOPED_TOOL_PARSE_MAP: dict[str, tuple[str, str | None]] = {}
 
 import re
+
+
+def extract_server_scope(server_name: str) -> str | None:
+    """Extract a clean UI scope label from a scoped MCP server name."""
+    if not server_name:
+        return None
+    if server_name.startswith("mcp__plugin__"):
+        rest = server_name[len("mcp__plugin__") :]
+        return rest.split("__", 1)[0].split("_")[0] or None
+    if server_name.startswith("subagent__"):
+        rest = server_name[len("subagent__") :]
+        return rest.split("__", 1)[0].split("_")[0] or None
+    if server_name.startswith("plugin__"):
+        rest = server_name[len("plugin__") :]
+        return rest.split("__", 1)[0].split("_")[0] or None
+    if server_name.startswith("mcp__"):
+        rest = server_name[len("mcp__") :]
+        return rest.split("__", 1)[0].split("_")[0] or None
+    return None
+
+
+def register_scoped_tool_name(
+    tool_name: str, base_name: str, scope: str | None = None
+) -> None:
+    """Register an explicit (base_name, scope) mapping for a mangled/hashed tool name."""
+    if not tool_name or not base_name:
+        return
+    _SCOPED_TOOL_PARSE_MAP[tool_name] = (base_name, scope)
+    hash_m = re.match(r"^(.+?)_[0-9a-f]{8,16}$", tool_name)
+    if hash_m:
+        _SCOPED_TOOL_PARSE_MAP[hash_m.group(1)] = (base_name, scope)
 
 
 def parse_scoped_tool_name(tool_name: str) -> tuple[str, str | None]:
@@ -47,11 +82,20 @@ def parse_scoped_tool_name(tool_name: str) -> tuple[str, str | None]:
       -> ('run_script', 'aws-compute')
     - mcp scoped: mcp__github__create_issue -> ('create_issue', 'github')
     - subagent scoped: subagent__helm-operator__install -> ('install', 'helm-operator')
+    - truncated subagent/plugin MCP names exceeding 64 chars
     - hash suffixed: run_script_f0b5243c096e -> ('run_script', None)
     - standard: read_file -> ('read_file', None)
     """
     if not tool_name or tool_name == "None":
         return ("tool", None)
+
+    if tool_name in _SCOPED_TOOL_PARSE_MAP:
+        return _SCOPED_TOOL_PARSE_MAP[tool_name]
+
+    if ":" in tool_name:
+        srv_part, base_part = tool_name.split(":", 1)
+        scope = extract_server_scope(srv_part) or srv_part or None
+        return (base_part, scope)
 
     # 1. MCP Subagent scoped: mcp__plugin__<subagent>__<server>__<tool>
     sub_mcp_m = re.match(
@@ -81,13 +125,24 @@ def parse_scoped_tool_name(tool_name: str) -> tuple[str, str | None]:
     # 4. Subagent scoped: subagent__<subagent>__<tool>(_<hex8+>)?
     sub_m = re.match(r"^subagent__([a-zA-Z0-9_-]+?)__(.+?)(?:_[0-9a-f]{8,16})?$", tool_name)
     if sub_m:
-        scope = sub_m.group(1)
+        scope = sub_m.group(1).split("_")[0]
         base = sub_m.group(2)
         return (base, scope)
+
+    # 4b. Truncated subagent/plugin scoped where second '__' was cut off by 64-char limit:
+    # e.g. subagent__aws-finops-agent_talkops-de_cost-explorer_0f1becd169d2
+    trunc_m = re.match(
+        r"^(?:subagent|plugin)__([^_]+)_(?:.+_)?([a-zA-Z0-9-]+?)(?:_[0-9a-f]{8,16})?$",
+        tool_name,
+    )
+    if trunc_m:
+        return (trunc_m.group(2), trunc_m.group(1))
 
     # 5. Trailing hash fallback: <tool>_<hex8+>
     hash_m = re.match(r"^(.+?)_[0-9a-f]{8,16}$", tool_name)
     if hash_m:
+        if hash_m.group(1) in _SCOPED_TOOL_PARSE_MAP:
+            return _SCOPED_TOOL_PARSE_MAP[hash_m.group(1)]
         return (hash_m.group(1), None)
 
     return (tool_name, None)
@@ -226,6 +281,8 @@ def format_tool_parts(
     # 2. Generic Parameter Inspection Heuristics (Extensible for ANY tool)
     path_val = (
         args.get("file_path")
+        or args.get("TargetFile")
+        or args.get("AbsolutePath")
         or args.get("path")
         or args.get("target_file")
         or args.get("directory_path")
@@ -277,7 +334,7 @@ def format_tool_display(
     tool_args: dict[str, Any] | None = None,
     prefix: str = "●",
 ) -> str:
-    """Format any tool call into a clean Claude Code style header string.
+    """Format any tool call into a clean header string.
 
     Automatically handles known tools as well as arbitrary future tools via
     generic parameter inspection heuristics.
@@ -299,7 +356,7 @@ def format_tool_display(
 
 
 def format_tool_result_summary(tool_name: str, result: str) -> str:
-    """Build a clean Claude Code style tree summary (e.g. '⎿ Read 600 lines').
+    """Build a compact tree summary (e.g. '⎿ Read 600 lines').
 
     Extensible via custom summary formatters and generic JSON/multiline heuristics.
     """
@@ -334,7 +391,15 @@ def format_tool_result_summary(tool_name: str, result: str) -> str:
         return f"⎿ {_plural(len(lines), 'match', 'matches')} found"
     elif raw_lower in {"execute", "exec", "bash"}:
         return f"⎿ Command output ({_plural(line_count, 'line')})"
-    elif raw_lower in {"edit_file", "write_file", "edit", "write"}:
+    elif raw_lower in {
+        "edit_file",
+        "write_file",
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "edit",
+        "write",
+    }:
         return f"⎿ Wrote {_plural(line_count, 'line')}"
 
     # Generic Fallback Heuristics for ANY future tool output

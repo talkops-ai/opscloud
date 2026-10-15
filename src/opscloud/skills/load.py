@@ -149,14 +149,6 @@ def list_skills(
         except Exception:
             effective_root = paths.find_project_root()
 
-    bi_dir = built_in_skills_dir or paths.get_built_in_skills_dir()
-    u_dir = user_skills_dir or paths.get_user_skills_dir("opscloud")
-    ua_dir = user_agent_skills_dir or paths.get_user_agent_skills_dir()
-    p_dir = project_skills_dir or paths.get_project_skills_dir(effective_root)
-    pa_dir = project_agent_skills_dir or paths.get_project_agent_skills_dir(effective_root)
-    uc_dir = user_claude_skills_dir or paths.get_user_claude_skills_dir()
-    pc_dir = project_claude_skills_dir or paths.get_project_claude_skills_dir(effective_root)
-
     sources: list[tuple[Path | None, str, bool, str]] = []
     has_custom_dirs = any(
         x is not None
@@ -172,6 +164,14 @@ def list_skills(
     ) or bool(plugin_skill_sources)
 
     if has_custom_dirs:
+        bi_dir = built_in_skills_dir
+        u_dir = user_skills_dir
+        ua_dir = user_agent_skills_dir
+        p_dir = project_skills_dir
+        pa_dir = project_agent_skills_dir
+        uc_dir = user_claude_skills_dir
+        pc_dir = project_claude_skills_dir
+
         plugin_sources = list(plugin_skill_sources)
         if not plugin_sources and include_plugins:
             try:

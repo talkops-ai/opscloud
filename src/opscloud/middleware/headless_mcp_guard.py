@@ -55,7 +55,30 @@ class HeadlessMCPGuardMiddleware(HumanInTheLoopMiddleware[AgentState[Any], Any, 
 
     def _rejection(self, request: ToolCallRequest) -> ToolMessage | None:
         tool_name = request.tool_call.get("name", "")
-        if tool_name not in self._tool_names:
+        blocked = tool_name in self._tool_names
+        if not blocked and tool_name == "call_mcp_tool":
+            args = request.tool_call.get("args") or {}
+            if isinstance(args, Mapping):
+                srv = str(args.get("server_name") or args.get("ServerName") or "").strip()
+                target_tool = str(args.get("tool_name") or args.get("ToolName") or "").strip()
+                if target_tool and ":" in target_tool and not srv:
+                    srv, target_tool = target_tool.split(":", 1)
+                qualified = f"{srv}:{target_tool}" if srv and target_tool else target_tool
+                if qualified in self._tool_names or target_tool in self._tool_names:
+                    blocked = True
+                elif target_tool:
+                    from opscloud.mcp.profiler import MCPSemanticProfiler
+
+                    profile = MCPSemanticProfiler.get_instance().profile_tool(
+                        target_tool,
+                        "",
+                        None,
+                        None,
+                    )
+                    if not (profile.read_only_hint and not profile.destructive_hint):
+                        blocked = True
+
+        if not blocked:
             return None
 
         tool_id = request.tool_call.get("id", "")

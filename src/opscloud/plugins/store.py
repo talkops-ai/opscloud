@@ -727,7 +727,7 @@ def load_installed_plugins(
 
 
 def _entry_to_json(entry: InstalledPluginEntry) -> dict[str, Any]:
-    """Serialize an install entry to JSON (Claude Code camelCase keys)."""
+    """Serialize an install entry to JSON using camelCase keys."""
     payload: dict[str, Any] = {
         "scope": entry.scope,
         "installPath": entry.install_path,

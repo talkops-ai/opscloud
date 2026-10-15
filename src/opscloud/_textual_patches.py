@@ -356,12 +356,166 @@ def _install_detached_hit_patch() -> None:
         )
 
 
+# ── 4. Scroll Hover Recalculation Coalescing Patch ────────────
+
+_OPSCODE_SCROLL_SUPPRESS_HOVER_UNTIL = "_opscloud_scroll_suppress_hover_until"
+_OPSCODE_HOVER_CHECK_PENDING = "_opscloud_hover_check_pending"
+
+
+def _install_scroll_hover_patch() -> None:
+    """Suppress redundant post-refresh hover hit-testing while scrolling.
+
+    Textual's ``Screen._compositor_refresh`` calls ``App._update_mouse_over``
+    on every rendered frame. During active scrolling, widgets pass beneath a
+    stationary mouse cursor on almost every frame, triggering
+    ``get_hover_widgets_at`` + ``stylesheet.update_nodes`` + a secondary
+    repaint per scroll tick. Deferring hover checks until the scroll gesture
+    settles eliminates double-repaints and style cache thrashing during scroll.
+    """
+    try:
+        import time
+        from textual.app import App as _App
+        from textual.errors import NoWidget
+
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            "Textual scroll-hover patch skipped (textual %s): %s",
+            _textual_version,
+            exc,
+        )
+        return
+
+    def update_mouse_over_patched(self: Any, screen: Screen) -> None:
+        if self.mouse_over is None or not screen.is_active:
+            return
+        suppress_until = getattr(self, _OPSCODE_SCROLL_SUPPRESS_HOVER_UNTIL, 0.0)
+        if suppress_until and time.monotonic() < suppress_until:
+            return
+        if getattr(screen, _OPSCODE_HOVER_CHECK_PENDING, False):
+            return
+        setattr(screen, _OPSCODE_HOVER_CHECK_PENDING, True)
+
+        async def check_mouse() -> None:
+            setattr(screen, _OPSCODE_HOVER_CHECK_PENDING, False)
+            suppress = getattr(self, _OPSCODE_SCROLL_SUPPRESS_HOVER_UNTIL, 0.0)
+            if suppress and time.monotonic() < suppress:
+                return
+            try:
+                hover_widgets = screen.get_hover_widgets_at(*self.mouse_position)
+            except NoWidget:
+                pass
+            else:
+                mouse_over, hover_over = hover_widgets.widgets
+                if (
+                    mouse_over is not self.mouse_over
+                    or hover_over is not self.hover_over
+                ):
+                    self._set_mouse_over(mouse_over, hover_over)
+
+        self.call_after_refresh(check_mouse)
+
+    try:
+        setattr(_App, "_update_mouse_over", update_mouse_over_patched)
+    except (AttributeError, TypeError) as exc:
+        logger.warning(
+            "Textual scroll-hover patch assignment rejected (textual %s): %s",
+            _textual_version,
+            exc,
+        )
+
+
+# ── 5. Virtual-DOM Scrollbar Lifecycle Patch ──────────────────
+
+
+def _install_scrollbar_lifecycle_patch() -> None:
+    """Prevent orphaned ScrollBar message-pump tasks during widget show/hide/teardown.
+
+    Fixes three Textual virtual-DOM lifecycle issues that can leave
+    ``ScrollBar`` tasks pending on widget removal:
+    1. ``Widget._on_show`` and ``Widget._on_hide`` accessed the lazy
+       ``self.horizontal_scrollbar`` / ``self.vertical_scrollbar`` properties
+       even when ``self._horizontal_scrollbar`` was ``None``, spawning a
+       ``ScrollBar`` task just to deliver ``Show``/``Hide``.
+    2. ``App._start_widget`` started ``ScrollBar._task`` even when the parent
+       widget was not running or already closing/pruning.
+    3. ``Widget._message_loop_exit`` could leave virtual-DOM scrollbar tasks
+       pending if a scrollbar was attached during teardown.
+    """
+    try:
+        import contextlib
+        from textual.app import App as _App
+        from textual.widget import Widget as _Widget
+
+        original_start_widget = _App._start_widget
+        original_message_loop_exit = _Widget._message_loop_exit
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            "Textual scrollbar-lifecycle patch skipped (textual %s): %s",
+            _textual_version,
+            exc,
+        )
+        return
+
+    def start_widget_patched(self: Any, parent: Widget, widget: Widget) -> None:
+        if (
+            not getattr(parent, "_running", False)
+            or getattr(parent, "_closing", False)
+            or getattr(parent, "_closed", False)
+            or getattr(parent, "_pruning", False)
+        ):
+            widget._attach(parent)
+            widget._closing = True
+            widget._closed = True
+            return
+        original_start_widget(self, parent, widget)
+
+    def widget_on_show_patched(self: Widget, event: Any) -> None:
+        if self._horizontal_scrollbar is not None:
+            self._horizontal_scrollbar.post_message(event)
+        if self._vertical_scrollbar is not None:
+            self._vertical_scrollbar.post_message(event)
+
+    def widget_on_hide_patched(self: Widget, event: Any) -> None:
+        if self._horizontal_scrollbar is not None:
+            self._horizontal_scrollbar.post_message(event)
+        if self._vertical_scrollbar is not None:
+            self._vertical_scrollbar.post_message(event)
+        if self.has_focus:
+            self.blur()
+
+    async def message_loop_exit_patched(self: Widget) -> None:
+        try:
+            await original_message_loop_exit(self)
+        finally:
+            for vnode in list(self._get_virtual_dom()):
+                task = getattr(vnode, "_task", None)
+                if task is not None and not task.done():
+                    with contextlib.suppress(Exception):
+                        await vnode._close_messages()
+
+    try:
+        setattr(_App, "_start_widget", start_widget_patched)
+        setattr(_Widget, "_on_show", widget_on_show_patched)
+        setattr(_Widget, "_on_hide", widget_on_hide_patched)
+        setattr(_Widget, "_message_loop_exit", message_loop_exit_patched)
+    except (AttributeError, TypeError) as exc:
+        logger.warning(
+            "Textual scrollbar-lifecycle patch assignment rejected (textual %s): %s",
+            _textual_version,
+            exc,
+        )
+
+
+
 def apply_textual_patches() -> None:
     """Apply all Textual compatibility enhancements."""
     _install_keyboard_parser_patch()
     _install_word_selection_patch()
     _install_detached_hit_patch()
+    _install_scroll_hover_patch()
+    _install_scrollbar_lifecycle_patch()
 
 
 # Automatically apply patches when module is imported
 apply_textual_patches()
+

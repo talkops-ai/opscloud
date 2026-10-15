@@ -57,6 +57,10 @@ from opscloud.ui.widgets.autocomplete import (
     MultiCompletionManager,
     SlashCommandController,
 )
+from opscloud.ui.widgets.btw_card import (
+    BtwCardPanel,
+    BtwExchange,
+)
 from opscloud.ui.widgets.chat_input import (
     ChatInput,
     ChatTextArea,
@@ -271,6 +275,8 @@ __all__ = [
     "AutoModeNoticeScreen",
     "BRAILLE_SPINNER_FRAMES",
     "BranchLabel",
+    "BtwCardPanel",
+    "BtwExchange",
     "CONFIGURATION_DOCS_URL",
     "CONNECTION_STATES",
     "ChatInput",

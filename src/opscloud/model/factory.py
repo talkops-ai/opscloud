@@ -445,6 +445,57 @@ def _create_model_via_init(
 
 _MODEL_CACHE: dict[str, ModelResult] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+_ANTHROPIC_CACHE_CONTROL_PATCHED = False
+
+
+def _ensure_anthropic_block_level_cache_control(model: BaseChatModel | None = None) -> None:
+    """Ensure ChatAnthropic expands top-level `cache_control` into block-level breakpoints.
+
+    `AnthropicPromptCachingMiddleware` sets `model_settings={"cache_control": ...}`
+    expecting `ChatAnthropic._get_request_payload` to translate it for the transport.
+    By default, `ChatAnthropic` only expands `cache_control` into a block-level
+    breakpoint when `_is_direct_anthropic_llm_type` is `False`, leaving a top-level
+    `cache_control` field in the JSON body for `ChatAnthropic` instances even when
+    routed through Anthropic-compatible gateways/proxies (which reject top-level
+    `cache_control` with `400 - cache_control: Extra inputs are not permitted`).
+    Block-level `cache_control` breakpoints are universally accepted by both direct
+    Anthropic APIs and all gateways.
+    """
+    global _ANTHROPIC_CACHE_CONTROL_PATCHED
+    try:
+        import langchain_anthropic.chat_models as _anth_cm
+    except ImportError:
+        return
+
+    if not _ANTHROPIC_CACHE_CONTROL_PATCHED:
+        _anth_cm._is_direct_anthropic_llm_type = lambda _llm_type: False  # type: ignore[assignment]
+        orig_get_payload = _anth_cm.ChatAnthropic._get_request_payload
+
+        if not getattr(orig_get_payload, "_opscloud_cache_patched", False):
+            def _patched_get_request_payload(
+                self: Any,
+                input_: Any,
+                *,
+                stop: list[str] | None = None,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                payload = orig_get_payload(self, input_, stop=stop, **kwargs)
+                top_cc = payload.pop("cache_control", None)
+                if top_cc and isinstance(payload.get("messages"), list) and payload["messages"]:
+                    tool_ids = _anth_cm._collect_code_execution_tool_ids(payload["messages"])
+                    _anth_cm._apply_cache_control_to_last_eligible_block(
+                        payload["messages"], top_cc, tool_ids
+                    )
+                return payload
+
+            setattr(_patched_get_request_payload, "_opscloud_cache_patched", True)
+            _anth_cm.ChatAnthropic._get_request_payload = _patched_get_request_payload  # type: ignore[method-assign]
+
+        _ANTHROPIC_CACHE_CONTROL_PATCHED = True
+
+    if model is not None and isinstance(model, _anth_cm.ChatAnthropic):
+        if isinstance(getattr(model, "model_kwargs", None), dict):
+            model.model_kwargs.pop("cache_control", None)
 
 
 def clear_model_cache() -> None:
@@ -582,6 +633,8 @@ def create_model(
         model = _create_model_from_class(class_path, model_name, provider, kwargs)
     else:
         model = _create_model_via_init(model_name, provider, kwargs)
+
+    _ensure_anthropic_block_level_cache_control(model)
 
     # Resolve model profile & context limits
     spec_key = f"{provider}:{model_name}" if provider else model_name

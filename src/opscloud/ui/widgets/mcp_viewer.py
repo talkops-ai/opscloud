@@ -12,7 +12,6 @@ import json
 import re
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from rich.markup import escape
 from textual import events
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -21,7 +20,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from opscloud.config.settings import get_glyphs
-from opscloud.ui.widgets.modal_base import OpsModalScreen
+from opscloud.ui.widgets.modal_base import OpsModalScreen, escape_markup as escape
 from opscloud.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -444,7 +443,7 @@ class MCPServerHeaderItem(Static):
         cursor = "›" if self._selected else " "
         safe_name = escape(self.display_name)
         safe_scope = escape(self.scope) if self.scope else ""
-        scope_badge = f" [{safe_scope}]" if self.scope else ""
+        scope_badge = rf" \[{safe_scope}]" if self.scope else ""
 
         # Retain raw identifier in dim markup for diagnostic & test verification
         raw_dim = f" [dim]({escape(server.name)})[/dim]" if server.name != self.display_name else ""

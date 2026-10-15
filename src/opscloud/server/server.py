@@ -129,6 +129,7 @@ def generate_langgraph_json(
     output_dir: Path,
     graph_ref: str = "./server_graph.py:make_graph",
     checkpointer_path: str = "./checkpointer.py:create_checkpointer",
+    http_app_path: str = "./webhooks_app.py:app",
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     config: dict[str, Any] = {
@@ -139,6 +140,9 @@ def generate_langgraph_json(
         },
         "checkpointer": {
             "path": checkpointer_path,
+        },
+        "http": {
+            "app": http_app_path,
         },
     }
     if (output_dir / ".env").is_file():
@@ -151,6 +155,11 @@ def generate_langgraph_json(
     server_graph_file = output_dir / "server_graph.py"
     server_graph_code = "from opscloud.server.server_graph import make_graph\n"
     server_graph_file.write_text(server_graph_code, encoding="utf-8")
+
+    # Link or create webhooks_app.py in output_dir
+    webhooks_app_file = output_dir / "webhooks_app.py"
+    webhooks_app_code = "from opscloud.server.webhooks_app import app\n"
+    webhooks_app_file.write_text(webhooks_app_code, encoding="utf-8")
 
     # Link or create checkpointer.py in output_dir (connects to sessions.db)
     from opscloud.state.session import get_db_path

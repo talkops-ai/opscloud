@@ -8,7 +8,6 @@ import re
 from opscloud.utils.logger import get_logger
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from rich.markup import escape
 from textual import events, on
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
@@ -16,7 +15,7 @@ from textual.content import Content
 from textual.message import Message
 from textual.widgets import Button, Input, Static, TextArea
 
-from opscloud.ui.widgets.modal_base import OpsModalScreen
+from opscloud.ui.widgets.modal_base import OpsModalScreen, escape_markup as escape
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
@@ -152,6 +151,8 @@ class ApprovalMenu(Container):
         Binding("n", "select_reject", "Reject", show=False),
         Binding("escape", "select_reject", "Reject", show=False),
         Binding("e", "toggle_expand", "Expand command", show=False),
+        Binding("f", "toggle_full_diff", "Full diff", show=False),
+        Binding("shift+tab", "select_smart", "Auto-approve file edits", show=False),
         Binding("tab", "reject_with_reason", "Reject with reason", show=False),
     ]
 
@@ -190,7 +191,7 @@ class ApprovalMenu(Container):
     }
     ApprovalMenu .tool-info-scroll {
         height: auto;
-        max-height: 10;
+        max-height: 40;
         overflow-y: auto;
         margin-top: 0;
     }
@@ -492,6 +493,15 @@ class ApprovalMenu(Container):
         self._help_widget = Static(self._compose_help_text(), classes="approval-help")
         yield self._help_widget
 
+    def _has_expandable_diff(self) -> bool:
+        """Return whether any mounted tool approval widget has an expandable diff."""
+        if not self._tool_info_container:
+            return False
+        for child in self._tool_info_container.children:
+            if getattr(child, "has_expandable_diff", False):
+                return True
+        return False
+
     def _compose_help_text(self) -> str:
         """Build the help-line content for bottom border subtitle."""
         glyphs = get_glyphs()
@@ -507,6 +517,8 @@ class ApprovalMenu(Container):
             parts.append("tab reason")
         if self._has_expandable_command:
             parts.append("e expand")
+        if self._has_expandable_diff():
+            parts.append("f full diff")
 
         return sep.join(parts) + f" ({quick_keys} quick keys)"
 
@@ -663,6 +675,19 @@ class ApprovalMenu(Container):
             self._get_command_display(expanded=self._command_expanded)
         )
 
+    def action_toggle_full_diff(self) -> None:
+        """Toggle full diff expansion on any mounted file approval widget."""
+        if self._reason_input_active or not self._tool_info_container:
+            return
+        toggled = False
+        for child in self._tool_info_container.children:
+            toggle_fn = getattr(child, "toggle_full_diff", None)
+            if callable(toggle_fn):
+                if toggle_fn():
+                    toggled = True
+        if toggled:
+            self._update_options()
+
     @on(events.Click, ".approval-option")
     def _on_option_clicked(self, event: events.Click) -> None:
         """Handle clicks on specific approval option widgets."""
@@ -671,6 +696,12 @@ class ApprovalMenu(Container):
             if event.control == widget:
                 self._handle_selection(idx)
                 break
+
+    @on(events.Click, ".diff-line-truncated")
+    def _on_diff_truncated_clicked(self, event: events.Click) -> None:
+        """Expand full diff when the truncation footer is clicked."""
+        event.stop()
+        self.action_toggle_full_diff()
 
     def on_click(self, event: events.Click) -> None:
         """Handle clicks anywhere on option widgets or menu options container."""

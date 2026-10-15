@@ -59,9 +59,11 @@ from opscloud.ui.widgets.approval import (
 )
 from opscloud.ui.widgets.goal_review import GoalReviewMenu
 from opscloud.ui.widgets.autocomplete import AutocompletePopup
+from opscloud.ui.widgets.btw_card import BtwCardPanel, BtwExchange
 from opscloud.ui.widgets.chat_input import ChatInput, InputMode
 from opscloud.ui.command_registry import (
     ALWAYS_IMMEDIATE,
+    IMMEDIATE_CMDS,
     IMMEDIATE_UI_CMDS,
     BypassTier,
     get_command,
@@ -419,6 +421,8 @@ class OpsCloudApp(App):
         initial_prompt: str | None = None,
         initial_skill: str | None = None,
         startup_cmd: str | None = None,
+        cwd: str | None = None,
+        check_workspace_trust: bool | None = None,
         defer_server_start: bool = False,
         server_kwargs: dict[str, Any] | None = None,
         mcp_preload_kwargs: dict[str, Any] | None = None,
@@ -463,15 +467,15 @@ class OpsCloudApp(App):
             else:
                 self._settings.model_name = model
 
-        from opscloud.approval_mode import ApprovalMode
+        from opscloud.approval_mode import ApprovalMode, coerce_approval_mode
         if approval_mode is not None:
-            if isinstance(approval_mode, str):
-                try:
-                    self._approval_mode = ApprovalMode.from_str(approval_mode)
-                except Exception:
-                    self._approval_mode = ApprovalMode.MANUAL
-            else:
-                self._approval_mode = approval_mode
+            try:
+                self._approval_mode = coerce_approval_mode(
+                    approval_mode,
+                    allow_yolo=False,
+                )
+            except Exception:
+                self._approval_mode = ApprovalMode.MANUAL
         elif auto_approve:
             self._approval_mode = ApprovalMode.AUTO
         else:
@@ -484,7 +488,21 @@ class OpsCloudApp(App):
         self._initial_skill = initial_skill
         self._startup_cmd = startup_cmd
         self._agent_thread_id: str | None = None
-        self._cwd: str = str(Path.cwd())
+        from opscloud.config.cli_settings import resolve_path_no_slash
+
+        raw_cwd = cwd or (server_kwargs.get("cwd") if isinstance(server_kwargs, dict) else None) or str(Path.cwd())
+        self._cwd: str = resolve_path_no_slash(raw_cwd) or str(Path.cwd())
+        if check_workspace_trust is None:
+            env_trust = os.environ.get("OPSCLOUD_CHECK_WORKSPACE_TRUST", "").strip().lower()
+            if env_trust in {"1", "true", "yes", "on"}:
+                self._check_workspace_trust = True
+            elif env_trust in {"0", "false", "no", "off"}:
+                self._check_workspace_trust = False
+            else:
+                self._check_workspace_trust = not bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        else:
+            self._check_workspace_trust = bool(check_workspace_trust)
+        self._workspace_trusted: bool = not self._check_workspace_trust
         self._status_bar: StatusBar | None = None
         self._git_branch_refresh_task: asyncio.Task[None] | None = None
         self._session_cost_usd: float = 0.0
@@ -523,6 +541,12 @@ class OpsCloudApp(App):
         self._quit_pending: bool = False
         self._shell_worker: Any | None = None
         self._shell_process: asyncio.subprocess.Process | None = None
+
+        # ── Ephemeral /btw Side-Question State ───────────
+        self._btw_items: list[BtwExchange] = []
+        self._btw_index: int = -1
+        self._btw_worker: Worker[None] | None = None
+        self._btw_cancel_event: asyncio.Event = asyncio.Event()
 
         # ── Queue ────────────────────────────────────────
         self._pending_messages: deque[QueuedMessage] = deque()
@@ -617,6 +641,7 @@ class OpsCloudApp(App):
         with Container(id="bottom-container"):
             yield SubagentPanel(id="subagent-panel")
             yield GoalStatusPanel(id="goal-status-panel")
+            yield BtwCardPanel(id="btw-card-panel")
             yield ChatInput(id="input-area")
         yield StatusBar(cwd=self._cwd, id="status-bar")
 
@@ -679,6 +704,89 @@ class OpsCloudApp(App):
 
         # Always refocus input after mounting widgets that may steal focus
         self._chat_input.focus()
+
+        if self._check_workspace_trust:
+            await self._evaluate_startup_trust_and_settings()
+        else:
+            self._workspace_trusted = True
+            await self._continue_post_trust_startup()
+
+    async def _evaluate_startup_trust_and_settings(self) -> None:
+        """Evaluate CLI settings validity and startup workspace folder trust."""
+        from opscloud.config.cli_settings import get_cli_settings_manager
+        from opscloud.ui.widgets.workspace_trust import SettingsErrorScreen
+
+        mgr = get_cli_settings_manager()
+        mgr.init_cli_settings()
+
+        if mgr.settings_load_error is not None:
+            if self._status_bar is not None:
+                self._status_bar.set_status("Settings error")
+
+            def _on_settings_error_decided(quarantine: bool | None) -> None:
+                if quarantine is True:
+                    mgr.quarantine_cli_settings()
+                    self.run_worker(
+                        self._prompt_workspace_trust_if_needed(),
+                        group="workspace-trust-gate",
+                    )
+                else:
+                    self._exit = True
+                    self.exit()
+
+            self.push_screen(
+                SettingsErrorScreen(mgr.settings_path, mgr.settings_load_error),
+                _on_settings_error_decided,
+            )
+            return
+
+        await self._prompt_workspace_trust_if_needed()
+
+    async def _prompt_workspace_trust_if_needed(self) -> None:
+        """Check whether the startup workspace is trusted; push WorkspaceTrustScreen if not."""
+        from opscloud.config.cli_settings import get_cli_settings_manager
+        from opscloud.ui.widgets.workspace_trust import WorkspaceTrustScreen
+
+        mgr = get_cli_settings_manager()
+        trusted = mgr.init_workspace_dirs(self._cwd)
+        if trusted or mgr.workspace_trusted(self._cwd):
+            self._workspace_trusted = True
+            await self._continue_post_trust_startup()
+            return
+
+        self._workspace_trusted = False
+        if self._status_bar is not None:
+            self._status_bar.set_status("Workspace trust required")
+
+        def _on_workspace_trust_decided(accepted: bool | None) -> None:
+            if accepted is True:
+                mgr.trust_workspace(self._cwd)
+                self._workspace_trusted = True
+                try:
+                    from opscloud.config.settings import _load_dotenv
+
+                    _load_dotenv(start_path=Path(self._cwd), refresh_loaded=True)
+                except Exception:
+                    logger.debug("Dotenv refresh after workspace trust failed", exc_info=True)
+                self.run_worker(
+                    self._continue_post_trust_startup(),
+                    group="post-trust-startup",
+                )
+            else:
+                self._exit = True
+                self.exit()
+
+        self.push_screen(
+            WorkspaceTrustScreen(self._cwd),
+            _on_workspace_trust_decided,
+        )
+
+    async def _continue_post_trust_startup(self) -> None:
+        """Run skill discovery, background server startup, and initial goal after workspace trust is satisfied."""
+        status_bar = self._status_bar or self.query_one("#status-bar", StatusBar)
+
+        if self._chat_input is not None:
+            self._chat_input.focus()
 
         # Discover skills in background to populate autocomplete
         self.run_worker(self._discover_startup_skills(), group="skill-discovery")
@@ -757,13 +865,13 @@ class OpsCloudApp(App):
             turn_start = (self._turn_metrics_start or {}).get("started")
             self._loading_widget = LoadingWidget(status, started_at=turn_start)
             await messages.mount(self._loading_widget)
-            messages.scroll_end(animate=False)
+            messages._scroll_to_end()
         else:
             if hasattr(self._loading_widget, "resume"):
                 self._loading_widget.resume()
             if hasattr(self._loading_widget, "set_status"):
                 self._loading_widget.set_status(status)
-            messages.scroll_end(animate=False)
+            messages._scroll_to_end()
 
     def _pause_loading_spinner_for_approval(self) -> None:
         """Pause the global spinner timer and subagent panel timer while approval is visible."""
@@ -805,7 +913,7 @@ class OpsCloudApp(App):
                 await messages.mount(widget, before=self._loading_widget)
             else:
                 await messages.mount(widget)
-            messages.scroll_end(animate=False)
+            messages._scroll_to_end()
         except Exception:
             logger.debug("Could not mount message (app closing?)", exc_info=True)
 
@@ -877,17 +985,20 @@ class OpsCloudApp(App):
                     pass
                 return
 
-            # The server owns cold MCP discovery. Reading metadata afterward
-            # uses the fingerprinted schema cache and avoids launching every
-            # stdio server a second time in the TUI process.
+            # Do not block ServerReady on cold MCP server discovery. Use any warm
+            # cached MCPServerInfo immediately so the TUI unlocks at once, and
+            # refresh MCP metadata in the background.
             mcp_info = None
             if self._mcp_preload_kwargs is not None and not self._mcp_preload_kwargs.get("no_mcp"):
-                from opscloud.mcp.preload import preload_mcp_server_info
+                from opscloud.mcp.preload import get_cached_mcp_server_infos
 
-                try:
-                    mcp_info = await preload_mcp_server_info(**self._mcp_preload_kwargs)
-                except Exception as exc:
-                    logger.warning("MCP metadata preload background failed: %s", exc)
+                cached = get_cached_mcp_server_infos()
+                mcp_info = cached if cached else None
+                self.run_worker(
+                    self._preload_mcp_metadata_background(),
+                    group="mcp-preload",
+                    exclusive=True,
+                )
 
             self.post_message(
                 self.ServerReady(
@@ -1165,6 +1276,9 @@ class OpsCloudApp(App):
         """
         cmd = value.split(maxsplit=1)[0] if value else ""
 
+        if cmd in IMMEDIATE_CMDS:
+            return True
+
         if cmd in IMMEDIATE_UI_CMDS:
             # Only bare form (no args) bypasses — e.g. /model opens selector,
             # /model <name> does a direct switch that shouldn't race with agent.
@@ -1274,6 +1388,222 @@ class OpsCloudApp(App):
         except Exception:
             pass
 
+    # ── Ephemeral `/btw` Side-Question Manager ───────────
+
+    def _refresh_btw_card(self) -> None:
+        """Update the `BtwCardPanel` widget from `self._btw_items` and `self._btw_index`."""
+        with suppress(Exception):
+            card = self.query_one("#btw-card-panel", BtwCardPanel)
+            card.render_state(self._btw_items, self._btw_index)
+
+    def is_btw_active(self) -> bool:
+        """Return True if any `/btw` side question is currently loading."""
+        return any(item.loading for item in self._btw_items)
+
+    def is_btw_open(self) -> bool:
+        """Return True if the `/btw` overlay card is currently visible."""
+        return 0 <= self._btw_index < len(self._btw_items)
+
+    def show_btw_history(self) -> bool:
+        """Reopen the most recent `/btw` card if history exists (`ShowBtwHistory` parity)."""
+        if not self._btw_items:
+            return False
+        self._btw_index = len(self._btw_items) - 1
+        self._refresh_btw_card()
+        return True
+
+    def dismiss_btw_response(self) -> None:
+        """Dismiss the `/btw` card and cancel any in-flight `/btw` generation (`DismissBtwResponse` parity)."""
+        self._btw_cancel_event.set()
+        if self._btw_worker is not None and not self._btw_worker.is_finished:
+            self._cancel_worker(self._btw_worker)
+        self._btw_worker = None
+        for item in self._btw_items:
+            if item.loading:
+                item.loading = False
+                if not item.error:
+                    item.error = "cancelled"
+        self._btw_index = -1
+        self._refresh_btw_card()
+
+    def clear_active_btw(self) -> None:
+        """Clear all `/btw` history and dismiss any open `/btw` card (`ClearActiveBtw` parity)."""
+        self.dismiss_btw_response()
+        self._btw_items.clear()
+        self._btw_index = -1
+        self._refresh_btw_card()
+
+    def toggle_btw_expanded(self) -> None:
+        """Toggle expanded/collapsed state on the currently visible `/btw` card (`ToggleBtwExpanded` parity)."""
+        if 0 <= self._btw_index < len(self._btw_items):
+            self._btw_items[self._btw_index].expanded = not self._btw_items[self._btw_index].expanded
+            self._refresh_btw_card()
+
+    def navigate_btw(self, delta: int) -> None:
+        """Navigate backward/forward through `/btw` history (`NavigateBtw` parity)."""
+        if not self._btw_items or self._btw_index < 0:
+            return
+        new_idx = max(0, min(len(self._btw_items) - 1, self._btw_index + delta))
+        if new_idx != self._btw_index:
+            self._btw_index = new_idx
+            self._refresh_btw_card()
+
+    def get_btw_copy_status(self) -> tuple[str | None, str | None]:
+        """Return `(answer, error_message)` for `/copy btw` (`copyBtwAnswer` parity)."""
+        if not self._btw_items:
+            return None, "No /btw response to copy."
+        idx = self._btw_index if 0 <= self._btw_index < len(self._btw_items) else len(self._btw_items) - 1
+        item = self._btw_items[idx]
+        if item.loading:
+            return None, "The /btw answer is still being generated."
+        if item.error:
+            return None, f"The /btw question failed: {item.error}"
+        if not item.answer.strip():
+            return None, "No /btw response to copy."
+        return item.answer, None
+
+    async def _send_ephemeral_message(self, question: str) -> None:
+        """Start an isolated `/btw` side question in a background worker (`SendSideQuestion` parity).
+
+        Runs concurrently even while `self._agent_running` is True without mutating
+        the main conversation transcript or checkpoint.
+        """
+        from opscloud.middleware.btw import BTW_PROMPT_PREFIX
+
+        clean_q = question.strip()
+        if clean_q.startswith(BTW_PROMPT_PREFIX):
+            clean_q = clean_q[len(BTW_PROMPT_PREFIX) :].strip()
+        elif clean_q.startswith("[ASIDE — ephemeral side question"):
+            lines = [ln for ln in clean_q.splitlines() if not ln.startswith("[ASIDE") and not ln.startswith("[/ASIDE")]
+            clean_q = "\n".join(lines).strip()
+
+        if self.is_btw_active():
+            self.notify(
+                "A /btw question is already in progress. Please wait for it to finish.",
+                severity="warning",
+                timeout=3,
+            )
+            return
+
+        exchange = BtwExchange(question=clean_q, answer="", loading=True, error="", expanded=False)
+        self._btw_items.append(exchange)
+        item_index = len(self._btw_items) - 1
+        self._btw_index = item_index
+        self._btw_cancel_event = asyncio.Event()
+        self._refresh_btw_card()
+
+        self._btw_worker = self.run_worker(
+            self._run_btw_task(item_index, clean_q),
+            group="btw-worker",
+            exclusive=False,
+        )
+
+    async def _run_btw_task(self, item_index: int, question: str) -> None:
+        """Execute the isolated `/btw` side question with a 60-second timeout."""
+        from opscloud.middleware.btw import BTW_TIMEOUT_SECONDS, format_btw_prompt
+
+        client = self._client or (getattr(self._adapter, "_client", None) if self._adapter else None)
+        if client is None:
+            if 0 <= item_index < len(self._btw_items):
+                self._btw_items[item_index].loading = False
+                self._btw_items[item_index].error = "Agent not connected"
+                self._refresh_btw_card()
+            return
+
+        from opscloud.config.cloud_profiles import get_active_aws_profile, get_active_aws_region
+
+        context: dict[str, Any] = {"_btw_side_question": True}
+        if self._model:
+            context["model"] = self._model
+        active_aws_prof = get_active_aws_profile()
+        active_aws_reg = get_active_aws_region()
+        if active_aws_prof:
+            context["aws_profile"] = active_aws_prof
+        if active_aws_reg:
+            context["aws_region"] = active_aws_reg
+
+        ui_messages = self.get_thread_messages()
+        fragments: list[str] = []
+
+        try:
+            async with asyncio.timeout(BTW_TIMEOUT_SECONDS):
+                if hasattr(client, "astream_side_question"):
+                    async for chunk in client.astream_side_question(
+                        question,
+                        parent_thread_id=self._agent_thread_id,
+                        context=context,
+                        messages_override=ui_messages,
+                    ):
+                        if self._btw_cancel_event.is_set():
+                            break
+                        if chunk:
+                            fragments.append(chunk)
+                            if 0 <= item_index < len(self._btw_items):
+                                self._btw_items[item_index].answer = "".join(fragments)
+                                self._refresh_btw_card()
+                elif hasattr(client, "astream"):
+                    from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+
+                    temp_tid = f"btw-{uuid.uuid4()}"
+                    seed_msgs = [
+                        m for m in ui_messages if getattr(m, "type", "") in ("human", "HumanMessage", "ai", "AIMessage")
+                    ]
+                    side_msg = HumanMessage(
+                        content=format_btw_prompt(question),
+                        additional_kwargs={"ephemeral": True},
+                    )
+                    async for raw_event in client.astream(
+                        {"messages": [*seed_msgs, side_msg], "_btw_side_question": True},
+                        stream_mode=["messages", "updates"],
+                        subgraphs=False,
+                        config={"configurable": {"thread_id": temp_tid}},
+                        context=context,
+                    ):
+                        if self._btw_cancel_event.is_set():
+                            break
+                        if not isinstance(raw_event, tuple):
+                            continue
+                        mode = raw_event[1] if len(raw_event) == 3 else raw_event[0]
+                        data = raw_event[2] if len(raw_event) == 3 else raw_event[1]
+                        if mode == "messages":
+                            msg_obj = data[0] if isinstance(data, tuple) else data
+                            if isinstance(msg_obj, (AIMessage, AIMessageChunk)) or getattr(
+                                msg_obj, "type", ""
+                            ) in ("ai", "AIMessage", "AIMessageChunk"):
+                                content = getattr(msg_obj, "content", "")
+                                if isinstance(content, str) and content:
+                                    fragments.append(content)
+                                    if 0 <= item_index < len(self._btw_items):
+                                        self._btw_items[item_index].answer = "".join(fragments)
+                                        self._refresh_btw_card()
+
+            if 0 <= item_index < len(self._btw_items):
+                item = self._btw_items[item_index]
+                item.loading = False
+                if self._btw_cancel_event.is_set() and not item.error:
+                    item.error = "cancelled"
+                self._refresh_btw_card()
+        except asyncio.CancelledError:
+            if 0 <= item_index < len(self._btw_items):
+                item = self._btw_items[item_index]
+                item.loading = False
+                if not item.error:
+                    item.error = "cancelled"
+                self._refresh_btw_card()
+        except TimeoutError:
+            if 0 <= item_index < len(self._btw_items):
+                item = self._btw_items[item_index]
+                item.loading = False
+                item.error = "timed out after 60s"
+                self._refresh_btw_card()
+        except Exception as exc:
+            logger.debug("/btw side question failed: %s", exc, exc_info=True)
+            if 0 <= item_index < len(self._btw_items):
+                item = self._btw_items[item_index]
+                item.loading = False
+                item.error = _format_error_detail(exc) or str(exc)
+                self._refresh_btw_card()
+
     # ── Agent Turn Lifecycle ─────────────────────────────
 
     async def _handle_user_message(self, message: str) -> None:
@@ -1289,8 +1619,6 @@ class OpsCloudApp(App):
         self._active_user_message = user_msg
         self._active_turn_visible_output_started = False
         await self._mount_message(user_msg)
-        if await self._maybe_continue_workflow(message):
-            return
         if await self._maybe_continue_agent_session(message):
             return
         await self._send_to_agent(message)
@@ -1300,9 +1628,14 @@ class OpsCloudApp(App):
 
         Public interface for skill invocation and command handlers.
         """
-        await self._send_to_agent(message)
+        await self._send_to_agent(message, message_kwargs=kwargs.get("message_kwargs"))
 
-    async def _send_to_agent(self, message: str) -> None:
+    async def _send_to_agent(
+        self,
+        message: str,
+        *,
+        message_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         """Send a message to the agent and start execution.
 
         This is the low-level send path.  The caller mounts the visual
@@ -1310,10 +1643,13 @@ class OpsCloudApp(App):
 
         Args:
             message: The prompt to send to the agent.
+            message_kwargs: Optional metadata kwargs to attach to the HumanMessage.
         """
         # Anchor scroll so streaming response stays visible
         with suppress(NoMatches):
-            self.query_one("#messages", MessageList).scroll_end(animate=False)
+            messages = self.query_one("#messages", MessageList)
+            messages._auto_scroll_locked = True
+            messages._scroll_to_end()
 
         # Check if agent is available
         if self._adapter and self._adapter.connected and self._agent_thread_id:
@@ -1328,7 +1664,7 @@ class OpsCloudApp(App):
 
             # Spawn a single worker for the agent task
             self._agent_worker = self.run_worker(
-                self._run_agent_task(message),
+                self._run_agent_task(message, message_kwargs=message_kwargs),
                 exclusive=False,
             )
         elif self._server_startup_error is not None:
@@ -1351,6 +1687,7 @@ class OpsCloudApp(App):
         message: str,
         *,
         graph_input: dict[str, Any] | None = None,
+        message_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Run the agent task in a background worker.
 
@@ -1362,6 +1699,7 @@ class OpsCloudApp(App):
             graph_input: Prepared non-conversation input for a server operation
                 (e.g. goal criteria generation).  When set, ``message`` is
                 ignored by ``stream_turn``.
+            message_kwargs: Optional metadata kwargs to attach to the HumanMessage.
         """
         if self._adapter is None:
             return
@@ -1376,7 +1714,6 @@ class OpsCloudApp(App):
                 raw_request_id = criteria_request.get("request_id")
                 if isinstance(raw_request_id, str):
                     criteria_request_id = raw_request_id
-        workflow_turn = graph_input is not None and isinstance(graph_input.get("workflow_request"), dict)
         agent_session_turn = graph_input is not None and isinstance(graph_input.get("agent_session_request"), dict)
         # Goal-criteria generation is a background server operation, not a
         # conversational turn, so it gets no footer.
@@ -1411,12 +1748,15 @@ class OpsCloudApp(App):
                 display_label = spec.split(":")[-1] if ":" in spec else spec
                 panel.prepare_turn(model_label=display_label)
 
-            await self._adapter.stream_turn(
-                prompt=message,
-                thread_id=self._agent_thread_id or "local_session",
-                context=context if context else None,
-                graph_input=graph_input,
-            )
+            stream_kwargs: dict[str, Any] = {
+                "prompt": message,
+                "thread_id": self._agent_thread_id or "local_session",
+                "context": context if context else None,
+                "graph_input": graph_input,
+            }
+            if message_kwargs is not None:
+                stream_kwargs["message_kwargs"] = message_kwargs
+            await self._adapter.stream_turn(**stream_kwargs)
             logger.info("TUI: Agent turn completed successfully | thread_id=%s", self._agent_thread_id)
             task_succeeded = True
         except asyncio.CancelledError:
@@ -1431,8 +1771,6 @@ class OpsCloudApp(App):
                     "Could not generate acceptance criteria for this goal. "
                     "Run `/goal` again to retry."
                 )
-            elif workflow_turn:
-                body = f"Workflow turn failed: {body}\n\nUse `/workflow show` to inspect or `/workflow cancel` to stop."
             await self._mount_message(ErrorMessage(body))
 
         finally:
@@ -1448,12 +1786,11 @@ class OpsCloudApp(App):
                 panel.finalize_running()
             self._close_active_tool_group()
             await self._cleanup_agent_task(
-                force_goal_sync=graph_input is not None and not workflow_turn and not agent_session_turn,
+                force_goal_sync=graph_input is not None and not agent_session_turn,
                 goal_criteria_request_id=criteria_request_id,
                 goal_criteria_succeeded=(
                     criteria_request_id is None or task_succeeded
                 ),
-                workflow_sync=workflow_turn,
             )
 
     async def _cleanup_agent_task(
@@ -1462,7 +1799,6 @@ class OpsCloudApp(App):
         force_goal_sync: bool = False,
         goal_criteria_request_id: str | None = None,
         goal_criteria_succeeded: bool = True,
-        workflow_sync: bool = False,
     ) -> None:
         """Tear down after a turn completes or is cancelled.
 
@@ -1476,8 +1812,6 @@ class OpsCloudApp(App):
                 when restoring a newly generated proposal.
             goal_criteria_succeeded: Whether criteria generation completed
                 without failure or cancellation.
-            workflow_sync: Reconcile and announce workflow state (after a
-                ``/workflow`` turn).
         """
         self._agent_reconciling = True
         self._agent_running = False
@@ -1501,13 +1835,6 @@ class OpsCloudApp(App):
                     proposal_request_id=goal_criteria_request_id,
                     allow_pending_proposal=goal_criteria_succeeded,
                 )
-
-                # ── Workflow state synchronization from checkpoint ──
-                if workflow_sync:
-                    try:
-                        await self._sync_workflow_state_from_checkpoint(announce=True)
-                    except Exception:
-                        logger.exception("Error during agent cleanup workflow sync")
 
                 # ── Session cost & token state synchronization from checkpoint ──
                 try:
@@ -2344,16 +2671,27 @@ class OpsCloudApp(App):
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         # ── Router Dispatch Check ────────────────────────
-        handler = self._command_router.get_handler(cmd_name)
+        handler, resolved_cmd_name, resolved_arg = self._command_router.resolve_command(normalized)
+        if handler is None and get_command(cmd_name) is None:
+            from opscloud.skills.invocation import match_discovered_skill
+
+            skills = self._discovered_skills or self.get_discovered_skills()
+            if match_discovered_skill(skills, cmd_name.lstrip("/")) is not None:
+                handler = self._command_router.get_handler("/skill:")
+
         if handler is not None:
             if self._agent_running and handler.bypass_tier == BypassTier.QUEUED:
                 self._pending_messages.append(QueuedMessage(text=text, mode="command"))
                 await self._mount_message(
-                    SystemMessage(f"Command `{cmd_name}` queued...")
+                    SystemMessage(f"Command `{resolved_cmd_name}` queued...")
                 )
                 return
 
-            if cmd_name not in {"/exit", "/quit", "/q", "/clear", "/force-clear", "/remember", "/skill-creator"} and not cmd_name.startswith("/skill:"):
+            is_skill_invoke = (
+                resolved_cmd_name.startswith("/skill:")
+                or getattr(handler, "name", "") == "/skill:"
+            )
+            if resolved_cmd_name not in {"/exit", "/quit", "/q", "/clear", "/force-clear", "/remember", "/skill-creator", "/btw", "/aside", "/fork", "/branch"} and not is_skill_invoke:
                 await self._mount_message(UserMessage(text))
 
             from opscloud.commands import CommandContext
@@ -2364,14 +2702,14 @@ class OpsCloudApp(App):
                 agent=getattr(self, "_agent", None),
                 settings=getattr(self, "_settings", None) or global_settings,
                 raw_command=text,
-                args=arg,
+                args=resolved_arg,
                 thread_id=self._agent_thread_id,
                 model_spec=self._model,
             )
             res = await self._command_router.dispatch(text, ctx)
             if res.mount_as_app_message and res.message:
                 from opscloud.ui.widgets.messages import CommandOutputMessage
-                await self._mount_message(CommandOutputMessage(res.message, command=cmd_name))
+                await self._mount_message(CommandOutputMessage(res.message, command=resolved_cmd_name))
             if res.notify:
                 self.notify(res.notify, severity=res.notify_severity)
             if res.push_screen:
@@ -2394,7 +2732,7 @@ class OpsCloudApp(App):
             )
             return
 
-        if cmd_name not in {"/exit", "/quit", "/q", "/clear", "/force-clear", "/remember", "/skill-creator"} and not cmd_name.startswith("/skill:"):
+        if cmd_name not in {"/exit", "/quit", "/q", "/clear", "/force-clear", "/remember", "/skill-creator", "/btw", "/aside", "/fork", "/branch"} and not cmd_name.startswith("/skill:"):
             await self._mount_message(UserMessage(text))
 
         # ── Dispatch (Fallback for unmigrated inline commands) ──────
@@ -2823,7 +3161,10 @@ class OpsCloudApp(App):
 
             ready_mcp_info = mcp_info if mcp_status != "unavailable" else self._mcp_server_info
 
-            self._client = RemoteAgent(url=server_proc.url, graph_name="agent")
+            if getattr(server_proc, "is_in_process", False) is True:
+                self._client = server_proc.create_client()
+            else:
+                self._client = RemoteAgent(url=server_proc.url, graph_name="agent")
             if self._adapter:
                 self._adapter.set_client(self._client)
 
@@ -3022,7 +3363,16 @@ class OpsCloudApp(App):
                 theme_reload_ok = False
                 logger.warning("Failed to reload themes", exc_info=True)
 
-            # 3. Re-discover skills
+            # 3. Re-discover skills & custom commands
+            try:
+                from opscloud.commands.custom.loader import clear_custom_command_cache
+
+                clear_custom_command_cache()
+                if hasattr(self, "_command_router") and self._command_router:
+                    self._command_router.reload_custom_commands()
+            except Exception:
+                logger.debug("Custom command reload skipped", exc_info=True)
+
             self._discovered_skills = await asyncio.to_thread(self.get_discovered_skills)
             new_skill_names = {
                 str(s.get("name", "")) for s in (self._discovered_skills or []) if s.get("name")
@@ -3033,16 +3383,16 @@ class OpsCloudApp(App):
             if hasattr(self, "_chat_input") and self._chat_input:
                 from opscloud.ui.command_registry import (
                     build_agent_commands,
+                    build_custom_commands,
                     build_skill_commands,
-                    build_workflow_commands,
                     get_all_entries,
                 )
 
                 skill_commands = build_skill_commands(self._discovered_skills)
-                skill_commands.extend(build_workflow_commands(self._discovered_skills or []))
                 plugin_agents = self.get_discovered_plugin_agents()
                 self._discovered_plugin_agents = plugin_agents
                 skill_commands.extend(build_agent_commands(plugin_agents or []))
+                skill_commands.extend(build_custom_commands())
                 self._chat_input.update_slash_commands(get_all_entries(skill_commands))
 
             # 4. Compose initial report lines
@@ -3401,6 +3751,7 @@ class OpsCloudApp(App):
         from opscloud.ui.widgets.messages import (
             AssistantMessage,
             MessageList,
+            SkillMessage,
             ToolCallMessage,
             UserMessage,
         )
@@ -3510,7 +3861,62 @@ class OpsCloudApp(App):
                     else:
                         continue  # Unknown operation type — skip
 
+                # ── Rehydrate skill invocations as SkillMessage ────────
+                add_kwargs = getattr(msg, "additional_kwargs", None) or {}
+                skill_meta = add_kwargs.get("__skill") if isinstance(add_kwargs, dict) else None
+                if isinstance(skill_meta, dict):
+                    s_name = str(skill_meta.get("name") or skill_meta.get("slash_command", "").lstrip("/"))
+                    s_desc = str(skill_meta.get("description") or "")
+                    s_source = str(skill_meta.get("source") or "built-in")
+                    s_args = str(skill_meta.get("args") or "")
+                    s_body = str(skill_meta.get("body") or "")
+                    if not s_body:
+                        scope_match = re.search(
+                            r"<SKILL>.*?Here are its contents:\n(.*?)</SKILL>",
+                            text,
+                            re.DOTALL,
+                        )
+                        s_body = scope_match.group(1) if scope_match else text
+                    await self._mount_message(
+                        SkillMessage(
+                            skill_name=s_name,
+                            description=s_desc,
+                            source=s_source,
+                            body=s_body,
+                            args=s_args,
+                        )
+                    )
+                    slash_cmd = str(skill_meta.get("slash_command") or f"/{s_name}").strip()
+                    hist_entry = f"{slash_cmd} {s_args}".strip() if s_args else slash_cmd
+                    if self._chat_input is not None and hasattr(self._chat_input, "add_history_entry"):
+                        self._chat_input.add_history_entry(hist_entry, persist=False)
+                    continue
+
+                skill_env_match = re.search(
+                    r"<SKILL>The user has explicitly invoked the \(([^)]+)\) skill\..*?Here are its contents:\n(.*?)</SKILL>",
+                    text,
+                    re.DOTALL,
+                )
+                if skill_env_match:
+                    s_name = skill_env_match.group(1).strip()
+                    s_body = skill_env_match.group(2)
+                    req_match = re.search(r"\*\*User request:\*\*\s*(.+)$", text, re.DOTALL)
+                    s_args = req_match.group(1).strip() if req_match else ""
+                    await self._mount_message(
+                        SkillMessage(
+                            skill_name=s_name,
+                            body=s_body,
+                            args=s_args,
+                        )
+                    )
+                    hist_entry = f"/{s_name} {s_args}".strip() if s_args else f"/{s_name}"
+                    if self._chat_input is not None and hasattr(self._chat_input, "add_history_entry"):
+                        self._chat_input.add_history_entry(hist_entry, persist=False)
+                    continue
+
                 await self._mount_message(UserMessage(text))
+                if self._chat_input is not None and hasattr(self._chat_input, "add_history_entry"):
+                    self._chat_input.add_history_entry(text, persist=False)
 
             elif isinstance(msg, AIMessage) or msg_type == "ai":
                 # Extract text and thinking from AIMessage
@@ -3655,10 +4061,9 @@ class OpsCloudApp(App):
 
         # Scroll to bottom after history loads (reference L16769-L16774)
         try:
-            from textual.containers import VerticalScroll
-            chat = self.query_one("#chat", VerticalScroll)
-            chat.scroll_end(animate=False)
-        except NoMatches:
+            messages_container._auto_scroll_locked = True
+            messages_container._scroll_to_end()
+        except Exception:
             pass
 
     def _close_active_tool_group(self) -> None:
@@ -3693,6 +4098,7 @@ class OpsCloudApp(App):
             session_state.thread_id = thread_id
         self._pending_messages.clear()
         self._queued_widgets.clear()
+        self._reset_ephemeral_mode_states()
         try:
             from opscloud.ui.widgets.messages import MessageList
             messages = self.query_one("#messages", MessageList)
@@ -3707,12 +4113,69 @@ class OpsCloudApp(App):
             await self._load_thread_history(thread_id)
             if hasattr(self, "_sync_goal_state_from_checkpoint"):
                 await self._sync_goal_state_from_checkpoint(force=True)
+            if hasattr(self, "_sync_agent_session_state_from_checkpoint"):
+                await self._sync_agent_session_state_from_checkpoint()
 
         label = "Created new thread" if is_new else "Resumed thread"
         await self._mount_message(
             SystemMessage(f"{label}: `{thread_id}`")
         )
 
+    async def fork_thread(self, *, source_thread_id: str | None = None) -> tuple[str, str]:
+        """Fork the active conversation thread into a new branch and switch to it in-place.
+
+        Workflow:
+        - Copies the active thread's checkpoint state and appends a ``<fork_notice>`` message.
+        - Switches ``_agent_thread_id`` to the newly created thread while preserving the
+          mounted TUI chat messages in place.
+        - Records ``_previous_thread_id`` so the user can return via ``/resume <previous_id>``.
+        """
+        from opscloud.middleware.goal_state_notice import build_fork_notice_message
+        from opscloud.state.session import SessionManager
+
+        prev_id = (source_thread_id or self._agent_thread_id or "").strip()
+        if not prev_id:
+            raise ValueError("No active conversation to fork.")
+
+        client = getattr(self, "_client", None) or getattr(self, "_agent", None)
+        if client is not None and callable(getattr(client, "afork_thread", None)):
+            new_thread_id = str(await client.afork_thread(prev_id))
+        else:
+            new_thread_id = await SessionManager.fork_thread(prev_id)
+            if client is not None and callable(getattr(client, "aupdate_state", None)):
+                notice_msg = build_fork_notice_message(
+                    source_thread_id=prev_id,
+                    new_thread_id=new_thread_id,
+                )
+                try:
+                    await client.aupdate_state(
+                        {"configurable": {"thread_id": new_thread_id}},
+                        {"messages": [notice_msg]},
+                    )
+                except Exception:
+                    logger.debug("Could not append <fork_notice> via client.aupdate_state", exc_info=True)
+
+        self._previous_thread_id = prev_id
+        self._agent_thread_id = new_thread_id
+        bind_logging_to_thread(new_thread_id)
+
+        session_state = getattr(self, "_session_state", None)
+        if session_state is not None:
+            try:
+                session_state.previous_thread_id = prev_id
+                session_state.thread_id = new_thread_id
+            except Exception:
+                pass
+
+        for state_attr in ("_goal_state", "_agent_session_state"):
+            st = getattr(self, state_attr, None)
+            if st is not None and hasattr(st, "thread_id"):
+                try:
+                    st.thread_id = new_thread_id
+                except Exception:
+                    pass
+
+        return prev_id, new_thread_id
 
     async def invoke_compact_conversation(self, thread_id: str | None = None, force: bool = True) -> None:
         """Trigger server-side conversation summarization/compaction."""
@@ -3854,11 +4317,16 @@ class OpsCloudApp(App):
 
         built_in_dir = Path(__file__).parent.parent / "built_in_skills"
         user_skills_dir = settings.get_user_skills_dir("opscloud")
-        project_skills_dir = settings.get_project_skills_dir()
+        ws_trusted = getattr(self, "_workspace_trusted", True)
+        project_skills_dir = settings.get_project_skills_dir() if ws_trusted else None
         project_root = (
-            getattr(self._settings, "project_root", None)
-            if hasattr(self, "_settings") and self._settings
-            else settings.project_root
+            (
+                getattr(self._settings, "project_root", None)
+                if hasattr(self, "_settings") and self._settings
+                else settings.project_root
+            )
+            if ws_trusted
+            else None
         )
 
         skills = list_skills(
@@ -3875,16 +4343,21 @@ class OpsCloudApp(App):
         from opscloud.config.settings import settings
         from opscloud.plugins.adapters.agents import discover_plugin_subagents
 
+        ws_trusted = getattr(self, "_workspace_trusted", True)
         project_root = (
-            getattr(self._settings, "project_root", None)
-            if hasattr(self, "_settings") and self._settings
-            else settings.project_root
+            (
+                getattr(self._settings, "project_root", None)
+                if hasattr(self, "_settings") and self._settings
+                else settings.project_root
+            )
+            if ws_trusted
+            else None
         )
         agents = discover_plugin_subagents(project_root=project_root)
         return [dict(a) for a in agents]
 
     async def _discover_startup_skills(self) -> None:
-        """Discover skills and plugin agents in the background on startup and populate autocomplete."""
+        """Discover skills, custom commands, and plugin agents in the background on startup and populate autocomplete."""
         try:
             skills = await asyncio.to_thread(self.get_discovered_skills)
             self._discovered_skills = skills
@@ -3893,17 +4366,50 @@ class OpsCloudApp(App):
             if hasattr(self, "_chat_input") and self._chat_input:
                 from opscloud.ui.command_registry import (
                     build_agent_commands,
+                    build_custom_commands,
                     build_skill_commands,
-                    build_workflow_commands,
                     get_all_entries,
                 )
 
                 skill_commands = build_skill_commands(skills or [])
-                skill_commands.extend(build_workflow_commands(skills or []))
                 skill_commands.extend(build_agent_commands(plugin_agents or []))
+                skill_commands.extend(build_custom_commands())
                 self._chat_input.update_slash_commands(get_all_entries(skill_commands))
         except Exception as exc:
             logger.debug("Failed startup skill discovery: %s", exc)
+
+    async def _run_custom_command_turn(
+        self,
+        prompt: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Submit an expanded custom command turn with active command permissions/model/effort/fork context."""
+        if not self._adapter or not self._adapter.connected or not self._agent_thread_id:
+            await self._send_to_agent(prompt)
+            return
+
+        await self._flush_pending_shell_messages()
+        self._agent_turn_started = False
+        self._agent_running = True
+        cmd_label = payload.get("command_name") or "command"
+        spinner = (
+            f"Running /{cmd_label} (forked)"
+            if payload.get("execution_context") == "fork"
+            else f"Thinking (/{cmd_label})"
+        )
+        await self._set_spinner(spinner)
+        from langchain_core.messages import HumanMessage
+
+        self._agent_worker = self.run_worker(
+            self._run_agent_task(
+                prompt,
+                graph_input={
+                    "messages": [HumanMessage(content=prompt)],
+                    "custom_command_request": payload,
+                },
+            ),
+            exclusive=False,
+        )
 
     async def switch_model(self, model_name: str, extra_kwargs: dict | None = None) -> None:
         """Switch active LLM model."""
@@ -4636,6 +5142,11 @@ class OpsCloudApp(App):
             if hasattr(self._chat_input, "exit_mode") and self._chat_input.exit_mode():
                 return
 
+        # 3a. If `/btw` overlay card is open, dismiss/cancel it without interrupting main agent
+        if self.is_btw_open():
+            self.dismiss_btw_response()
+            return
+
         # 4. If shell command is running, cancel the worker
         if self._shell_running and self._shell_worker:
             self._cancel_worker(self._shell_worker)
@@ -4716,8 +5227,10 @@ class OpsCloudApp(App):
 
     def action_clear_chat(self) -> None:
         """Clear chat and start fresh (Ctrl+L)."""
+        self.clear_active_btw()
         self._pending_messages.clear()
         self._queued_widgets.clear()
+        self._reset_ephemeral_mode_states()
         self._restore_goal_rubric_state({})
         self._reset_thread_usage(0.0, 0)
         try:
@@ -5904,6 +6417,9 @@ class OpsCloudApp(App):
         # Clear chat and start new thread
         self._pending_messages.clear()
         self._queued_widgets.clear()
+        self._reset_ephemeral_mode_states()
+        self._restore_goal_rubric_state({})
+        self._reset_thread_usage(0.0, 0)
         try:
             messages = self.query_one("#messages", MessageList)
             messages.clear()
@@ -6181,6 +6697,56 @@ class OpsCloudApp(App):
     # Plugin subagents run in an isolated session agent inside the server graph;
     # the TUI submits typed requests and mirrors AgentSessionState.
 
+    def _reset_ephemeral_mode_states(self) -> None:
+        """Reset TUI mirrors for active plugin agent sessions and workflows."""
+        try:
+            from opscloud.commands.power.agents import (
+                get_agent_session_state,
+                sync_agent_session_status_label,
+            )
+
+            ag_state = get_agent_session_state(self)
+            ag_state.clear()
+            sync_agent_session_status_label(self, ag_state)
+        except Exception:
+            pass
+
+    async def _sync_agent_session_state_from_checkpoint(self) -> None:
+        """Mirror the thread's ``_active_agent_id`` channel into ``AgentSessionState``."""
+        from opscloud.commands.power.agents import (
+            _clean_short_name,
+            _discover_plugin_agents,
+            get_agent_session_state,
+            resolve_plugin_agent,
+            sync_agent_session_status_label,
+        )
+
+        state = get_agent_session_state(self)
+        values = await self._get_thread_state_values()
+        if not values:
+            state.clear()
+            sync_agent_session_status_label(self, state)
+            return
+
+        active_id = values.get("_active_agent_id")
+        if isinstance(active_id, str) and active_id.strip():
+            full_name = active_id.strip()
+            spec = resolve_plugin_agent(full_name, _discover_plugin_agents(self))
+            state.agent_id = str(spec.get("name") or full_name) if spec else full_name
+            state.short_name = _clean_short_name(state.agent_id)
+            state.plugin_id = str(spec.get("plugin_id") or "") if spec else ""
+            state.description = (
+                str(spec.get("description") or "").splitlines()[0]
+                if spec and spec.get("description")
+                else ""
+            )
+            state.attached = True
+            state.thread_id = self._agent_thread_id
+            state.needs_server_reset = False
+        else:
+            state.clear()
+        sync_agent_session_status_label(self, state)
+
     async def _run_agent_session_request(self, request: dict[str, Any]) -> None:
         """Submit one typed agent session request through the normal agent stream."""
         if not self._adapter or not self._adapter.connected:
@@ -6248,132 +6814,18 @@ class OpsCloudApp(App):
         else:
             final_content = prompt_text
 
-        await self._run_agent_session_request(
-            {
-                "kind": "continue",
-                "request_id": str(uuid.uuid4()),
-                "agent_name": state.agent_id,
-                "message": final_content,
-            }
-        )
+        reset_flag = bool(getattr(state, "needs_server_reset", False))
+        state.needs_server_reset = False
+        req: dict[str, Any] = {
+            "kind": "continue",
+            "request_id": str(uuid.uuid4()),
+            "agent_name": state.agent_id,
+            "message": final_content,
+        }
+        if reset_flag:
+            req["reset"] = True
+        await self._run_agent_session_request(req)
         return True
-
-    # ── Workflow (/workflow) ─────────────────────────────
-    #
-    # Workflows run in an isolated workflow agent inside the server graph;
-    # the TUI only submits typed requests and mirrors ``_workflow_*`` channels.
-
-    async def _run_workflow_request(self, request: dict[str, Any]) -> None:
-        """Submit one typed workflow request through the normal agent stream."""
-        if not self._adapter or not self._adapter.connected:
-            await self._mount_message(ErrorMessage("Workflows require a connected server."))
-            return
-        from opscloud.commands.power.workflow import get_workflow_state
-
-        get_workflow_state(self).thread_id = self._agent_thread_id
-        kind = request.get("kind")
-        spinner = "Cancelling workflow" if kind == "cancel" else "Running workflow"
-        self._agent_turn_started = False
-        self._agent_running = True
-        await self._set_spinner(spinner)
-        self._agent_worker = self.run_worker(
-            self._run_agent_task(
-                "",
-                graph_input={
-                    "messages": [],
-                    "workflow_request": request,
-                },
-            ),
-            exclusive=False,
-        )
-
-    async def _maybe_continue_workflow(self, message: str) -> bool:
-        """Route plain chat input to an attached, running workflow.
-
-        Returns:
-            Whether the message was consumed by the workflow.
-        """
-        from opscloud.commands.power.workflow import get_workflow_state
-
-        state = get_workflow_state(self)
-        if state.thread_id not in {None, self._agent_thread_id}:
-            # Mirror belongs to another thread (e.g. after /threads); drop it.
-            state.clear()
-            return False
-        if not state.accepts_replies:
-            return False
-        await self._run_workflow_request(
-            {
-                "kind": "continue",
-                "request_id": str(uuid.uuid4()),
-                "message": message,
-            }
-        )
-        return True
-
-    async def _sync_workflow_state_from_checkpoint(self, *, announce: bool = False) -> None:
-        """Mirror the thread's ``_workflow_*`` channels into ``WorkflowState``.
-
-        Args:
-            announce: Report status transitions (only after a workflow turn,
-                never on passive refresh).
-        """
-        from opscloud.commands.power.workflow import get_workflow_state, sync_workflow_status_label
-        from opscloud.ui.widgets.messages import AppMessage
-
-        state = get_workflow_state(self)
-        values = await self._get_thread_state_values()
-        if not values:
-            return
-        state.thread_id = self._agent_thread_id
-
-        def _text(key: str) -> str | None:
-            raw = values.get(key)
-            return raw.strip() if isinstance(raw, str) and raw.strip() else None
-
-        previous_run = state.run_id
-        state.run_id = _text("_workflow_run_id")
-        state.name = _text("_workflow_name")
-        state.args = _text("_workflow_args")
-        state.status = _text("_workflow_status")
-        state.note = _text("_workflow_status_note")
-        artifacts = values.get("_workflow_artifacts")
-        state.artifacts = [str(a) for a in artifacts] if isinstance(artifacts, list) else []
-        if state.run_id and state.run_id != previous_run:
-            state.attached = True
-        sync_workflow_status_label(self, state)
-
-        if not announce:
-            return
-        key = (state.run_id, state.status, state.note)
-        if key == state.announced:
-            return
-        state.announced = key
-
-        label = f"`{state.name}`" if state.name else "Workflow"
-        if state.status == "complete":
-            body = f"Workflow {label} complete."
-            if state.note:
-                body += f"\n\n{state.note}"
-            if state.artifacts:
-                body += "\n\n**Artifacts:**\n" + "\n".join(f"- `{a}`" for a in state.artifacts)
-            await self._mount_message(AppMessage(body))
-        elif state.status == "blocked":
-            body = f"Workflow {label} needs your input."
-            if state.note:
-                body += f"\n\n{state.note}"
-            body += "\n\nReply to continue, or `/workflow cancel`."
-            await self._mount_message(AppMessage(body))
-        elif state.status == "failed":
-            body = f"Workflow {label} failed: {state.note or 'unknown error'}"
-            if state.artifacts:
-                body += "\n\n**Artifacts:**\n" + "\n".join(f"- `{a}`" for a in state.artifacts)
-            await self._mount_message(ErrorMessage(body))
-        elif state.status == "cancelled":
-            await self._mount_message(AppMessage("Workflow cancelled."))
-        elif state.note:
-            # Rejected request (e.g. another run still open) — status unchanged.
-            await self._mount_message(AppMessage(state.note))
 
     # ── Skill Command ────────────────────────────────────
 
@@ -6394,7 +6846,10 @@ class OpsCloudApp(App):
         """Load a skill, render its widget, and send its prompt to the agent.
 
         """
-        from opscloud.skills.invocation import build_skill_invocation_envelope
+        from opscloud.skills.invocation import (
+            build_skill_invocation_envelope,
+            match_discovered_skill,
+        )
         from opscloud.skills.loader import load_skill_content
         from opscloud.ui.widgets.messages import AppMessage, ErrorMessage, SkillMessage, UserMessage
 
@@ -6408,32 +6863,18 @@ class OpsCloudApp(App):
         if not normalized_name:
             if command is not None:
                 await self._mount_message(UserMessage(command))
-                await self._mount_message(AppMessage("Usage: /skill:<name> [args]"))
+                await self._mount_message(AppMessage("Usage: /<skill-name> [args]"))
             else:
                 await self._mount_message(AppMessage("Skill name is required."))
             return
 
         skills = self._discovered_skills or self.get_discovered_skills()
-        cached = next(
-            (
-                s for s in skills
-                if str(s.get("name", "")).lower() == normalized_name
-                or (":" in str(s.get("name", "")) and str(s.get("name", "")).rsplit(":", 1)[-1].lower() == normalized_name)
-            ),
-            None,
-        )
+        cached = match_discovered_skill(skills, normalized_name)
         if cached is None and self._discovered_skills:
             # Fall back to fresh discovery on cache miss
             skills = self.get_discovered_skills()
             self._discovered_skills = skills
-            cached = next(
-                (
-                    s for s in skills
-                    if str(s.get("name", "")).lower() == normalized_name
-                    or (":" in str(s.get("name", "")) and str(s.get("name", "")).rsplit(":", 1)[-1].lower() == normalized_name)
-                ),
-                None,
-            )
+            cached = match_discovered_skill(skills, normalized_name)
 
         if cached is None:
             logger.warning("Skill not found: %r", normalized_name)
@@ -6466,7 +6907,10 @@ class OpsCloudApp(App):
                 args=args,
             )
         )
-        await self._send_to_agent(envelope.prompt)
+        await self._send_to_agent(
+            envelope.prompt,
+            message_kwargs=envelope.message_kwargs,
+        )
 
     # ── Exit ─────────────────────────────────────────────
 

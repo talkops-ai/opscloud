@@ -124,6 +124,23 @@ class AgentSessionMiddleware(AgentMiddleware[AgentSessionChannels, Any]):
             "_active_agent_id",
             "_active_agent_plugin_id",
             "_active_agent_description",
+            # Exclude goal/rubric and large skill cache channels
+            # so they do not bloat or leak into the isolated subagent checkpoint state.
+            "goal_criteria_request",
+            "_goal_objective",
+            "_goal_status",
+            "_goal_rubric",
+            "_goal_status_note",
+            "_pending_goal_objective",
+            "_pending_goal_rubric",
+            "_pending_goal_kind",
+            "_pending_goal_request_id",
+            "_pending_goal_completion_note",
+            "rubric",
+            "_sticky_rubric",
+            "_rubric_status",
+            "_current_grading_run_id",
+            "skills_metadata",
         }
         inherited_state = {
             k: v for k, v in values.items()
@@ -173,17 +190,25 @@ class AgentSessionMiddleware(AgentMiddleware[AgentSessionChannels, Any]):
                 logger.warning("Plugin agent runnable for '%s' not found", agent_name)
                 return self._finish(base)
 
-            history = list(values.get("_agent_session_messages") or [])
+            prev_active = values.get("_active_agent_id")
+            force_reset = bool(request.get("reset")) or (
+                bool(agent_name) and prev_active != agent_name
+            )
+            history = [] if force_reset else list(values.get("_agent_session_messages") or [])
             new_msg = HumanMessage(content=message)
             input_data = {**inherited_state, "messages": [*history, new_msg]}
             context = getattr(runtime, "context", None)
             if is_async:
-                return self._async_call_subagent(agent_runnable, input_data, context, base, reset=False)
+                return self._async_call_subagent(
+                    agent_runnable, input_data, context, base, reset=force_reset
+                )
             result = agent_runnable.invoke(input_data, context=context)
-            messages = result.get("messages", [*history, new_msg])
+            messages = list(result.get("messages", [*history, new_msg]))
             update = {
                 **base,
-                "_agent_session_messages": list(messages),
+                "_agent_session_messages": (
+                    {"reset": True, "messages": messages} if force_reset else messages
+                ),
             }
             transfers = result.get("_session_cost_transfers")
             if isinstance(transfers, dict) and transfers:
@@ -213,6 +238,42 @@ class AgentSessionMiddleware(AgentMiddleware[AgentSessionChannels, Any]):
             update["_session_cost_transfers"] = transfers
         return self._finish(update)
 
+    @staticmethod
+    def _passthrough_cleanup(values: dict[str, Any]) -> dict[str, Any] | None:
+        """Clean up transient flags and any orphaned agent session messages on main agent turns."""
+        early: dict[str, Any] = {}
+        if values.get("_agent_session_turn"):
+            early["_agent_session_turn"] = False
+        if not values.get("_active_agent_id") and values.get("_agent_session_messages"):
+            early["_agent_session_messages"] = {"reset": True}
+        return early or None
+
+    @staticmethod
+    async def _close_subagent_mcp_if_needed(
+        request: dict[str, Any],
+        values: dict[str, Any],
+    ) -> None:
+        """Close active subagent MCP stdio sessions when clearing or switching agents."""
+        kind = request.get("kind")
+        prev_active = values.get("_active_agent_id")
+        target_agent = request.get("agent_name")
+        if kind == "clear":
+            to_close: str | None = None
+        elif prev_active and target_agent and prev_active != target_agent:
+            to_close = str(prev_active)
+        elif request.get("reset"):
+            to_close = str(prev_active) if prev_active else None
+        else:
+            return
+
+        try:
+            from opscloud.mcp.session_manager import MCPSessionManager
+
+            if MCPSessionManager._instance is not None:
+                await MCPSessionManager._instance.close_subagent_sessions(to_close)
+        except Exception:
+            logger.debug("Failed closing subagent MCP sessions", exc_info=True)
+
     # ── hooks ────────────────────────────────────────────
 
     @hook_config(can_jump_to=["end"])
@@ -221,7 +282,7 @@ class AgentSessionMiddleware(AgentMiddleware[AgentSessionChannels, Any]):
         values: dict[str, Any] = dict(state)
         request = values.get("agent_session_request")
         if not isinstance(request, dict):
-            return {"_agent_session_turn": False} if values.get("_agent_session_turn") else None
+            return self._passthrough_cleanup(values)
         try:
             return self._execute_turn(request, values, runtime, is_async=False)
         except GraphBubbleUp:
@@ -236,8 +297,9 @@ class AgentSessionMiddleware(AgentMiddleware[AgentSessionChannels, Any]):
         values: dict[str, Any] = dict(state)
         request = values.get("agent_session_request")
         if not isinstance(request, dict):
-            return {"_agent_session_turn": False} if values.get("_agent_session_turn") else None
+            return self._passthrough_cleanup(values)
         try:
+            await self._close_subagent_mcp_if_needed(request, values)
             res = self._execute_turn(request, values, runtime, is_async=True)
             if hasattr(res, "__await__"):
                 return await res

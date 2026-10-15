@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, ClassVar
 
-from rich.markup import escape
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Content
@@ -20,6 +19,7 @@ from opscloud.config.settings import get_glyphs
 from opscloud.ui.widgets.modal_base import (
     ModalSearchInput,
     OpsModalScreen,
+    escape_markup as escape,
     format_modal_option_row,
 )
 from opscloud.utils.logger import get_logger
@@ -140,11 +140,12 @@ class SkillItemWidget(Static):
 
     def render(self) -> str:
         cursor = "›" if self._selected else " "
-        badge = f"[{self.source.upper()}]"
+        safe_name = escape(self.skill_name)
+        badge = rf"\[{escape(self.source.upper())}]"
         if self._selected:
-            return f"[bold]{cursor} {self.skill_name}[/bold]  [dim cyan]{badge}[/dim cyan]"
+            return f"[bold]{cursor} {safe_name}[/bold]  [dim cyan]{badge}[/dim cyan]"
         else:
-            return f"{cursor} {self.skill_name}  [dim]{badge}[/dim]"
+            return f"{cursor} {safe_name}  [dim]{badge}[/dim]"
 
 
 # ── Skills Viewer Screen (Two-Pane Modal) ─────────────────────────

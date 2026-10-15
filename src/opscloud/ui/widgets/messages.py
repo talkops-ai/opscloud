@@ -60,9 +60,33 @@ from opscloud.ui.widgets.tool_display import (
 )
 EXECUTE_HEADER_MAX_LENGTH = 100
 
-_TOOL_GROUP_EXCLUSIONS = frozenset({"ask_user", "edit_file", "write_to_file", "replace_file_content", "write_todos"})
+_FILE_DIFF_TOOLS: frozenset[str] = frozenset(
+    {
+        "edit_file",
+        "write_file",
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "delete",
+        "delete_file",
+    }
+)
+"""Tools that modify, write, or delete files and display a line-numbered diff preview."""
+
+_TOOL_GROUP_EXCLUSIONS = frozenset(
+    {
+        "ask_user",
+        "write_todos",
+    }
+)
 """Tools that stay expanded instead of collapsing into step summaries."""
-from opscloud.ui.widgets.diff import compose_diff_lines
+from opscloud.ui.widgets.diff import (
+    compose_diff_lines,
+    format_file_diff_header,
+    render_diff_content,
+)
+from opscloud.ui.widgets.tool_renderers import get_renderer
+from opscloud.ui.widgets.tool_widgets import is_sensitive_file_path
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -140,9 +164,14 @@ _TOOLS_WITH_HEADER_INFO: set[str] = {
     # Filesystem tools
     "ls",
     "read_file",
+    "view_file",
     "write_file",
+    "write_to_file",
     "edit_file",
+    "replace_file_content",
+    "multi_replace_file_content",
     "delete",
+    "delete_file",
     "glob",
     "grep",
     "execute",  # sandbox shell
@@ -174,7 +203,19 @@ _COLLAPSE_OUTPUT_BY_DEFAULT: set[str] = {
 # decided by the formatter rather than by the raw size thresholds. `write_todos`
 # renders a per-item summary; `ask_user` renders a one-line summary so a
 # two-line transcript still keeps its answers behind an expand click.
-_ALWAYS_PREVIEW_TOOLS: frozenset[str] = frozenset({"write_todos", "ask_user"})
+_ALWAYS_PREVIEW_TOOLS: frozenset[str] = frozenset(
+    {
+        "write_todos",
+        "ask_user",
+        "edit_file",
+        "write_file",
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "delete",
+        "delete_file",
+    }
+)
 
 
 # An `ask_user` row whose recorded output is exactly one of these holds only a
@@ -339,8 +380,7 @@ _UserMessageDisplay = _UserMessageFull | _UserMessageCollapsed
 def _collapse_user_message(text: str) -> _UserMessageDisplay:
     """Collapse a very long user message for transcript display.
 
-    Keeps the first and last portions and elides the middle. This mirrors
-    Claude Code's `UserPromptMessage` head+tail truncation for rendering
+    Keeps the first and last portions and elides the middle for rendering
     performance.
 
     Args:
@@ -632,6 +672,65 @@ class ToolCallMessage(Vertical):
         # Transcript decorations that must follow approval visibility without
         # losing their independent user-controlled visibility state.
         self._visibility_accessories: list[Widget] = []
+        self._cached_file_diff: tuple[list[str], int, int] | None = None
+        if self._tool_name in _FILE_DIFF_TOOLS and self._args:
+            self._cached_file_diff = self._compute_file_diff_lines()
+
+    def _compute_file_diff_lines(self) -> tuple[list[str], int, int]:
+        """Compute diff lines and (+added, -removed) counts for file edit/write tools."""
+        if self._tool_name not in _FILE_DIFF_TOOLS or not self._args:
+            return [], 0, 0
+        file_path = str(
+            self._args.get("file_path")
+            or self._args.get("TargetFile")
+            or self._args.get("path")
+            or ""
+        )
+        if is_sensitive_file_path(file_path):
+            return [], 0, 0
+        try:
+            renderer = get_renderer(self._tool_name)
+            _widget_cls, data = renderer.get_approval_widget(self._args)
+        except Exception:
+            return [], 0, 0
+
+        diff_lines = data.get("diff_lines")
+        if isinstance(diff_lines, list) and diff_lines:
+            added = int(data.get("stats_add", 0))
+            removed = int(data.get("stats_del", 0))
+            if added == 0 and removed == 0:
+                added = sum(
+                    1
+                    for ln in diff_lines
+                    if isinstance(ln, str) and ln.startswith("+") and not ln.startswith("+++")
+                )
+                removed = sum(
+                    1
+                    for ln in diff_lines
+                    if isinstance(ln, str) and ln.startswith("-") and not ln.startswith("---")
+                )
+            return [str(ln) for ln in diff_lines], added, removed
+
+        content = (
+            data.get("content")
+            or self._args.get("content")
+            or self._args.get("CodeContent")
+        )
+        if isinstance(content, str) and content:
+            raw_lines = content.splitlines()
+            synth_diff = [
+                f"@@ -0,0 +1,{len(raw_lines)} @@",
+                *[f"+{ln}" for ln in raw_lines],
+            ]
+            return synth_diff, len(raw_lines), 0
+
+        return [], 0, 0
+
+    def _build_file_diff_lines(self) -> tuple[list[str], int, int]:
+        """Return cached or freshly computed diff lines and (+added, -removed) stats."""
+        if self._cached_file_diff is None:
+            self._cached_file_diff = self._compute_file_diff_lines()
+        return self._cached_file_diff
 
     def compose(self) -> ComposeResult:
         """Compose the tool call message layout.
@@ -828,7 +927,9 @@ class ToolCallMessage(Vertical):
             return
         frames = get_glyphs().spinner_frames
         self._spinner_position = (self._spinner_position + 1) % len(frames)
-        self._refresh_header()
+        if not self.display:
+            return
+        self._refresh_header(layout=False)
 
     def pause_running(self) -> None:
         """Pause the running spinner while the tool awaits a user decision.
@@ -915,6 +1016,17 @@ class ToolCallMessage(Vertical):
             if parts.kind != "task":
                 pieces.append(parts.detail)
 
+        if self._tool_name in _FILE_DIFF_TOOLS:
+            _diff_lines, added, removed = self._build_file_diff_lines()
+            if added > 0 or removed > 0:
+                pieces.append("  ")
+                if added > 0:
+                    pieces.append((f"+{added}", "bold #4ec969"))
+                if removed > 0:
+                    if added > 0:
+                        pieces.append(" ")
+                    pieces.append((f"-{removed}", "bold #f85149"))
+
         meta = self._header_meta()
         if meta:
             pieces.append((f"  {glyphs.separator} {meta}", "dim"))
@@ -931,10 +1043,10 @@ class ToolCallMessage(Vertical):
                 return format_duration(int(self._duration))
         return ""
 
-    def _refresh_header(self) -> None:
+    def _refresh_header(self, *, layout: bool = True) -> None:
         """Re-render the header line for the current state."""
         if self._header_widget is not None:
-            self._header_widget.update(self._header_content())
+            self._header_widget.update(self._header_content(), layout=layout)
 
     def _show_terminal_label(self, label: str, css_class: str) -> None:
         """Show a short terminal label (e.g. ``Rejected``) under the header."""
@@ -1255,9 +1367,17 @@ class ToolCallMessage(Vertical):
                 _TOOL_AWAITING_APPROVAL_ACCESSORY_CLASS,
             )
 
+    def _has_diff_preview(self) -> bool:
+        """Return whether this row is a file diff tool with renderable diff lines."""
+        return (
+            self._tool_name in _FILE_DIFF_TOOLS
+            and self._status not in {"error", "rejected", "skipped"}
+            and bool(self._build_file_diff_lines()[0])
+        )
+
     def toggle_output(self) -> None:
         """Toggle expansion of the tool's preview/full output."""
-        if not self._output:
+        if not self._output and not self._has_diff_preview():
             return
         # No-op in both directions when nothing is hidden: the collapsed and
         # expanded forms are identical, so toggling only flickers the hint.
@@ -1302,7 +1422,7 @@ class ToolCallMessage(Vertical):
             self.toggle_task_desc()
         elif self.has_expandable_args and self._click_targets_args_region(event.widget):
             self.toggle_args()
-        elif self._output and self.has_expandable_output:
+        elif (self._output or self._has_diff_preview()) and self.has_expandable_output:
             self.toggle_output()
         elif self.has_expandable_args:
             self.toggle_args()
@@ -1400,7 +1520,7 @@ class ToolCallMessage(Vertical):
         # which prefixes each branch with two spaces) renders with line 0 flush
         # and the rest indented beside the fixed glyph gutter.
         output = output.rstrip().lstrip("\n")
-        if not output:
+        if not output and not self._has_diff_preview():
             return FormattedOutput(content=Content(""))
 
         # Tool-specific formatting using dispatch table
@@ -1408,8 +1528,14 @@ class ToolCallMessage(Vertical):
             "write_todos": self._format_todos_output,
             "ls": self._format_ls_output,
             "read_file": self._format_file_output,
-            "write_file": self._format_file_output,
+            "view_file": self._format_file_output,
+            "write_file": self._format_edit_file_output,
+            "write_to_file": self._format_edit_file_output,
             "edit_file": self._format_edit_file_output,
+            "replace_file_content": self._format_edit_file_output,
+            "multi_replace_file_content": self._format_edit_file_output,
+            "delete": self._format_edit_file_output,
+            "delete_file": self._format_edit_file_output,
             "grep": self._format_search_output,
             "glob": self._format_search_output,
             "execute": self._format_shell_output,
@@ -1481,32 +1607,12 @@ class ToolCallMessage(Vertical):
     def _has_expandable_output(self) -> bool:
         """Return whether collapsed output has hidden content to expand."""
         output = self._output.strip()
-        if not output or self._is_search_no_result_output(output):
+        if (not output and not self._has_diff_preview()) or self._is_search_no_result_output(output):
             return False
 
-        # Tools in `_COLLAPSE_OUTPUT_BY_DEFAULT` (read_file, grep, glob) collapse
-        # their body entirely by default (the header already carries the file
-        # path / search pattern), so any result with something to show is
-        # expandable regardless of size. The exception is a search that finds
-        # nothing: grep/glob return the terminal "No matches found" / "No files
-        # found" message, caught by `_is_search_no_result_output` above so it
-        # renders inline (see `_update_output_display`) instead of hiding a
-        # "nothing found" result behind an expand click. Beyond that, confirm the
-        # formatted output is non-empty rather than trusting the raw string —
-        # output that formats to blank (all whitespace, or a serialized empty
-        # collection like `[]`) has nothing to reveal. Successful `edit_file`
-        # similarly hides its redundant success line in the collapsed view while
-        # keeping the raw output expandable. This mirrors the empty-output guard
-        # in `_update_output_display`, which suppresses any body that would
-        # render blank before the collapse branch is reached — the two must move
-        # together if that assumption changes. Errors are excluded because
-        # `set_error` force-expands every error; treating a short error as
-        # always-expandable would offer a collapse that hides it entirely.
         if self._tool_name in _COLLAPSE_OUTPUT_BY_DEFAULT and self._status != "error":
             formatted = self._format_output(output, is_preview=False)
             return bool(formatted.content.plain.strip())
-        if self._tool_name == "edit_file" and self._status == "success":
-            return True
 
         # See `_ALWAYS_PREVIEW_TOOLS`: the formatter decides whether these have
         # anything left to reveal, rather than the raw size thresholds below.
@@ -1516,12 +1622,6 @@ class ToolCallMessage(Vertical):
 
         lines = output.split("\n")
         if len(lines) > self._PREVIEW_LINES or len(output) > self._PREVIEW_CHARS:
-            # The outer size threshold is necessary but not sufficient: only
-            # treat output as expandable if the formatter actually hides
-            # content. Some formatters cap by line count alone (task and the
-            # web fallback, via `_format_task_output` / `_format_lines_output`),
-            # so a long single line crosses the char threshold yet renders in
-            # full with nothing hidden.
             return self._format_output(output, is_preview=True).truncation is not None
 
         return False
@@ -1815,18 +1915,25 @@ class ToolCallMessage(Vertical):
     def _format_edit_file_output(
         self, output: str, *, is_preview: bool = False
     ) -> FormattedOutput:
-        """Render edit_file output, hiding success only in the preview.
-
-        On success the collapsed status glyph and the diff already convey the
-        outcome, so the "Successfully replaced ..." line is hidden by default.
-        The full rendering still shows the raw tool output so clicking the row
-        can recover the original message. Errors still render in both modes.
-
-        Returns:
-            Empty preview on success, otherwise the file formatter.
-        """
-        if self._status == "success" and is_preview:
-            return FormattedOutput(content=Content(""))
+        """Render file edit/write output as a line-numbered, background-tinted diff block."""
+        if self._status != "error":
+            diff_lines, _added, _removed = self._build_file_diff_lines()
+            if diff_lines:
+                width = 88
+                if self.is_attached and self.size.width > 16:
+                    width = max(40, self.size.width - 8)
+                max_preview_lines = 33
+                content, remaining = render_diff_content(
+                    "\n".join(diff_lines),
+                    max_lines=max_preview_lines if is_preview else None,
+                    show_stats=False,
+                    expand_hint="",
+                    line_width=width,
+                )
+                truncation = f"{remaining} more lines" if (is_preview and remaining > 0) else None
+                return FormattedOutput(content=content, truncation=truncation)
+            if self._status == "success" and is_preview:
+                return FormattedOutput(content=Content(""))
         return self._format_file_output(output, is_preview=is_preview)
 
     def _format_file_output(
@@ -2309,7 +2416,7 @@ class ToolCallMessage(Vertical):
         """Update the output display based on expanded state."""
         # Guard: all widgets must be initialized before updating display state
         if (
-            not self._output
+            (not self._output and not self._has_diff_preview())
             or not self._preview_widget
             or not self._preview_row
             or not self._full_widget
@@ -2328,21 +2435,6 @@ class ToolCallMessage(Vertical):
             total_lines > self._PREVIEW_LINES or total_chars > self._PREVIEW_CHARS
         )
 
-        # Some output is a non-empty raw string that the formatter renders as no
-        # visible content — all whitespace, or a serialized empty collection like
-        # `[]`. The raw `_output` is truthy, so the early-return guard at the top
-        # of this method doesn't catch it, but rendering it would show an empty
-        # box with a misleading expand affordance. Treat it like empty output and
-        # render nothing. (A search that found nothing is not this case: grep/glob
-        # return a human-readable "No matches found" / "No files found" that
-        # formats non-empty and renders inline; see the collapse branch below.)
-        # This also subsumes the all-whitespace case, so the collapsed branch
-        # below no longer needs its own empty guard.
-        #
-        # This fires for errors too, but never hides one: a real error body is
-        # human-readable text that formats non-empty (and execute errors keep
-        # the `$ command` echo), so it only triggers on a body that has nothing
-        # to render anyway. The "error" status badge stays visible regardless.
         full = self._format_output(self._output, is_preview=False)
         if not full.content.plain.strip():
             self._preview_row.display = False
@@ -2355,10 +2447,6 @@ class ToolCallMessage(Vertical):
             self._preview_row.display = False
             self._full_widget.update(full.content)
             self._full_row.display = True
-            # Only offer a collapse affordance when collapsing would actually
-            # hide something. Errors are force-expanded (see `set_error`), so a
-            # short single-line error has no smaller collapsed form — showing
-            # "click to collapse" there is misleading.
             if self._has_expandable_output():
                 self._hint_widget.update(
                     Content.styled(
@@ -2371,21 +2459,9 @@ class ToolCallMessage(Vertical):
         else:
             # Show collapsed preview
             self._full_row.display = False
-            # `read_file` echoes the file the agent read, grep/glob echo the
-            # matches for a pattern the header already names, and `edit_file`
-            # success output repeats the status/diff — so the body is noise by
-            # default. Collapse it entirely (no preview) while keeping the
-            # original output expandable for when the user does want to see it.
-            # A grep/glob that found nothing is excluded: its terminal "No
-            # matches/files found" message is the whole result, so it renders
-            # inline rather than hiding behind an expand click.
             if not self._is_search_no_result_output(self._output) and (
                 self._tool_name in _COLLAPSE_OUTPUT_BY_DEFAULT
-                or (self._tool_name == "edit_file" and self._status == "success")
             ):
-                # Show a one-line result summary in the output gutter
-                # ("⎿ 1 match · click or Ctrl+O to expand") so the row still
-                # says what came back without echoing the body.
                 sep = get_glyphs().separator
                 summary = format_tool_result_summary(self._tool_name, self._output)
                 summary = summary.removeprefix("⎿").strip()
@@ -2403,18 +2479,11 @@ class ToolCallMessage(Vertical):
             # warrant it; `_ALWAYS_PREVIEW_TOOLS` use their compact preview
             # regardless of size.
             is_preview = needs_truncation or self._tool_name in _ALWAYS_PREVIEW_TOOLS
-            # Pass the raw output, not `output_stripped`: `_format_output`
-            # normalizes whitespace while preserving the first line's leading
-            # indentation. Pre-stripping here flattens that indent on line 0 only,
-            # misaligning uniformly indented output (e.g. `git branch -r`). The
-            # expanded branch above already passes raw `self._output`.
             result = self._format_output(self._output, is_preview=is_preview)
             self._preview_widget.update(result.content)
             self._preview_row.display = True
 
             # Offer expansion only when the formatter actually hid content.
-            # The raw size threshold can trip without anything being hidden, and
-            # promising an expansion that reveals nothing is misleading.
             if result.truncation:
                 ellipsis = get_glyphs().ellipsis
                 sep = get_glyphs().separator
@@ -2432,13 +2501,6 @@ class ToolCallMessage(Vertical):
     def _output_hint_keys(self) -> str:
         """Affordances to advertise in the output expand/collapse hint.
 
-        Ctrl+O routes to the collapsible command/code block whenever this row
-        has one (see `action_toggle_tool_output`), and to a truncated `task`
-        description when the row is a `task` call, so the output hint only
-        advertises Ctrl+O when Ctrl+O would actually toggle the *output*. When a
-        command/code block or expandable `task` description owns Ctrl+O the
-        output is reachable by clicking its own region instead.
-
         Returns:
             `"click"` when an expandable command/code block or `task`
                 description owns Ctrl+O, otherwise `"click or Ctrl+O"`.
@@ -2454,7 +2516,7 @@ class ToolCallMessage(Vertical):
         Returns:
             True if there is output content, False otherwise.
         """
-        return bool(self._output)
+        return bool(self._output) or self._has_diff_preview()
 
     @property
     def tool_name(self) -> str:
@@ -2503,6 +2565,8 @@ class ToolCallMessage(Vertical):
             collapsible block when the command is longer than `EXECUTE_HEADER_MAX_LENGTH`.
         - `js_eval`, `run_script`, or script/code args: full source code block.
         """
+        if self._tool_name in _FILE_DIFF_TOOLS:
+            return False
         if self._tool_name == "ask_user":
             return bool(self._args)
         if self._tool_name in {"execute", "run_command"}:
@@ -2700,11 +2764,11 @@ class ToolCallMessage(Vertical):
         Returns:
             Filtered args dict with only display-relevant keys for write/edit tools.
         """
-        if self._tool_name not in {"write_file", "edit_file"}:
+        if self._tool_name not in _FILE_DIFF_TOOLS:
             return self._args
 
         filtered: dict[str, Any] = {}
-        for key in ("file_path", "path", "replace_all"):
+        for key in ("file_path", "TargetFile", "path", "replace_all"):
             if key in self._args:
                 filtered[key] = self._args[key]
         return filtered
@@ -2721,6 +2785,7 @@ _TOOL_SUMMARY_CATEGORY: dict[str, str] = {
     "replace_file_content": "edit",
     "multi_replace_file_content": "edit",
     "delete": "delete",
+    "delete_file": "delete",
     "ls": "ls",
     "list_dir": "ls",
     "grep": "search",
@@ -3173,31 +3238,35 @@ class ToolGroupSummary(Static):
             self._timer.stop()
             self._timer = None
 
+    def sync_members(self) -> None:
+        """Synchronize member status, evict failures, and update the summary line."""
+        before = len(self._tools)
+        self._evict_failed()
+        evicted = len(self._tools) != before
+        if self._collapsed:
+            # Re-assert hidden state in case a member was shown externally
+            # (e.g. ToolCallMessage.clear_awaiting_approval after HITL).
+            self._apply_visibility()
+        if not self._tools:
+            self._sync_lifecycle(in_progress=False)
+            # Nothing can expand this summary once it is gone, so release
+            # anything still folded before removing it.
+            self._release_all_collapsible()
+            if self.is_attached:
+                self.remove()
+            return
+        in_progress = self._sync_lifecycle()
+        # A bare spinner advance keeps the line height. `_render_line`
+        # promotes this to a layout update if the pending summary changed.
+        self._render_line(
+            in_progress=in_progress, layout=evicted or not in_progress
+        )
+
     def _tick(self) -> None:
         """Advance the spinner, eject failures, and flip to past tense when done."""
         try:
             self._spinner_pos += 1
-            before = len(self._tools)
-            self._evict_failed()
-            evicted = len(self._tools) != before
-            if self._collapsed:
-                # Re-assert hidden state in case a member was shown externally
-                # (e.g. ToolCallMessage.clear_awaiting_approval after HITL).
-                self._apply_visibility()
-            if not self._tools:
-                self._sync_lifecycle(in_progress=False)
-                # Nothing can expand this summary once it is gone, so release
-                # anything still folded before removing it.
-                self._release_all_collapsible()
-                if self.is_attached:
-                    self.remove()
-                return
-            in_progress = self._sync_lifecycle()
-            # A bare spinner advance keeps the line height. `_render_line`
-            # promotes this to a layout update if the pending summary changed.
-            self._render_line(
-                in_progress=in_progress, layout=evicted or not in_progress
-            )
+            self.sync_members()
         except Exception:
             # Fires ~10x/second, so an unhandled raise would propagate out of the
             # interval callback and can crash the app repeatedly. The group is
@@ -3645,6 +3714,14 @@ def _assistant_markdown_class() -> type[Markdown]:
     class AssistantFence(MarkdownFence):
         """Code fence that shows its language label and opens file paths on click."""
 
+        DEFAULT_CSS = """
+        AssistantFence {
+            overflow: hidden hidden;
+            scrollbar-size-horizontal: 0;
+            scrollbar-size-vertical: 0;
+        }
+        """
+
         def __init__(self, markdown: Any, token: Any, code: str) -> None:
             super().__init__(markdown, token, code)
             self._apply_language_title()
@@ -3822,6 +3899,7 @@ class AssistantMessage(Vertical):
         border: round $foreground 18%;
         border-title-color: $text-muted;
         border-title-align: left;
+        overflow: hidden hidden;
         scrollbar-size-horizontal: 0;
         scrollbar-size-vertical: 0;
     }
@@ -3954,6 +4032,9 @@ class AssistantMessage(Vertical):
         try:
             stream = self._ensure_stream()
             await stream.write(pending)
+            if isinstance(self.parent, MessageList) and self.parent._auto_scroll_locked:
+                self.parent._scroll_to_end()
+                self.parent.call_after_refresh(self.parent._scroll_to_end)
         except Exception:
             # Restore buffer on failure so next tick retries.
             self._pending_append = pending + self._pending_append
@@ -3995,15 +4076,21 @@ class AssistantMessage(Vertical):
         if not self._content_parts or not self._content.strip():
             self.remove()
         else:
-            # Flush remaining buffered text and do a final full render.
+            # Flush remaining buffered text and do a final full render if needed.
             async def _finalize() -> None:
+                had_stream = self._stream is not None
                 await self._flush_pending_append()
                 if self._stream is not None:
                     await self._stream.stop()
                     self._stream = None
                 from opscloud.ui.widgets._links import autolink_file_paths
 
-                await self._get_markdown().update(autolink_file_paths(self._content))
+                autolinked = autolink_file_paths(self._content)
+                md = self._get_markdown()
+                if not had_stream or autolinked != self._content or not md.children:
+                    await md.update(autolinked)
+                if isinstance(self.parent, MessageList) and self.parent._auto_scroll_locked:
+                    self.parent._scroll_to_end()
             self.run_worker(_finalize(), exclusive=True, thread=False)
 
     async def on_markdown_link_clicked(self, event: Any) -> None:
@@ -4064,9 +4151,12 @@ class DiffMessage(Static):
     """
 
     def __init__(self, patch_or_diff: str, file_path: str = "") -> None:
-        diff_lines = compose_diff_lines(patch_or_diff)
-        header = Text(f"Diff: {file_path}\n" if file_path else "Diff\n", style="bold cyan")
-        super().__init__(header + diff_lines)
+        lines = patch_or_diff.splitlines()
+        additions = sum(1 for ln in lines if ln.startswith("+") and not ln.startswith("+++"))
+        deletions = sum(1 for ln in lines if ln.startswith("-") and not ln.startswith("---"))
+        header = format_file_diff_header(file_path or "Diff", additions=additions, deletions=deletions)
+        body, _ = render_diff_content(patch_or_diff, max_lines=None, show_stats=False)
+        super().__init__(Content.assemble(header, "\n", body))
 
 class _SkillToggle(Static):
     """Clickable header/hint area for toggling skill body expansion.
@@ -4181,11 +4271,14 @@ class SkillMessage(Vertical):
         Yields:
             Widgets for header, description, args, and collapsible body.
         """
+        from opscloud.skills.invocation import format_skill_slash_name
+
         colors = theme.get_theme_colors(self)
         source_tag = f" [{self._source}]" if self._source else ""
+        clean_name = format_skill_slash_name(self._skill_name) or self._skill_name
         yield _SkillToggle(
             Content.styled(
-                f"/ skill:{self._skill_name}{source_tag}",
+                f"/{clean_name}{source_tag}",
                 f"bold {colors.skill}",
             ),
             classes="skill-header",
@@ -4541,15 +4634,40 @@ class TurnSummary(Static):
         )
 
 
+def compute_wheel_speed(streak: int, viewport_height: int = 0) -> int:
+    """Compute sub-linear scroll lines per wheel event.
+
+    Uses ``min(12, 1 + isqrt(streak))`` clamped to ``max(1, viewport_height // 3)``
+    when ``viewport_height > 0``.
+    """
+    import math
+
+    speed = min(12, 1 + math.isqrt(max(0, streak)))
+    if viewport_height > 0:
+        speed = min(speed, max(1, viewport_height // 3))
+    return max(1, speed)
+
+
 class MessageList(VerticalScroll):
     """Scrollable list of conversation messages with auto-scroll lock controls."""
 
     DEFAULT_CSS = """
     MessageList {
         height: 1fr;
-        layout: stream;
     }
     """
+
+    _WHEEL_STREAK_WINDOW_S: ClassVar[float] = 0.150
+    """Max interval (150ms) between same-direction wheel events to build streak."""
+
+    _SCROLL_COALESCE_INTERVAL_S: ClassVar[float] = 0.016
+    """16ms (60fps) frame budget for coalescing burst wheel scroll deltas."""
+
+    _HOVER_SUPPRESS_WINDOW_S: ClassVar[float] = 0.120
+    """Suppress post-refresh hover hit-testing while actively scrolling."""
+
+    _STICKY_BOTTOM_THRESHOLD: ClassVar[float] = 2.0
+    """Distance from max_scroll_y within which downward scroll re-locks auto-scroll."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -4561,6 +4679,26 @@ class MessageList(VerticalScroll):
         """Monotonic count of tool-call widgets created (per-turn deltas)."""
         self._active_tool_group: ToolGroupSummary | None = None
         self._auto_scroll_locked = True
+        self._scroll_end_pending = False
+        self._last_wheel_time: float = 0.0
+        self._last_wheel_dir: int = 0
+        self._wheel_streak: int = 0
+        self._pending_scroll_delta: int = 0
+        self._last_scroll_flush_time: float = 0.0
+        self._scroll_flush_timer: Any = None
+        self._hover_settle_timer: Any = None
+
+    def on_unmount(self) -> None:
+        """Stop any pending scroll coalescer or hover settle timers."""
+        self._stop_scroll_timers()
+
+    def _stop_scroll_timers(self) -> None:
+        if self._scroll_flush_timer is not None:
+            self._scroll_flush_timer.stop()
+            self._scroll_flush_timer = None
+        if self._hover_settle_timer is not None:
+            self._hover_settle_timer.stop()
+            self._hover_settle_timer = None
 
     def _mount_child(self, widget: Widget, before: Widget | None = None) -> None:
         """Mount child widget, ensuring it mounts before the bottom loading widget if active."""
@@ -4581,6 +4719,195 @@ class MessageList(VerticalScroll):
     def on_scroll_up(self) -> None:
         """Suspend auto-scroll when user manually scrolls up."""
         self._auto_scroll_locked = False
+        if self._anchored and not self._anchor_released:
+            self.release_anchor()
+
+    def _mark_user_scrolling(self) -> None:
+        """Suppress post-refresh hover hit-testing while a scroll gesture is active."""
+        if not self.is_attached or self.app is None:
+            return
+        setattr(
+            self.app,
+            "_opscloud_scroll_suppress_hover_until",
+            time.monotonic() + self._HOVER_SUPPRESS_WINDOW_S,
+        )
+        if self._hover_settle_timer is not None:
+            self._hover_settle_timer.stop()
+        self._hover_settle_timer = self.set_timer(
+            self._HOVER_SUPPRESS_WINDOW_S, self._on_scroll_hover_settled
+        )
+
+    def _on_scroll_hover_settled(self) -> None:
+        """Restore hover hit-testing once the scroll gesture settles."""
+        self._hover_settle_timer = None
+        if not self.is_attached or self.app is None:
+            return
+        setattr(self.app, "_opscloud_scroll_suppress_hover_until", 0.0)
+        try:
+            self.app._update_mouse_over(self.screen)
+        except Exception:
+            pass
+
+    def _next_wheel_speed(self, direction: int, now: float | None = None) -> int:
+        """Compute accelerated wheel scroll lines for ``direction`` (-1 up, +1 down)."""
+        ts = time.monotonic() if now is None else now
+        if (
+            self._last_wheel_dir == direction
+            and (ts - self._last_wheel_time) < self._WHEEL_STREAK_WINDOW_S
+        ):
+            self._wheel_streak += 1
+        else:
+            self._wheel_streak = 0
+        self._last_wheel_time = ts
+        self._last_wheel_dir = direction
+        vh = self.scrollable_content_region.height if self.is_attached else 0
+        return compute_wheel_speed(self._wheel_streak, vh)
+
+    def _queue_wheel_scroll(self, delta: int, now: float | None = None) -> None:
+        """Coalesce wheel deltas within a 16ms frame budget."""
+        if delta == 0:
+            return
+        ts = time.monotonic() if now is None else now
+        if delta < 0:
+            self.on_scroll_up()
+        self._mark_user_scrolling()
+        if (self._pending_scroll_delta > 0 and delta < 0) or (
+            self._pending_scroll_delta < 0 and delta > 0
+        ):
+            self._pending_scroll_delta = delta
+        else:
+            self._pending_scroll_delta += delta
+
+        if not self.is_attached:
+            self._flush_pending_scroll()
+            return
+
+        if (
+            self._scroll_flush_timer is None
+            and (ts - self._last_scroll_flush_time) >= self._SCROLL_COALESCE_INTERVAL_S
+        ):
+            self._flush_pending_scroll()
+        elif self._scroll_flush_timer is None:
+            self._scroll_flush_timer = self.set_timer(
+                self._SCROLL_COALESCE_INTERVAL_S, self._flush_pending_scroll
+            )
+
+    def _flush_pending_scroll(self) -> None:
+        """Flush accumulated wheel delta in a single immediate compositor scroll."""
+        if self._scroll_flush_timer is not None:
+            self._scroll_flush_timer.stop()
+            self._scroll_flush_timer = None
+        delta = self._pending_scroll_delta
+        self._pending_scroll_delta = 0
+        if delta == 0:
+            return
+        self._last_scroll_flush_time = time.monotonic()
+        target_y = max(0.0, min(float(self.max_scroll_y), float(self.scroll_y) + delta))
+        self.scroll_to(y=target_y, animate=False, immediate=True)
+        if delta > 0 and (self.max_scroll_y - self.scroll_y) <= self._STICKY_BOTTOM_THRESHOLD:
+            self._auto_scroll_locked = True
+        elif delta < 0 and (self.max_scroll_y - self.scroll_y) > self._STICKY_BOTTOM_THRESHOLD:
+            self._auto_scroll_locked = False
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        """Handle mouse/trackpad scroll up with WheelSpeed + 16ms coalescing."""
+        if not self.allow_vertical_scroll:
+            return
+        self.on_scroll_up()
+        if self.scroll_y > 0 or self._pending_scroll_delta > 0:
+            speed = self._next_wheel_speed(-1)
+            self._queue_wheel_scroll(-speed)
+            event.stop()
+
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        """Handle mouse/trackpad scroll down with WheelSpeed + 16ms coalescing."""
+        if not self.allow_vertical_scroll:
+            return
+        if self.scroll_y < self.max_scroll_y or self._pending_scroll_delta < 0:
+            speed = self._next_wheel_speed(1)
+            self._queue_wheel_scroll(speed)
+            event.stop()
+        else:
+            self._auto_scroll_locked = True
+
+    def action_scroll_up(self) -> None:
+        """Scroll up one line immediately and unlock auto-scroll."""
+        if not self.allow_vertical_scroll:
+            return
+        self.on_scroll_up()
+        self._mark_user_scrolling()
+        self.scroll_up(animate=False, immediate=True)
+
+    def action_scroll_down(self) -> None:
+        """Scroll down one line immediately and re-lock if at bottom."""
+        if not self.allow_vertical_scroll:
+            return
+        self._mark_user_scrolling()
+        self.scroll_down(animate=False, immediate=True)
+        if (self.max_scroll_y - self.scroll_y) <= self._STICKY_BOTTOM_THRESHOLD:
+            self._auto_scroll_locked = True
+
+    def action_page_up(self) -> None:
+        """Scroll one page up without animation jitter and unlock auto-scroll."""
+        if not self.allow_vertical_scroll:
+            return
+        self.on_scroll_up()
+        self._mark_user_scrolling()
+        self.scroll_page_up(animate=False)
+
+    def action_page_down(self) -> None:
+        """Scroll one page down without animation jitter and re-lock at bottom."""
+        if not self.allow_vertical_scroll:
+            return
+        self._mark_user_scrolling()
+        self.scroll_page_down(animate=False)
+        if (self.max_scroll_y - self.scroll_y) <= self._STICKY_BOTTOM_THRESHOLD:
+            self._auto_scroll_locked = True
+
+    def action_scroll_home(self) -> None:
+        """Jump to top of transcript and unlock auto-scroll."""
+        if not self._allow_scroll:
+            return
+        self.on_scroll_up()
+        self._mark_user_scrolling()
+        self.scroll_home(animate=False, immediate=True, x_axis=False)
+
+    def action_scroll_end(self) -> None:
+        """Jump to bottom of transcript and re-lock auto-scroll."""
+        if not self._allow_scroll:
+            return
+        self._auto_scroll_locked = True
+        self._mark_user_scrolling()
+        self.scroll_end(animate=False, immediate=True, x_axis=False)
+
+    def _on_scroll_up(self, event: Any) -> None:
+        """Handle scrollbar track page-up click."""
+        if self.allow_vertical_scroll:
+            self.on_scroll_up()
+            self._mark_user_scrolling()
+            self.scroll_page_up(animate=False)
+            event.stop()
+
+    def _on_scroll_down(self, event: Any) -> None:
+        """Handle scrollbar track page-down click."""
+        if self.allow_vertical_scroll:
+            self._mark_user_scrolling()
+            self.scroll_page_down(animate=False)
+            if (self.max_scroll_y - self.scroll_y) <= self._STICKY_BOTTOM_THRESHOLD:
+                self._auto_scroll_locked = True
+            event.stop()
+
+    def _on_scroll_to(self, message: Any) -> None:
+        """Handle scrollbar thumb drag without 0.1s animation lag."""
+        if self._allow_scroll:
+            self._mark_user_scrolling()
+            if message.y is not None:
+                if message.y < self.scroll_y:
+                    self.on_scroll_up()
+                elif (self.max_scroll_y - message.y) <= self._STICKY_BOTTOM_THRESHOLD:
+                    self._auto_scroll_locked = True
+            self.scroll_to(message.x, message.y, animate=False, immediate=True)
+            message.stop()
 
     async def mount_inline_prompt(self, widget: Widget) -> None:
         """Mount an inline prompt widget into the message transcript area."""
@@ -4601,6 +4928,7 @@ class MessageList(VerticalScroll):
         self, content: str = "", duration_seconds: float = 0.0, *, live: bool = False
     ) -> ThinkingMessage:
         """Add a thinking message widget to the conversation."""
+        self.close_active_tool_group()
         msg = ThinkingMessage(content=content, duration_seconds=duration_seconds, live=live)
         self._mount_child(msg)
         if self._auto_scroll_locked:
@@ -4689,6 +5017,11 @@ class MessageList(VerticalScroll):
         batch_ctx = self.app.batch_update() if (self.is_attached and self.app is not None) else nullcontext()
         with batch_ctx:
             for child in list(self.children):
+                if isinstance(child, ToolGroupSummary):
+                    await flush()
+                    if not child._finalized:
+                        child.close()
+                    continue
                 if isinstance(child, ToolCallMessage):
                     groupable = (
                         child.tool_name not in _TOOL_GROUP_EXCLUSIONS
@@ -4742,8 +5075,6 @@ class MessageList(VerticalScroll):
             self.start_assistant_message()
         if self._current_assistant is not None:
             self._current_assistant.append_token(token)
-            if self._auto_scroll_locked:
-                self._scroll_to_end()
 
     def update_assistant_message(self, text: str) -> None:
         """Replace current assistant message text with full state."""
@@ -4796,6 +5127,9 @@ class MessageList(VerticalScroll):
                 msg.set_success(result)
             else:
                 msg.set_error(result)
+            for child in list(self.children):
+                if isinstance(child, ToolGroupSummary) and msg in child._tools:
+                    child.sync_members()
         else:
             msg_name = name if (name and name != "None") else "tool"
             msg = ToolCallMessage(msg_name, {})
@@ -4817,30 +5151,36 @@ class MessageList(VerticalScroll):
                     msg.set_success(result)
                 else:
                     msg.set_error(result)
+                if self._active_tool_group is not None and msg in self._active_tool_group._tools:
+                    self._active_tool_group.sync_members()
         self._scroll_to_end()
 
     def add_skill_message(self, name: str, content: str) -> None:
         """Add a skill loaded card."""
-        self.mount(SkillMessage(skill_name=name, body=content))
+        self._mount_child(SkillMessage(skill_name=name, body=content))
         self._scroll_to_end()
 
     def add_diff_message(self, patch: str, file_path: str = "") -> None:
         """Add an inline diff message."""
-        self.mount(DiffMessage(patch, file_path))
+        self._mount_child(DiffMessage(patch, file_path))
         self._scroll_to_end()
 
     def add_error_message(self, text: str) -> None:
         """Add an error message."""
-        self.mount(ErrorMessage(text))
+        self._mount_child(ErrorMessage(text))
         self._scroll_to_end()
 
     def add_system_message(self, text: str) -> None:
         """Add a system/info message."""
-        self.mount(SystemMessage(text))
+        self._mount_child(SystemMessage(text))
         self._scroll_to_end()
 
     def clear(self) -> None:
         """Clear all child widgets."""
+        self._stop_scroll_timers()
+        self._pending_scroll_delta = 0
+        self._scroll_end_pending = False
+        self._auto_scroll_locked = True
         self.remove_children()
         self._current_assistant = None
         self._current_thinking = None
@@ -4856,9 +5196,22 @@ class MessageList(VerticalScroll):
                 fn(visible)
 
     def _scroll_to_end(self) -> None:
-        """Scroll to the end if auto-scroll is locked."""
-        if self._auto_scroll_locked:
-            self.scroll_end(animate=False)
+        """Scroll to the end if auto-scroll is locked, coalesced per refresh frame."""
+        if not self._auto_scroll_locked:
+            return
+        if not self.is_attached:
+            self.scroll_end(animate=False, x_axis=False)
+            return
+        if self._scroll_end_pending:
+            return
+        self._scroll_end_pending = True
+
+        def _do_scroll_end() -> None:
+            self._scroll_end_pending = False
+            if self._auto_scroll_locked and self.is_attached:
+                self.scroll_end(animate=False, immediate=True, x_axis=False)
+
+        self.call_after_refresh(_do_scroll_end)
 
 _THINKING_HEADING_RE = re.compile(r"^\s*(?:\*\*(.+?)\*\*|#{1,6}\s+(.+?))\s*$")
 """Matches a reasoning-summary heading line (``**Title**`` or ``## Title``)."""

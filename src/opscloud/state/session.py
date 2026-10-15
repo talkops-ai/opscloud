@@ -870,6 +870,7 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
         *,
         strategy: str = "keep_latest",
         prune_subagents: bool = True,
+        turn_completed: bool = False,
     ) -> None:
         """Asynchronously compact thread checkpoint history (destructive compaction).
 
@@ -899,32 +900,50 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
                 await cur.execute("SELECT DISTINCT thread_id FROM checkpoints")
                 tids = [row[0] for row in await cur.fetchall()]
 
-            # STEP 1 (DV-01): Identify ALL checkpoints across ALL namespaces (root, tools:*, subagent:*)
-            # that have pending interrupts (channel = '__interrupt__').
-            # This MUST be discovered BEFORE deleting any subagent or historical namespace!
+            # STEP 1 (DV-01): Identify checkpoints across namespaces that have genuinely
+            # pending (unresumed) interrupts. Once a checkpoint has a '__resume__',
+            # 'branch:to:%', or 'jump_to' write (or when turn_completed=True), its
+            # interrupt has already been resolved and must not block compaction.
             preserved_interrupts_by_thread: dict[str, set[tuple[str, str]]] = {tid: set() for tid in tids}
-            for tid in tids:
-                await cur.execute(
-                    "SELECT DISTINCT checkpoint_ns, checkpoint_id FROM writes "
-                    "WHERE thread_id = ? AND channel = '__interrupt__'",
-                    (tid,),
-                )
-                for ns, cid in await cur.fetchall():
-                    if cid:
-                        preserved_interrupts_by_thread[tid].add((ns or "", cid))
+            if not turn_completed:
+                for tid in tids:
+                    await cur.execute(
+                        """
+                        SELECT DISTINCT w1.checkpoint_ns, w1.checkpoint_id
+                        FROM writes w1
+                        WHERE w1.thread_id = ?
+                          AND w1.channel = '__interrupt__'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM writes w2
+                              WHERE w2.thread_id = w1.thread_id
+                                AND w2.checkpoint_ns = w1.checkpoint_ns
+                                AND w2.checkpoint_id = w1.checkpoint_id
+                                AND (
+                                    w2.channel = '__resume__'
+                                    OR w2.channel LIKE 'branch:to:%'
+                                    OR w2.channel = 'jump_to'
+                                )
+                          )
+                        """,
+                        (tid,),
+                    )
+                    for ns, cid in await cur.fetchall():
+                        if cid:
+                            preserved_interrupts_by_thread[tid].add((ns or "", cid))
 
-            # STEP 2 (DV-01): Prune dead subagent namespaces (tools:* and subagent:*),
-            # but NEVER delete a subagent checkpoint that contains a pending HITL interrupt!
+            # STEP 2 (DV-01): Prune completed non-root subgraph & middleware namespaces
+            # (tools:*, subagent:*, AgentSessionMiddleware.*,
+            # GoalCriteriaMiddleware.*, ReliableRubricMiddleware.*, and nested %|*),
+            # while preserving any checkpoint that holds an active pending HITL interrupt.
             if prune_subagents:
                 for tid in tids:
                     await cur.execute(
                         "SELECT DISTINCT checkpoint_ns, checkpoint_id FROM checkpoints "
-                        "WHERE thread_id = ? AND (checkpoint_ns LIKE 'tools:%' OR checkpoint_ns LIKE 'subagent:%')",
+                        "WHERE thread_id = ? AND checkpoint_ns != ''",
                         (tid,),
                     )
                     sub_rows = await cur.fetchall()
                     for sub_ns, sub_cid in sub_rows:
-                        # If this subagent checkpoint is an active interrupt, preserve it!
                         if (sub_ns or "", sub_cid) in preserved_interrupts_by_thread[tid]:
                             continue
                         await cur.execute(
@@ -948,7 +967,6 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
                     if latest_cid is None:
                         continue
                     ns_key = checkpoint_ns or ""
-                    # Checkpoints to keep in this specific namespace: latest + any interrupts in this namespace
                     cids_to_keep = {latest_cid}
                     for p_ns, p_cid in preserved_interrupts_by_thread[tid]:
                         if p_ns == ns_key:
@@ -963,6 +981,21 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
                         f"DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id NOT IN ({placeholders})",
                         (tid, checkpoint_ns, *cids_to_keep),
                     )
+
+                # STEP 4: Clean up any orphaned write rows whose checkpoint no longer exists
+                await cur.execute(
+                    """
+                    DELETE FROM writes
+                    WHERE thread_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM checkpoints c
+                          WHERE c.thread_id = writes.thread_id
+                            AND c.checkpoint_ns = writes.checkpoint_ns
+                            AND c.checkpoint_id = writes.checkpoint_id
+                      )
+                    """,
+                    (tid,),
+                )
             await self.conn.commit()
 
     async def avacuum(self) -> None:
@@ -1029,16 +1062,26 @@ class SessionManager:
         return get_checkpointer()
 
     @staticmethod
-    async def prune_thread(thread_id: str, *, strategy: str = "keep_latest") -> None:
+    async def prune_thread(
+        thread_id: str,
+        *,
+        strategy: str = "keep_latest",
+        turn_completed: bool = False,
+    ) -> None:
         """Prune intermediate history and subagent checkpoints for a thread."""
         try:
             async with get_checkpointer() as saver:
-                await saver.aprune([thread_id], strategy=strategy, prune_subagents=True)
+                await saver.aprune(
+                    [thread_id],
+                    strategy=strategy,
+                    prune_subagents=True,
+                    turn_completed=turn_completed,
+                )
         except Exception:
             logger.debug("Failed to prune thread %s", thread_id, exc_info=True)
 
     @staticmethod
-    async def maintain_database(db_path: Path | None = None, *, size_threshold_mb: float = 50.0) -> dict[str, Any]:
+    async def maintain_database(db_path: Path | None = None, *, size_threshold_mb: float = 20.0) -> dict[str, Any]:
         """Compact obsolete checkpoints, flush WAL pages, and vacuum database if size exceeds threshold (IA-12/DV-08).
 
         Uses an advisory non-blocking file lease (.maint_lock) to prevent concurrent maintenance
@@ -1110,6 +1153,37 @@ class SessionManager:
             logger.warning("Database maintenance encountered an error", exc_info=True)
             return {"performed": False, "reason": "error", "error": str(exc)}
 
+    @staticmethod
+    async def fork_thread(
+        source_thread_id: str,
+        target_thread_id: str | None = None,
+    ) -> str:
+        """Fork a conversation thread by copying all checkpoints and writes into a new thread ID."""
+        return await fork_thread(source_thread_id, target_thread_id=target_thread_id)
+
+
+async def fork_thread(
+    source_thread_id: str,
+    target_thread_id: str | None = None,
+) -> str:
+    """Copy all checkpoints and delta writes from ``source_thread_id`` into a new thread ID.
+
+    Uses ``OpsCloudCheckpointer.acopy_thread`` and invalidates the recent-threads cache.
+    """
+    target_id = target_thread_id or generate_thread_id()
+    try:
+        async with get_checkpointer() as saver:
+            await saver.acopy_thread(source_thread_id, target_id)
+        _recent_threads_cache.clear()
+    except Exception:
+        logger.debug(
+            "Local SQLite checkpointer copy skipped or failed for %s -> %s",
+            source_thread_id,
+            target_id,
+            exc_info=True,
+        )
+    return target_id
+
 
 __all__ = [
     "OpsCloudCheckpointer",
@@ -1117,6 +1191,7 @@ __all__ = [
     "ThreadInfo",
     "delete_thread",
     "find_similar_threads",
+    "fork_thread",
     "format_relative_timestamp",
     "format_timestamp",
     "generate_thread_id",

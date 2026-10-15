@@ -5,6 +5,7 @@ from opscloud.state.base import (
     BaseAgentState,
     OpsCloudAgentState,
 )
+from opscloud.state.btw_channels import BtwChannels
 from opscloud.state.cloud_context import (
     AWSContext,
     AzureContext,
@@ -76,6 +77,7 @@ __all__ = [
     # Core Composite State
     "AgentState",
     "BaseAgentState",
+    "BtwChannels",
     "OpsCloudAgentState",
     # Cloud Operations Context
     "AWSContext",

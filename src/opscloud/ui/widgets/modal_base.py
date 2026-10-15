@@ -35,6 +35,13 @@ _CSS_PATH = Path(__file__).parents[1] / "modal.tcss"
 # ── Formatters ──────────────────────────────────────────────
 
 
+def escape_markup(text: object) -> str:
+    """Escape all '[' characters so both closed and unclosed brackets are safe in Textual/Rich markup."""
+    if text is None:
+        return ""
+    return str(text).replace("[", r"\[")
+
+
 def format_modal_hints(
     hints: Sequence[tuple[str, str]],
     max_width: int | None = None,

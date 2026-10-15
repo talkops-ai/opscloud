@@ -719,10 +719,14 @@ class SubagentPanel(Vertical):
             self._applied_height = height
 
     def _update_cached(self, widget_id: str, content: Content) -> None:
-        if self._last_render.get(widget_id) == content.plain:
+        prev = self._last_render.get(widget_id)
+        if prev == content.plain:
             return
+        line_count_changed = prev is None or prev.count("\n") != content.plain.count("\n")
         try:
-            self.query_one(f"#{widget_id}", Static).update(content)
+            self.query_one(f"#{widget_id}", Static).update(
+                content, layout=line_count_changed
+            )
         except (NoMatches, TooManyMatches):
             return
         self._last_render[widget_id] = content.plain

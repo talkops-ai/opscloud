@@ -123,7 +123,7 @@ def get_skill_sources(
     if project_agent_skills_dir and project_agent_skills_dir.is_dir():
         sources.append((str(project_agent_skills_dir), "Project Agent Skills"))
 
-    # 6. Experimental: Claude Code skill directories
+    # 6. Additional compatible skill directories (.claude/skills)
     user_claude_skills_dir = paths.get_user_claude_skills_dir()
     if user_claude_skills_dir and user_claude_skills_dir.is_dir():
         sources.append((str(user_claude_skills_dir), "User Claude"))

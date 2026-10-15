@@ -93,7 +93,11 @@ def _build_default_runtime_sync() -> ServerRuntime:
     )
 
 
-async def _build_default_runtime_async() -> ServerRuntime:
+async def _build_default_runtime_async(
+    *,
+    checkpointer: Any | None = None,
+    store: Any | None = None,
+) -> ServerRuntime:
     """Prepare MCP/model resources on the event loop before graph compilation."""
     config = ServerConfig.from_env()
 
@@ -141,6 +145,8 @@ async def _build_default_runtime_async() -> ServerRuntime:
         enable_shell=config.enable_shell,
         cwd=effective_cwd,
         project_context=project_context,
+        checkpointer=checkpointer,
+        store=store,
     )
     return ServerRuntime(agent=agent, backend=composite_backend)
 

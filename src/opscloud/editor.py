@@ -185,14 +185,6 @@ def open_file_in_editor(
     cmd: list[str] | None = None
     if editor_env:
         cmd = shlex.split(editor_env)
-    elif os.environ.get("ANTIGRAVITY_EDITOR_APP_ROOT"):
-        cli = Path(os.environ["ANTIGRAVITY_EDITOR_APP_ROOT"]) / "bin" / "antigravity-ide"
-        if cli.exists() and os.access(cli, os.X_OK):
-            cmd = [str(cli), "-r"]
-        elif shutil.which("cursor"):
-            cmd = ["cursor"]
-        elif shutil.which("code"):
-            cmd = ["code"]
     elif os.environ.get("VSCODE_PID"):
         if shutil.which("cursor"):
             cmd = ["cursor"]
@@ -216,7 +208,7 @@ def open_file_in_editor(
             else:
                 args = [a for a in cmd if a not in ("--wait", "-w")]
                 if (
-                    exe in {"code", "cursor", "windsurf", "subl", "antigravity-ide"}
+                    exe in {"code", "cursor", "windsurf", "subl"}
                     and line is not None
                 ):
                     loc = f"{target}:{line}"

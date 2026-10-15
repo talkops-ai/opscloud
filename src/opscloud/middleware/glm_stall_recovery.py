@@ -80,8 +80,14 @@ class GlmTerminalStallRecoveryMiddleware(AgentMiddleware[Any, Any]):
         handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
     ) -> ModelResponse[Any]:
         """Wrap synchronous model call to recover from GLM-5.2 headless stall conditions."""
+        from opscloud.middleware.btw import is_btw_turn
+
         response = handler(request)
-        if self._should_recover(response, model=request.model):
+        if (
+            request.tools
+            and not is_btw_turn(request.state, getattr(request, "runtime", None))
+            and self._should_recover(response, model=request.model)
+        ):
             logger.info("GLM-5.2 headless turn stalled at output cap; retrying once")
             response = handler(self._recovery_request(request))
             self._log_if_still_stalled(response)
@@ -93,8 +99,14 @@ class GlmTerminalStallRecoveryMiddleware(AgentMiddleware[Any, Any]):
         handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
     ) -> ModelResponse[Any]:
         """Wrap asynchronous model call to recover from GLM-5.2 headless stall conditions."""
+        from opscloud.middleware.btw import is_btw_turn
+
         response = await handler(request)
-        if self._should_recover(response, model=request.model):
+        if (
+            request.tools
+            and not is_btw_turn(request.state, getattr(request, "runtime", None))
+            and self._should_recover(response, model=request.model)
+        ):
             logger.info("GLM-5.2 headless turn stalled at output cap; retrying once")
             response = await handler(self._recovery_request(request))
             self._log_if_still_stalled(response)

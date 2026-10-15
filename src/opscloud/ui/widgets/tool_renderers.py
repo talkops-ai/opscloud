@@ -83,19 +83,22 @@ class WriteFileRenderer(ToolRenderer):
         )
         content = format_display_content(raw_content)
 
+        is_append = bool(tool_args.get("Append") or tool_args.get("append"))
+
         # Check if file exists on disk to compute a real unified diff
         physical_path = resolve_physical_path(file_path, assistant_id)
         if physical_path and physical_path.exists() and physical_path.is_file():
             before = _safe_read(physical_path) or ""
+            after = (before + content) if is_append else content
             diff = compute_unified_diff(
-                before, content, format_display_path(file_path), max_lines=100
+                before, after, format_display_path(file_path), max_lines=None
             )
             if diff:
                 return EditFileApprovalWidget, {
                     "file_path": file_path,
                     "diff_lines": diff.splitlines(),
                     "old_string": before,
-                    "new_string": content,
+                    "new_string": after,
                 }
 
         file_extension = "text"
@@ -232,21 +235,9 @@ class EditFileRenderer(ToolRenderer):
         start_line: int | None = None,
     ) -> list[str]:
         """Generate unified diff lines from old and new strings with accurate line numbers."""
-        if not old_string and not new_string:
-            return []
+        from opscloud.ui.widgets.diff import compute_line_diff
 
-        old_lines = old_string.splitlines() if old_string else []
-        new_lines = new_string.splitlines() if new_string else []
-
-        start = start_line if start_line is not None else 1
-        old_count = len(old_lines)
-        new_count = len(new_lines)
-
-        hunk_header = f"@@ -{start},{old_count} +{start},{new_count} @@"
-        diff_lines = [hunk_header]
-        diff_lines.extend(f"-{line}" for line in old_lines)
-        diff_lines.extend(f"+{line}" for line in new_lines)
-        return diff_lines
+        return compute_line_diff(old_string, new_string, start_line=start_line)
 
 
 _RENDERER_REGISTRY: dict[str, type[ToolRenderer]] = {

@@ -1,8 +1,8 @@
 """Interactive permissions manager modal screen for /permissions.
 
-Full-screen modal with tabbed interface inspired by Claude Code's permission
-management TUI.  Six tabs: Permissions · Recently Denied · Allow · Ask · Deny ·
-Workspace.  Supports search/filter, rule add/delete, and keyboard navigation.
+Full-screen modal with a tabbed interface for permission management.
+Six tabs: Permissions · Recently Denied · Allow · Ask · Deny · Workspace.
+Supports search/filter, rule add/delete, and keyboard navigation.
 
 Styled consistently with the project's existing modals (AuthManagerScreen,
 ConfigManagerScreen, ThreadSelectorScreen).
@@ -75,11 +75,7 @@ class _PermSearchInput(Input):
 
 
 class PermissionsManagerScreen(OpsModalScreen[None]):
-    """Full-screen modal for interactive permission management.
-
-    Mirrors Claude Code's /permissions TUI adapted for OpsCloud's DevOps scopes
-    and tool-pattern rules.
-    """
+    """Full-screen modal for interactive permission management across DevOps scopes and tool-pattern rules."""
 
     DIALOG_CLASSES: ClassVar[str] = "-workspace"
 

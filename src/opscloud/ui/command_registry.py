@@ -69,6 +69,7 @@ from opscloud.commands.core.doctor import DoctorHandler
 from opscloud.commands.core.effort import EffortHandler
 from opscloud.commands.core.exit_cmd import ExitHandler
 from opscloud.commands.core.fast import FastHandler
+from opscloud.commands.core.fork import ForkHandler
 from opscloud.commands.core.help_cmd import HelpHandler
 from opscloud.commands.core.mcp import McpHandler
 from opscloud.commands.core.model import ModelHandler
@@ -107,7 +108,6 @@ from opscloud.commands.power.ui_toggles import (
     TimestampsHandler,
 )
 from opscloud.commands.power.version import VersionHandler
-from opscloud.commands.power.workflow import WorkflowHandler, WorkflowInvokeHandler
 
 
 # ── Authoritative Command Descriptors ────────────────────────────────────────
@@ -154,11 +154,11 @@ COMMAND_DESCRIPTORS: tuple[CommandDescriptor, ...] = (
         name="/btw",
         handler_type=BtwHandler,
         aliases=("/aside",),
-        description="Provide side commentary or lightweight guidance without derailing flow",
+        description="Ask a side question without interrupting the current task",
         bypass_tier=BypassTier.IMMEDIATE,
-        ui_mode="message",
+        ui_mode="inline",
         argument_hint="<question>",
-        hidden_keywords="btw by the way note aside context hint",
+        hidden_keywords="btw by the way note aside context hint side question",
     ),
     CommandDescriptor(
         name="/bug",
@@ -271,6 +271,15 @@ COMMAND_DESCRIPTORS: tuple[CommandDescriptor, ...] = (
         bypass_tier=BypassTier.ALWAYS,
         ui_mode="inline",
         hidden_keywords="reset interrupt stop kill",
+    ),
+    CommandDescriptor(
+        name="/fork",
+        handler_type=ForkHandler,
+        aliases=("/branch",),
+        description="Create a branch of the current conversation at this point",
+        bypass_tier=BypassTier.IMMEDIATE,
+        ui_mode="message",
+        hidden_keywords="fork branch clone duplicate thread trajectory checkpoint",
     ),
     CommandDescriptor(
         name="/goal",
@@ -544,24 +553,6 @@ COMMAND_DESCRIPTORS: tuple[CommandDescriptor, ...] = (
         ui_mode="message",
         hidden_keywords="ver build info",
     ),
-    CommandDescriptor(
-        name="/workflow",
-        handler_type=WorkflowHandler,
-        description="Trigger a skill as an isolated, parameterised workflow",
-        bypass_tier=BypassTier.QUEUED,
-        ui_mode="message",
-        argument_hint="[<name> [params]|show|cancel|detach|attach]",
-        hidden_keywords="workflow runbook playbook pipeline job procedure run skill isolated execute",
-    ),
-    CommandDescriptor(
-        name="/workflow:",
-        handler_type=WorkflowInvokeHandler,
-        description="Start a workflow by name directly",
-        bypass_tier=BypassTier.QUEUED,
-        ui_mode="message",
-        argument_hint="<name> [args]",
-        hidden_keywords="workflow invoke run direct",
-    ),
 )
 
 
@@ -572,7 +563,7 @@ def autocomplete_entries(
 ) -> tuple[CommandEntry, ...]:
     """Project commands into a sequence of CommandEntry instances for autocomplete.
 
-    Excludes prefix handlers ending in ':' (e.g. '/skill:', '/workflow:');
+    Excludes prefix handlers ending in ':' (e.g. '/skill:', '/agent:');
     specific entries for those are generated dynamically from discovered skills.
     """
     return tuple(
@@ -612,6 +603,7 @@ def _build_bypass_set(tier: BypassTier) -> frozenset[str]:
 
 ALWAYS_IMMEDIATE: frozenset[str] = _build_bypass_set(BypassTier.ALWAYS)
 IMMEDIATE_UI_CMDS: frozenset[str] = _build_bypass_set(BypassTier.IMMEDIATE_UI)
+IMMEDIATE_CMDS: frozenset[str] = _build_bypass_set(BypassTier.IMMEDIATE)
 
 
 def get_command(name_or_alias: str) -> CommandDescriptor | None:
@@ -622,7 +614,7 @@ def get_command(name_or_alias: str) -> CommandDescriptor | None:
     if match is not None:
         return match
 
-    # Prefix match: /skill:<name> -> /skill:, /workflow:<name> -> /workflow:
+    # Prefix match: /skill:<name> -> /skill:, /agent:<name> -> /agent:
     for name, desc in lookup.items():
         if name.endswith(":") and target.startswith(name):
             return desc
@@ -634,77 +626,78 @@ _STATIC_SKILL_ALIASES: frozenset[str] = frozenset({"remember", "skill-creator"})
 
 
 def _skill_command_entry(skill: dict[str, Any] | Any) -> CommandEntry:
-    """Build a single autocomplete entry for a discovered skill."""
+    """Build a single autocomplete entry for a discovered skill.
+
+    Formatting rules:
+    - Plugin skills are registered as ``/<plugin-name>:<skill-name>`` (without ``skill:`` prefix
+      and without ``@<marketplace>`` suffix).
+    - Non-plugin skills (built-in, user, project) are registered as ``/<skill-name>``.
+    - Description is the clean frontmatter description without ``(plugin@marketplace)`` noise.
+    """
+    from opscloud.skills.invocation import format_skill_slash_name
+
     if isinstance(skill, dict):
         name = str(skill.get("name", ""))
         desc = str(skill.get("description", ""))
-        source = str(skill.get("source", ""))
+        frontmatter = skill.get("frontmatter") if isinstance(skill.get("frontmatter"), dict) else {}
     else:
         name = getattr(skill, "name", "")
         desc = getattr(skill, "description", "")
-        source = getattr(skill, "source", "")
+        raw_fm = getattr(skill, "frontmatter", None)
+        frontmatter = raw_fm if isinstance(raw_fm, dict) else {}
 
-    machine_name = f"/skill:{name}"
-    is_plugin = source == "plugin"
+    canonical = format_skill_slash_name(skill) or name
+    slash_name = f"/{canonical.lstrip('/')}"
+    description = desc or canonical
+    arg_hint = str(
+        frontmatter.get("argument-hint")
+        or frontmatter.get("argument_hint")
+        or ""
+    ).strip()
 
-    if is_plugin and ":" in name:
-        terminal = name.rsplit(":", 1)[-1]
-        display_name = f"/skill:{terminal}"
-        plugin_id = name.split(":", 1)[0]
-        description = f"({plugin_id}) {desc}"
-    else:
-        display_name = ""
-        description = desc or name
+    kw_tokens = f"skill {name.replace(':', ' ').replace('@', ' ')} {canonical.replace(':', ' ')}".strip()
 
     return CommandEntry(
-        name=machine_name,
+        name=slash_name,
         description=description,
-        hidden_keywords=name.replace(":", " "),
-        argument_hint="",
-        display_name=display_name,
+        hidden_keywords=kw_tokens,
+        argument_hint=arg_hint,
+        display_name="",
     )
 
 
 def build_skill_commands(skills: list[Any]) -> list[CommandEntry]:
     """Build autocomplete entries for discovered skills."""
+    static_names = {cmd.name.lower() for cmd in COMMAND_DESCRIPTORS}
+    for cmd in COMMAND_DESCRIPTORS:
+        static_names.update(a.lower() for a in cmd.aliases)
+
     entries: list[CommandEntry] = []
+    seen_names: set[str] = set()
     for skill in skills:
         if isinstance(skill, dict):
             name = str(skill.get("name", ""))
+            fm = skill.get("frontmatter") if isinstance(skill.get("frontmatter"), dict) else {}
         else:
             name = getattr(skill, "name", "")
-        if name and name.lower() not in _STATIC_SKILL_ALIASES:
-            entries.append(_skill_command_entry(skill))
-    return entries
+            raw_fm = getattr(skill, "frontmatter", None)
+            fm = raw_fm if isinstance(raw_fm, dict) else {}
 
-
-def build_workflow_commands(skills: list[Any]) -> list[CommandEntry]:
-    """Build ``/workflow:<name>`` autocomplete entries for workflow-capable skills."""
-    from opscloud.workflows.discovery import workflow_from_skill
-
-    entries: list[CommandEntry] = []
-    for skill in skills:
-        raw = skill if isinstance(skill, dict) else {
-            "name": getattr(skill, "name", ""),
-            "description": getattr(skill, "description", ""),
-            "path": getattr(skill, "path", ""),
-            "source": getattr(skill, "source", ""),
-            "frontmatter": getattr(skill, "frontmatter", {}),
-        }
-        spec = workflow_from_skill(raw)
-        if spec is None:
+        if not name or name.lower() in _STATIC_SKILL_ALIASES:
             continue
-        desc = spec.description.splitlines()[0] if spec.description else spec.name
-        is_namespaced = ":" in spec.name
-        entries.append(
-            CommandEntry(
-                name=f"/workflow:{spec.name}",
-                description=f"(workflow · {spec.plugin_id}) {desc}" if spec.plugin_id else f"(workflow) {desc}",
-                hidden_keywords=f"workflow {spec.name.replace(':', ' ')}",
-                argument_hint="[params]",
-                display_name=f"/workflow:{spec.short_name}" if is_namespaced else "",
-            )
-        )
+
+        # Respect frontmatter user-invocable / disable-user-invocation flags
+        if fm.get("user-invocable") is False or fm.get("user_invocable") is False:
+            continue
+        if fm.get("disable-user-invocation") is True or fm.get("disable_user_invocation") is True:
+            continue
+
+        entry = _skill_command_entry(skill)
+        key = entry.name.lower()
+        if key in static_names or key in seen_names:
+            continue
+        seen_names.add(key)
+        entries.append(entry)
     return entries
 
 
@@ -731,6 +724,57 @@ def build_agent_commands(agents: list[Any]) -> list[CommandEntry]:
                 hidden_keywords=f"agent {name.replace(':', ' ').replace('@', ' ')} {short_name}",
                 argument_hint="[prompt]",
                 display_name=f"/agent:{short_name}",
+            )
+        )
+    return entries
+
+
+def build_custom_commands(
+    custom_commands: Sequence[Any] | None = None,
+) -> list[CommandEntry]:
+    """Build ``/<name>`` autocomplete entries for zero-code custom commands (`user-invocable: true`)."""
+    if custom_commands is None:
+        try:
+            from opscloud.commands.custom.loader import discover_custom_commands
+
+            custom_commands = discover_custom_commands(include_conditional=False)
+        except Exception:
+            custom_commands = ()
+
+    static_names = {cmd.name.lower() for cmd in COMMAND_DESCRIPTORS}
+    for cmd in COMMAND_DESCRIPTORS:
+        static_names.update(a.lower() for a in cmd.aliases)
+
+    entries: list[CommandEntry] = []
+    for item in custom_commands:
+        if isinstance(item, dict):
+            raw_name = str(item.get("name") or "").strip().lstrip("/")
+            desc = str(item.get("description") or raw_name)
+            arg_hint = str(item.get("argument_hint") or "")
+            user_invocable = bool(item.get("user_invocable", True))
+            source = str(item.get("source") or "custom")
+        else:
+            raw_name = str(getattr(item, "name", "") or "").strip().lstrip("/")
+            desc = str(getattr(item, "description", "") or raw_name)
+            arg_hint = str(getattr(item, "argument_hint", "") or "")
+            user_invocable = bool(getattr(item, "user_invocable", True))
+            source = str(getattr(item, "source", "custom") or "custom")
+
+        if not raw_name or not user_invocable:
+            continue
+
+        slash_name = f"/{raw_name}"
+        if slash_name.lower() in static_names:
+            continue
+
+        scope_tag = "project" if source == "projectSettings" else ("plugin" if source == "plugin" else "user")
+        entries.append(
+            CommandEntry(
+                name=slash_name,
+                description=f"({scope_tag}) {desc}",
+                hidden_keywords=f"custom command {raw_name.replace(':', ' ')}",
+                argument_hint=arg_hint,
+                display_name=slash_name,
             )
         )
     return entries
@@ -791,12 +835,13 @@ __all__ = [
     "COMMAND_DESCRIPTORS",
     "CommandDescriptor",
     "CommandEntry",
+    "IMMEDIATE_CMDS",
     "IMMEDIATE_UI_CMDS",
     "SlashCommand",
     "autocomplete_entries",
     "build_agent_commands",
+    "build_custom_commands",
     "build_skill_commands",
-    "build_workflow_commands",
     "command_lookup",
     "get_all_entries",
     "get_command",

@@ -36,6 +36,7 @@ TOOL_ALIAS_MAP: dict[str, tuple[str, ...]] = {
 ALWAYS_ALLOWED_SYSTEM_TOOLS: frozenset[str] = frozenset({
     "compact_conversation",
     "ask_user",
+    "call_mcp_tool",
 })
 
 
@@ -639,6 +640,37 @@ class ToolFilterMiddleware(AgentMiddleware[Any, Any]):
             else ""
         )
         tool_obj = getattr(request, "tool", None)
+        if tool_name == "call_mcp_tool" and self._allowed_patterns:
+            args = (
+                request.tool_call.get("args")
+                if getattr(request, "tool_call", None) and isinstance(request.tool_call, dict)
+                else None
+            )
+            if isinstance(args, Mapping):
+                srv = str(args.get("server_name") or args.get("ServerName") or "").strip()
+                t_name = str(args.get("tool_name") or args.get("ToolName") or "").strip()
+                if t_name and ":" in t_name and not srv:
+                    srv, t_name = t_name.split(":", 1)
+                if srv and t_name:
+                    qualified = f"{srv}:{t_name}"
+                    if self.is_tool_allowed(qualified) or self.is_tool_allowed(t_name):
+                        return None
+                    allowed_str = ", ".join(self._allowed_patterns)
+                    logger.warning(
+                        "Lazy MCP tool call %r blocked for subagent (not in allowed list: %s)",
+                        qualified,
+                        allowed_str,
+                    )
+                    return ToolMessage(
+                        content=(
+                            f"Tool call rejected: tool `{qualified}` is restricted for this subagent. "
+                            f"Allowed tool patterns: [{allowed_str}]."
+                        ),
+                        name=tool_name,
+                        tool_call_id=request.tool_call.get("id", ""),
+                        status="error",
+                    )
+
         if self.is_tool_allowed(tool_name, tool_obj=tool_obj):
             return None
 

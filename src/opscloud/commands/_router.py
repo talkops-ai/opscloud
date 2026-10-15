@@ -85,7 +85,70 @@ class CommandRouter:
         except Exception as exc:
             logger.debug("Plugin command discovery skipped in router: %s", exc)
 
+        # Discover and register zero-code custom commands (.opscloud/commands, .claude/commands, etc.)
+        self.reload_custom_commands()
+
         self._discovered = True
+
+    def reload_custom_commands(self) -> None:
+        """Discover and register zero-code custom commands without overwriting built-in commands."""
+        try:
+            from opscloud.commands.custom.handler import (
+                CustomCommandHandler,
+                discover_custom_command_handlers,
+            )
+
+            # Remove previously registered CustomCommandHandler instances prior to reload
+            stale_keys = [
+                k for k, h in self._handlers.items() if isinstance(h, CustomCommandHandler)
+            ]
+            for k in stale_keys:
+                self._handlers.pop(k, None)
+
+            for custom_handler in discover_custom_command_handlers():
+                canonical = custom_handler.name.lower().strip()
+                if canonical not in self._handlers:
+                    self._handlers[canonical] = custom_handler
+                for alias in custom_handler.aliases:
+                    alias_key = alias.lower().strip()
+                    if alias_key not in self._handlers:
+                        self._handlers[alias_key] = custom_handler
+        except Exception as exc:
+            logger.debug("Custom command discovery skipped in router: %s", exc)
+
+    def resolve_command(
+        self, raw_command: str
+    ) -> tuple[BaseCommandHandler | None, str, str]:
+        """Resolve a raw `/command ...` string with space-to-colon namespace fallback.
+
+        Returns `(handler, resolved_cmd_name, remaining_args)`.
+        """
+        clean = raw_command.strip()
+        if not clean:
+            return None, "", ""
+
+        parts = clean.split(maxsplit=1)
+        cmd_name = parts[0].lower()
+        remaining = parts[1].strip() if len(parts) > 1 else ""
+
+        handler = self.get_handler(cmd_name)
+        if handler is not None:
+            return handler, cmd_name, remaining
+
+        # Space-to-colon fallback: `/prefix sub arg` -> `/prefix:sub` with `arg`
+        candidate_prefix = cmd_name
+        tail = remaining
+        while tail:
+            sub_parts = tail.split(maxsplit=1)
+            sub_tok = sub_parts[0].lower()
+            rest = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+            candidate_prefix = f"{candidate_prefix}:{sub_tok}"
+            matched = self.get_handler(candidate_prefix)
+            if matched is not None:
+                return matched, candidate_prefix, rest
+            tail = rest
+
+        return None, cmd_name, remaining
 
     def _register_handlers_from_module(self, module: Any) -> None:
         """Find and register all concrete BaseCommandHandler subclasses in module."""
@@ -101,20 +164,57 @@ class CommandRouter:
         """Parse command, validate, evaluate safety gate, and execute handler.
 
         Dispatch flow:
-          1. Extract command name (first token).
-          2. Look up handler (exact match, then prefix match for ``/skill:``).
+          1. Check for stacked custom prompt commands (`/cmd1 /cmd2 args`, up to 5).
+          2. Extract command name with space-to-colon fallback (`/ns sub` -> `/ns:sub`).
           3. Apply safety gate for high-risk commands.
           4. Validate and execute.
         """
+        from dataclasses import replace
+
         clean = command.strip()
         if not clean:
             return CommandResult(success=False, message="Empty command.")
 
-        cmd_name = clean.split()[0].lower()
-        handler = self.get_handler(cmd_name)
+        # Check for stacked custom prompt commands (`/cmd1 /cmd2 args`)
+        try:
+            from opscloud.commands.custom.expansion import peel_stacked_prompt_commands
+            from opscloud.commands.custom.handler import (
+                CustomCommandHandler,
+                execute_stacked_custom_commands,
+            )
+
+            def _lookup_custom_def(name: str):
+                key = f"/{name.lstrip('/').lower()}"
+                h = self._handlers.get(key)
+                if isinstance(h, CustomCommandHandler):
+                    return h.definition
+                return None
+
+            stacked = peel_stacked_prompt_commands(clean, _lookup_custom_def)
+            if len(stacked) > 1:
+                return await execute_stacked_custom_commands(stacked, ctx)
+        except Exception as exc:
+            logger.debug("Stacked command check skipped: %s", exc)
+
+        handler, cmd_name, resolved_args = self.resolve_command(clean)
+
+        if handler is None:
+            skill_handler = self._handlers.get("/skill:")
+            if skill_handler is not None and hasattr(skill_handler, "_resolve_skill"):
+                try:
+                    if skill_handler._resolve_skill(ctx, cmd_name.lstrip("/")):
+                        handler = skill_handler
+                except Exception:
+                    pass
 
         if handler is None:
             return CommandResult(success=False, message=f"Unknown command: {cmd_name}")
+
+        if resolved_args != getattr(ctx, "args", ""):
+            try:
+                ctx = replace(ctx, args=resolved_args)
+            except Exception:
+                pass
 
         # Safety Gate for High Risk and Destructive commands
         if handler.safety_level in (SafetyLevel.HIGH_RISK, SafetyLevel.DESTRUCTIVE):

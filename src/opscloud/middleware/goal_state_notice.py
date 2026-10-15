@@ -50,6 +50,9 @@ GOAL_STATE_MESSAGE_SOURCE: Final = "goal_state"
 SUPERSEDED_GOAL_STATE_SOURCE: Final = "goal_state_superseded"
 """Source for the stand-in that replaces an oversized notice in a request."""
 
+FORK_NOTICE_MESSAGE_SOURCE: Final = "fork_notice"
+"""``lc_source`` value for conversation fork/branch provenance notices."""
+
 GOAL_MESSAGE_SCHEMA_VERSION: Final = 5
 """Schema version stamped on every goal notice and continuation."""
 
@@ -58,7 +61,12 @@ _GOAL_MESSAGE_SCHEMA_KEY: Final = "goal_message_schema_version"
 _GOAL_MESSAGE_KIND_KEY: Final = "goal_message_kind"
 _GOAL_INTERNAL_SOURCES = frozenset({GOAL_CONTROL_MESSAGE_SOURCE, GOAL_STATE_MESSAGE_SOURCE})
 _CONVERSATION_CONTROL_SOURCES = frozenset(
-    {*_GOAL_INTERNAL_SOURCES, SUPERSEDED_GOAL_STATE_SOURCE, "rubric_grader"}
+    {
+        *_GOAL_INTERNAL_SOURCES,
+        SUPERSEDED_GOAL_STATE_SOURCE,
+        FORK_NOTICE_MESSAGE_SOURCE,
+        "rubric_grader",
+    }
 )
 _USER_HIDDEN_SOURCES = frozenset({*_CONVERSATION_CONTROL_SOURCES, "summarization"})
 _LEGACY_CONVERSATION_CONTROL_PREFIXES = (
@@ -67,6 +75,7 @@ _LEGACY_CONVERSATION_CONTROL_PREFIXES = (
     f"{SYSTEM_MESSAGE_PREFIX} Goal resumed by the user.",
     f"{SYSTEM_MESSAGE_PREFIX} Goal/rubric state changed.",
     f"{SYSTEM_MESSAGE_PREFIX} Task interrupted by user.",
+    "<fork_notice>",
 )
 
 GoalTransition = Literal["created", "amended", "resumed"]
@@ -211,7 +220,8 @@ def is_internal_message(message: object) -> bool:
         return False
     if message_source(message) in _USER_HIDDEN_SOURCES:
         return True
-    return message_text(message).startswith(SYSTEM_MESSAGE_PREFIX)
+    text = message_text(message).lstrip()
+    return text.startswith(SYSTEM_MESSAGE_PREFIX) or text.startswith("<fork_notice>")
 
 
 # ---------------------------------------------------------------------------
@@ -710,3 +720,45 @@ def superseded_goal_state_placeholder(message: object) -> HumanMessage:
         additional_kwargs={"lc_source": SUPERSEDED_GOAL_STATE_SOURCE},
         id=getattr(message, "id", None),
     )
+
+
+def build_fork_notice_message(
+    source_thread_id: str,
+    new_thread_id: str | None = None,
+    *,
+    event_id: str | None = None,
+) -> HumanMessage:
+    """Build a canonical model-facing ``<fork_notice>`` message for branched threads.
+
+    Informs the model that this thread was branched from ``source_thread_id``
+    and that any prior subagents or background tasks in the inherited history
+    belong to the source conversation.
+    """
+    from langchain_core.messages import HumanMessage
+
+    resolved_id = event_id or f"fork-notice-{uuid.uuid4().hex}"
+    content = (
+        "<fork_notice>\n"
+        f"This conversation was branched from a previous conversation (ID: {source_thread_id}).\n"
+        "The subagents invoked in the history above are NOT yours: they belong to the "
+        "source conversation and were not branched with it. They are not listed among "
+        "your subagents, and you cannot message, inspect or kill them. Invoke your own "
+        "if you need them.\n"
+        "The background tasks in the history above are NOT yours: they belong to the "
+        "source conversation and were not branched with it. They are marked cancelled "
+        "here and will send you no output. Start your own if you need them.\n"
+        "</fork_notice>"
+    )
+    metadata: dict[str, object] = {
+        "lc_source": FORK_NOTICE_MESSAGE_SOURCE,
+        "source_thread_id": source_thread_id,
+        "event_id": resolved_id,
+    }
+    if new_thread_id:
+        metadata["new_thread_id"] = new_thread_id
+    return HumanMessage(
+        content=content,
+        id=resolved_id,
+        additional_kwargs=metadata,
+    )
+

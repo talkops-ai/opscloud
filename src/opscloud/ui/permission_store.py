@@ -2,7 +2,7 @@
 
 Manages allow / ask / deny rules with both scope-based rules (e.g. ``shell:read``)
 and tool-pattern rules (e.g. ``Shell(kubectl get *)``).  Rules are evaluated in
-**Deny → Ask → Allow** order (first match wins), mirroring Claude Code's model.
+**Deny → Ask → Allow** order (first match wins).
 
 Persistence is handled via ``~/.opscloud/config.toml`` under the ``[permissions]``
 section.  Session-only state (recently denied actions) is *not* persisted.
@@ -313,36 +313,82 @@ class PermissionStore:
 
 
 def load_permission_store() -> PermissionStore:
-    """Load a PermissionStore from ``~/.opscloud/config.toml``."""
+    """Load a PermissionStore from ``~/.opscloud/config.toml`` and ``~/.opscloud/settings.json``."""
+    from opscloud.ui.theme import CONFIG_PATH as _THEME_CONFIG_PATH
+
     store = PermissionStore()
-    config_path = Path(os.path.expanduser("~/.opscloud/config.toml"))
-    if not config_path.exists():
-        return store
-    try:
-        import tomllib
-        with open(config_path, "rb") as f:
-            data = tomllib.load(f)
-        perms = data.get("permissions", {})
-        if isinstance(perms, dict):
-            store.load_from_dict(perms)
-    except Exception:
-        logger.warning("Failed to load permissions from config.toml", exc_info=True)
+    config_path = _THEME_CONFIG_PATH if _THEME_CONFIG_PATH.exists() else Path(os.path.expanduser("~/.opscloud/config.toml"))
+    loaded_from_toml = False
+    if config_path.exists():
+        try:
+            import tomllib
+
+            with open(config_path, "rb") as f:
+                data = tomllib.load(f)
+            perms = data.get("permissions", {})
+            if isinstance(perms, dict) and perms:
+                store.load_from_dict(perms)
+                loaded_from_toml = True
+        except Exception:
+            logger.warning("Failed to load permissions from config.toml", exc_info=True)
+
+    if not loaded_from_toml:
+        try:
+            from opscloud.config.cli_settings import get_cli_settings_manager
+
+            mgr = get_cli_settings_manager()
+            s = mgr.settings
+            if s.tool_permission or (s.permissions and not s.permissions.is_empty()):
+                perms_dict: dict[str, Any] = {
+                    "mode": s.tool_permission if s.tool_permission in _MODE_PRESETS else "default",
+                }
+                if s.permissions is not None:
+                    perms_dict["allow"] = list(s.permissions.allow)
+                    perms_dict["ask"] = list(s.permissions.ask)
+                    perms_dict["deny"] = list(s.permissions.deny)
+                store.load_from_dict(perms_dict)
+        except Exception:
+            logger.debug("Could not load permissions from settings.json", exc_info=True)
+
     return store
 
 
 def save_permission_store(store: PermissionStore) -> bool:
-    """Persist a PermissionStore to ``~/.opscloud/config.toml``.
+    """Persist a PermissionStore to ``~/.opscloud/config.toml`` and ``~/.opscloud/settings.json``.
 
-    Uses theme.py's single config writer to avoid data loss from
-    competing serialisers.  Reads the full config, updates the
-    ``[permissions]`` section, and writes everything back.
+    Uses theme.py's single config writer for ``config.toml`` and
+    ``CliSettingsManager``'s 3-way merge + atomic writer for ``settings.json``.
     """
     try:
         from opscloud.ui.theme import _read_config_toml_data, _write_config_toml_data
 
+        serialized = store.to_dict()
         existing = _read_config_toml_data()
-        existing["permissions"] = store.to_dict()
-        return _write_config_toml_data(existing)
+        existing["permissions"] = serialized
+        ok = _write_config_toml_data(existing)
+
+        try:
+            import copy
+            from opscloud.config.cli_settings import (
+                PermissionsSetting,
+                get_cli_settings_manager,
+            )
+
+            mgr = get_cli_settings_manager()
+            if mgr.settings_load_error is None:
+                updated = copy.deepcopy(mgr.settings)
+                updated.tool_permission = "" if store.mode == "default" else store.mode
+                perms_setting = PermissionsSetting(
+                    allow=list(serialized.get("allow", [])),
+                    deny=list(serialized.get("deny", [])),
+                    ask=list(serialized.get("ask", [])),
+                )
+                updated.permissions = None if perms_setting.is_empty() else perms_setting
+                mgr.write_cli_settings(updated)
+        except Exception:
+            logger.debug("Could not sync permissions to settings.json", exc_info=True)
+
+        return ok
     except Exception:
         logger.exception("Failed to save permissions to config.toml")
         return False

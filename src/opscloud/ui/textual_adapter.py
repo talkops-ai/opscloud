@@ -70,20 +70,8 @@ def _is_renderable_subagent_event(data: Any, *, is_main_agent: bool) -> bool:
     return isinstance(data, dict) and data.get("type") == "subagent"
 
 
-_WORKFLOW_NAMESPACE_PREFIX = "WorkflowMiddleware."
-"""Mirrors ``opscloud.middleware.workflow.WORKFLOW_NODE_PREFIX``."""
-
 _AGENT_SESSION_NAMESPACE_PREFIX = "AgentSessionMiddleware."
 """Mirrors ``opscloud.middleware.agent_session.AGENT_SESSION_NODE_PREFIX``."""
-
-
-def _is_workflow_namespace(ns_key: tuple[str, ...]) -> bool:
-    """Whether ``ns_key`` is the isolated workflow agent graph.
-
-    Only the direct child of ``WorkflowMiddleware.before_agent`` qualifies;
-    deeper graphs stay non-primary.
-    """
-    return len(ns_key) == 1 and ns_key[0].startswith(_WORKFLOW_NAMESPACE_PREFIX)
 
 
 def _is_agent_session_namespace(ns_key: tuple[str, ...]) -> bool:
@@ -539,6 +527,7 @@ class TextualAdapter:
         self,
         prompt: str,
         graph_input: dict[str, Any] | None,
+        message_kwargs: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         """Build the graph input payload and turn ID.
 
@@ -553,7 +542,21 @@ class TextualAdapter:
 
         from opscloud.input import parse_file_mentions
 
-        prompt_text, mentioned_files = parse_file_mentions(prompt)
+        extra_additional_kwargs: dict[str, Any] = {}
+        if isinstance(message_kwargs, dict) and isinstance(message_kwargs.get("additional_kwargs"), dict):
+            extra_additional_kwargs = dict(message_kwargs["additional_kwargs"])
+
+        skill_meta = extra_additional_kwargs.get("__skill")
+        if isinstance(skill_meta, dict):
+            skill_args = str(skill_meta.get("args") or "")
+            _, mentioned_files = parse_file_mentions(skill_args) if skill_args else ("", [])
+            prompt_text = prompt
+            slash_cmd = str(skill_meta.get("slash_command") or "").strip()
+            literal_user_text = f"{slash_cmd} {skill_args}".strip() if slash_cmd else prompt
+        else:
+            prompt_text, mentioned_files = parse_file_mentions(prompt)
+            literal_user_text = prompt
+
         max_embed_bytes = 256 * 1024
 
         if mentioned_files:
@@ -571,15 +574,18 @@ class TextualAdapter:
         self._turn_number += 1
         turn_id = str(uuid.uuid4())
 
+        combined_additional_kwargs = {
+            **extra_additional_kwargs,
+            USER_PROMPT_METADATA_KEY: user_prompt_metadata(
+                literal_user_text=literal_user_text,
+                referenced_paths=[str(p) for p in mentioned_files],
+                turn_id=turn_id,
+            ),
+        }
+
         human_msg = HumanMessage(
             content=final_content,
-            additional_kwargs={
-                USER_PROMPT_METADATA_KEY: user_prompt_metadata(
-                    literal_user_text=prompt,
-                    referenced_paths=[str(p) for p in mentioned_files],
-                    turn_id=turn_id,
-                )
-            },
+            additional_kwargs=combined_additional_kwargs,
         )
         input_msg: dict[str, Any] = {
             "messages": [human_msg],
@@ -779,10 +785,6 @@ class TextualAdapter:
                         self._app._reasoning_effort = effort
             return
 
-        if isinstance(data, dict) and str(data.get("type") or "").startswith("workflow_"):
-            self._handle_workflow_stream_event(data, is_main_agent)
-            return
-
         if self._on_subagent_event is not None and _is_renderable_subagent_event(data, is_main_agent=is_main_agent):
             try:
                 self._on_subagent_event(data)
@@ -820,20 +822,6 @@ class TextualAdapter:
                     widget = SystemMessage(formatted_event)
                 self._messages.mount(widget)
 
-    def _handle_workflow_stream_event(self, data: dict[str, Any], is_main_agent: bool) -> None:
-        """Render ``workflow_phase`` events as spinner updates."""
-        del is_main_agent
-        if str(data.get("type") or "") != "workflow_phase":
-            return
-        phase = str(data.get("phase") or "")
-        name = str(data.get("name") or "").rsplit(":", 1)[-1]
-        if phase == "running" and self._set_spinner:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._set_spinner(f"Running workflow {name}".strip()))
-            except RuntimeError:
-                pass
-
     def _handle_updates_stream_event(
         self,
         data: Any,
@@ -843,13 +831,26 @@ class TextualAdapter:
         if not isinstance(data, dict):
             return
         interrupts = data.get("__interrupt__")
-        if interrupts:
-            for interrupt_obj in interrupts:
-                interrupt_id = getattr(interrupt_obj, "id", None)
-                interrupt_val = getattr(interrupt_obj, "value", None)
-                if interrupt_val and interrupt_id:
-                    logger.debug("TUI: Handle interrupt %s: %s", interrupt_id, interrupt_val)
-                    pending_interrupts[interrupt_id] = interrupt_val
+        if not interrupts:
+            return
+        items = list(interrupts) if isinstance(interrupts, (list, tuple)) else [interrupts]
+        for interrupt_obj in items:
+            if isinstance(interrupt_obj, (list, tuple)):
+                items.extend(interrupt_obj)
+                continue
+            interrupt_id = (
+                interrupt_obj.get("id")
+                if isinstance(interrupt_obj, dict)
+                else getattr(interrupt_obj, "id", None)
+            )
+            interrupt_val = (
+                interrupt_obj.get("value")
+                if isinstance(interrupt_obj, dict)
+                else getattr(interrupt_obj, "value", None)
+            )
+            if interrupt_val and interrupt_id:
+                logger.debug("TUI: Handle interrupt %s: %s", interrupt_id, interrupt_val)
+                pending_interrupts[str(interrupt_id)] = interrupt_val
 
     async def _handle_messages_stream_event(
         self,
@@ -1276,7 +1277,7 @@ class TextualAdapter:
             async def _safe_prune(target_tid: str) -> None:
                 try:
                     from opscloud.state.session import SessionManager
-                    await SessionManager.prune_thread(target_tid)
+                    await SessionManager.prune_thread(target_tid, turn_completed=True)
                 except Exception:
                     logger.debug("Failed to prune thread %s", target_tid, exc_info=True)
 
@@ -1327,6 +1328,7 @@ class TextualAdapter:
         thread_id: str,
         context: dict[str, Any] | None = None,
         graph_input: dict[str, Any] | None = None,
+        message_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Run one agent turn, routing stream events to Textual widgets."""
         from langgraph.types import Command
@@ -1335,7 +1337,11 @@ class TextualAdapter:
         await self.drain_maintenance(timeout=2.0)
 
         # 1. Prepare input and configuration
-        input_msg, turn_id = self._prepare_stream_input(prompt, graph_input)
+        input_msg, turn_id = self._prepare_stream_input(
+            prompt,
+            graph_input,
+            message_kwargs=message_kwargs,
+        )
         config, enriched_context = await self._prepare_stream_config(thread_id, turn_id, context)
 
         start_t = time.time()
@@ -1383,11 +1389,10 @@ class TextualAdapter:
 
                     namespace, current_stream_mode, data = chunk
                     ns_key = tuple(namespace) if namespace else ()
-                    # The isolated /workflow and /agent session run one level down inside
-                    # their respective middleware; render them as primary.
+                    # The isolated /agent session runs one level down inside
+                    # its middleware; render it as primary.
                     is_main_agent = (
                         ns_key == ()
-                        or _is_workflow_namespace(ns_key)
                         or _is_agent_session_namespace(ns_key)
                     )
 

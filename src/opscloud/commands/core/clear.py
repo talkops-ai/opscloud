@@ -53,6 +53,11 @@ class ClearHandler(BaseCommandHandler):
                 except Exception:
                     pass
             ctx.app._agent_thread_id = new_thread_id
+            if hasattr(ctx.app, "_reset_ephemeral_mode_states"):
+                try:
+                    ctx.app._reset_ephemeral_mode_states()
+                except Exception:
+                    pass
             if hasattr(ctx.app, "_restore_goal_rubric_state"):
                 ctx.app._restore_goal_rubric_state({})
 

@@ -37,38 +37,50 @@ class BtwHandler(BaseCommandHandler):
         return BypassTier.IMMEDIATE
 
     def validate(self, ctx: CommandContext) -> str | None:
-        if not ctx.args or not ctx.args.strip():
-            return "Usage: /btw <question>\n\nAsk an ephemeral side question without interrupting your main task."
+        # Bare `/btw` is allowed so `execute` can reopen `/btw` history if present.
+        del ctx
         return None
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
-        question = ctx.args.strip()
+        from opscloud.middleware.btw import format_btw_prompt
 
-        # Build ephemeral wrapper that instructs the agent to answer
-        # without modifying its current task state.
-        ephemeral_prompt = (
-            "[ASIDE — ephemeral side question, do NOT alter your current task or goal state]\n\n"
-            f"{question}\n\n"
-            "[/ASIDE — return to your main task after answering]"
-        )
-
+        question = (ctx.args or "").strip()
         app = ctx.app
-        if app is not None and hasattr(app, "_send_ephemeral_message"):
-            try:
-                await app._send_ephemeral_message(ephemeral_prompt)
+
+        if not question:
+            if app is not None and hasattr(app, "show_btw_history") and app.show_btw_history():
                 return CommandResult(
                     success=True,
                     message=None,
                     mount_as_app_message=False,
                 )
-            except Exception:
-                pass
+            return CommandResult(
+                success=False,
+                message="Usage: /btw <question>\n\nAsk an ephemeral side question without interrupting your main task.",
+            )
 
-        # Fallback: treat as a regular message with aside wrapper
+        if app is not None and hasattr(app, "is_btw_active") and app.is_btw_active():
+            busy_msg = "A /btw question is already in progress. Please wait for it to finish."
+            return CommandResult(
+                success=False,
+                message=busy_msg,
+                notify=busy_msg,
+                notify_severity="warning",
+            )
+
+        if app is not None and hasattr(app, "_send_ephemeral_message"):
+            await app._send_ephemeral_message(question)
+            return CommandResult(
+                success=True,
+                message=None,
+                mount_as_app_message=False,
+            )
+
+        # Fallback for mock apps that only implement `send_agent_message`
         if app is not None and hasattr(app, "send_agent_message"):
             try:
                 await app.send_agent_message(
-                    ephemeral_prompt,
+                    format_btw_prompt(question),
                     additional_kwargs={"ephemeral": True},
                 )
                 return CommandResult(

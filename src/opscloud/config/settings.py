@@ -431,6 +431,23 @@ class Settings:
     log_dir: Path = Path("/tmp/opscloud_logs")
     log_file: str = "opscloud.log"
 
+    # ── Webhooks & Event Ingestion ────────────────────────
+    webhook_host: str = "0.0.0.0"
+    webhook_port: int = 2024
+    webhook_secret: str | None = None
+    webhook_pagerduty_secret: str | None = None
+    webhook_github_secret: str | None = None
+    webhook_gitlab_token: str | None = None
+    webhook_jenkins_token: str | None = None
+    webhook_dedupe_ttl_seconds: int = 300
+    webhook_max_concurrent_runs: int = 5
+    webhook_sns_auto_confirm: bool = True
+    webhook_slack_url: str | None = None
+    webhook_pagerduty_api_key: str | None = None
+    webhook_pagerduty_from_email: str | None = None
+    webhook_github_token: str | None = None
+    webhook_callback_url: str | None = None
+
     def __post_init__(self) -> None:
         if self.cwd is None or self.project_root is None:
             try:
@@ -575,6 +592,7 @@ class Settings:
                 except Exception:
                     logger.debug("Could not persist setting %s to config.toml", key, exc_info=True)
 
+            self._sync_field_to_cli_settings(target_field, coerced)
             self.export_to_environment()
             return True, f"Set {key} = {value}"
         except (ValueError, TypeError) as exc:
@@ -610,8 +628,85 @@ class Settings:
             except Exception:
                 logger.debug("Could not clear setting %s from config.toml", key, exc_info=True)
 
+        self._sync_field_to_cli_settings(target_field, None, reset=True)
         self.export_to_environment()
         return True, f"Reset {key} to default"
+
+    @staticmethod
+    def _sync_field_to_cli_settings(
+        target_field: str,
+        value: Any,
+        *,
+        reset: bool = False,
+    ) -> None:
+        """Synchronize a Settings field update to ~/.opscloud/settings.json."""
+        field_map = {
+            "model_name": "model",
+            "model_provider": "model_provider",
+            "reasoning_effort": "reasoning_effort",
+            "theme": "color_scheme",
+            "approval_mode": "tool_permission",
+            "model_context_limit": "context_window",
+            "notifications_enabled": "notifications",
+            "aws_profile": "aws_profile",
+            "aws_region": "aws_region",
+        }
+        cli_attr = field_map.get(target_field)
+        if not cli_attr:
+            return
+        try:
+            import copy
+            from opscloud.config.cli_settings import (
+                default_cli_settings,
+                get_cli_settings_manager,
+            )
+
+            mgr = get_cli_settings_manager()
+            if mgr.settings_load_error is not None:
+                return
+            updated = copy.deepcopy(mgr.settings)
+            defaults = default_cli_settings()
+            if reset or value is None:
+                setattr(updated, cli_attr, getattr(defaults, cli_attr))
+            else:
+                setattr(updated, cli_attr, value)
+            mgr.write_cli_settings(updated)
+        except Exception:
+            logger.debug("Could not sync field %s to settings.json", target_field, exc_info=True)
+
+    @staticmethod
+    def _cli_settings_overrides() -> dict[str, Any]:
+        """Extract non-default values from ~/.opscloud/settings.json mapped to Settings fields."""
+        overrides: dict[str, Any] = {}
+        try:
+            from opscloud.config.cli_settings import get_cli_settings_manager
+
+            s = get_cli_settings_manager().settings
+            if s.model:
+                overrides["model_name"] = s.model
+            if s.model_provider:
+                overrides["model_provider"] = s.model_provider
+            if s.reasoning_effort:
+                overrides["reasoning_effort"] = s.reasoning_effort
+            if s.color_scheme:
+                overrides["theme"] = s.color_scheme
+            if s.tool_permission:
+                overrides["approval_mode"] = s.tool_permission
+            if s.context_window > 0:
+                overrides["model_context_limit"] = s.context_window
+            if s.notifications is not None:
+                overrides["notifications_enabled"] = s.notifications
+            if s.verbosity in {"verbose", "debug"}:
+                overrides["verbose_output"] = True
+            if s.aws_profile:
+                overrides["aws_profile"] = s.aws_profile
+            if s.aws_region:
+                overrides["aws_region"] = s.aws_region
+            if s.agent_pool:
+                overrides["agent_pool"] = dict(s.agent_pool)
+        except Exception:
+            pass
+        return overrides
 
     def export_to_environment(self) -> None:
         """Export active settings values to os.environ for child processes, SDKs, and CLI tools.
@@ -706,7 +801,7 @@ class Settings:
 
     @classmethod
     def from_env(cls, start_path: Path | None = None) -> Settings:
-        """Create settings from environment variables and config.toml (bootstrap fallback)."""
+        """Create settings from environment variables, config.toml, and settings.json."""
         _ensure_bootstrap()
         try:
             from opscloud.project_utils import get_server_project_context
@@ -718,6 +813,7 @@ class Settings:
         effective_start = start_path or (ctx.user_cwd if ctx else None)
         root = ctx.project_root if (ctx and ctx.project_root) else find_project_root(effective_start)
         toml_data = load_config_toml(CONFIG_PATH)
+        cli_overrides = cls._cli_settings_overrides()
 
         kwargs: dict[str, Any] = {"project_root": root}
         if ctx and ctx.user_cwd:
@@ -725,8 +821,10 @@ class Settings:
 
         for opt in get_config_options():
             if opt.settings_field:
-                val, _ = resolve_scalar(opt, toml_data=toml_data)
-                if val is not None:
+                val, src = resolve_scalar(opt, toml_data=toml_data)
+                if src == "default" and opt.settings_field in cli_overrides:
+                    kwargs[opt.settings_field] = cli_overrides[opt.settings_field]
+                elif val is not None:
                     kwargs[opt.settings_field] = val
 
         # Handle shell allow list if string
@@ -751,6 +849,13 @@ class Settings:
         p = Path(start_path) if start_path else None
         _load_dotenv(start_path=p, refresh_loaded=True)
 
+        try:
+            from opscloud.config.cli_settings import get_cli_settings_manager
+
+            get_cli_settings_manager().init_cli_settings()
+        except Exception:
+            pass
+
         # Clear process-cached environment variables for options that were neither
         # explicitly exported in the initial shell environment nor defined in dotenv.
         # This guarantees that config.toml edits take effect and are not shadowed by
@@ -763,12 +868,15 @@ class Settings:
 
         previous = {field_name: getattr(self, field_name, None) for field_name in RELOADABLE_FIELDS}
         toml_data = load_config_toml(CONFIG_PATH)
+        cli_overrides = self._cli_settings_overrides()
 
         changes: list[str] = []
         for opt in get_config_options():
             if opt.settings_field and hasattr(self, opt.settings_field):
-                val, _ = resolve_scalar(opt, toml_data=toml_data)
-                if val is not None:
+                val, src = resolve_scalar(opt, toml_data=toml_data)
+                if src == "default" and opt.settings_field in cli_overrides:
+                    setattr(self, opt.settings_field, cli_overrides[opt.settings_field])
+                elif val is not None:
                     setattr(self, opt.settings_field, val)
 
         # Re-export active resolved settings to environment
@@ -813,10 +921,14 @@ def get_settings() -> Settings:
 
 
 def reload_settings() -> Settings:
-    """Reload settings from environment and config.toml."""
+    """Reload settings from environment, config.toml, and settings.json."""
     global _settings
     with _settings_lock:
         _bootstrap_state.done = False
+        with contextlib.suppress(Exception):
+            from opscloud.config.cli_settings import get_cli_settings_manager
+
+            get_cli_settings_manager().init_cli_settings()
         _settings = Settings.from_env()
         sync_aws_env_aliases()
     return _settings
@@ -831,6 +943,10 @@ def reset_settings_for_testing() -> None:
         _dotenv_loaded_values.clear()
         _glyphs_cache = None
         _charset_mode_cache = None
+        with contextlib.suppress(Exception):
+            from opscloud.config.cli_settings import reset_cli_settings_manager_for_testing
+
+            reset_cli_settings_manager_for_testing()
 
 
 async def reload_from_store(store: Any) -> Settings:

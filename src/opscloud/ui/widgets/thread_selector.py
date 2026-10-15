@@ -19,10 +19,9 @@ from textual.widgets import Button, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from rich.cells import cell_len
-from rich.markup import escape
 
 from opscloud.config.settings import get_glyphs
-from opscloud.ui.widgets.modal_base import OpsModalScreen
+from opscloud.ui.widgets.modal_base import OpsModalScreen, escape_markup as escape
 from opscloud.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -283,7 +282,7 @@ class ThreadSelectorScreen(OpsModalScreen[str | None]):
 
             # Build right-aligned part: [del] on highlighted row, relative time otherwise
             if is_highlighted:
-                right_markup = " [bold red][del][/bold red]"
+                right_markup = r" [bold red]\[del][/bold red]"
                 right_plain = " [del]"
             else:
                 right_markup = f" [dim]{rel_time}[/dim]" if rel_time else ""
@@ -303,7 +302,10 @@ class ThreadSelectorScreen(OpsModalScreen[str | None]):
             else:
                 prompt_trunc = init_prompt
 
-            safe_prompt = escape(prompt_trunc)
+            # Note: rich.markup.escape() leaves unclosed '[' unescaped (e.g. when truncation
+            # cuts off the matching ']'), which causes Textual's markup parser to pair it with
+            # the subsequent '[dim]' tag and raise MarkupError on '[/dim]'.
+            safe_prompt = prompt_trunc.replace("[", r"\[")
             core_markup = f"{left_markup}{safe_prompt}{is_curr}"
             core_plain = f"{left_plain}{prompt_trunc}{' (active)' if is_curr else ''}"
 

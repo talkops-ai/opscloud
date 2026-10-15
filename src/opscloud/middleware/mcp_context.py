@@ -44,8 +44,11 @@ def _build_mcp_context_from_infos(
     if not servers:
         return ""
 
+    from opscloud.mcp.preload import get_mcp_server_state_dir
+
     total_tools = sum(len(getattr(s, "tools", ())) for s in servers)
     lines = [f"**MCP Servers** ({len(servers)} servers, {total_tools} tools):"]
+    has_active_tools = False
 
     for server in servers:
         name = getattr(server, "name", str(server))
@@ -69,13 +72,18 @@ def _build_mcp_context_from_infos(
                 lines.append(f"- **{name}** ({transport}): (no tools registered)")
             continue
 
+        has_active_tools = True
         tool_names = [getattr(t, "name", str(t)) for t in tools]
-        if len(tool_names) > _TOOL_NAME_DISPLAY_LIMIT:
-            shown = ", ".join(tool_names[:_TOOL_NAME_DISPLAY_LIMIT])
-            remaining = len(tool_names) - _TOOL_NAME_DISPLAY_LIMIT
-            lines.append(f"- **{name}** ({transport}): {shown}, and {remaining} more")
-        else:
-            lines.append(f"- **{name}** ({transport}): {', '.join(tool_names)}")
+        lines.append(f"- **{name}** ({transport}): {', '.join(tool_names)}")
+
+    if has_active_tools:
+        state_dir = get_mcp_server_state_dir()
+        lines.append(
+            f"\nEach MCP server has a directory `{state_dir}/<serverName>` containing tool schemas "
+            "(`<toolName>.json`). Eagerly loaded tools are registered directly (`<serverName>:<toolName>`). "
+            "For lazy-loaded tools, read the corresponding schema file to understand its arguments and usage, "
+            "then call the tool using `call_mcp_tool(server_name=<serverName>, tool_name=<toolName>, arguments={...})`."
+        )
 
     return "\n".join(lines)
 
@@ -119,20 +127,25 @@ class MCPContextMiddleware(AgentMiddleware):
 
     def _get_applicable_server_infos(self) -> list[Any]:
         """Filter server infos to only those declared in config, if config is present."""
-        if not self._server_info:
+        source_infos = self._server_info
+        if not source_infos and self._config:
+            from opscloud.mcp.preload import get_cached_mcp_server_infos
+
+            source_infos = get_cached_mcp_server_infos()
+        if not source_infos:
             return []
         if not self._config:
-            return self._server_info
+            return source_infos
         raw_servers = (
             self._config.get("mcpServers")
             or self._config.get("mcp_servers")
             or self._config
         )
         if not isinstance(raw_servers, dict):
-            return self._server_info
+            return source_infos
         allowed_names = set(raw_servers.keys())
         return [
-            s for s in self._server_info
+            s for s in source_infos
             if getattr(s, "name", str(s)) in allowed_names
         ]
 

@@ -2028,6 +2028,13 @@ class AutoModeHITLMiddleware(HumanInTheLoopMiddleware[AutoModeState, Any, Any]):
             "fallback_reason": None,
         }
 
+        if mode is ApprovalMode.YOLO and gated_calls:
+            logger.info(
+                "Auto decision mode=yolo model=%s tools=%d path=yolo_bypass decision=allow",
+                _extract_model_name(request.model),
+                len(gated_calls),
+            )
+
         if mode not in (ApprovalMode.AUTO, ApprovalMode.SMART) or not gated_calls:
             return ExtendedModelResponse(
                 model_response=response,
@@ -2279,6 +2286,11 @@ class AutoModeHITLMiddleware(HumanInTheLoopMiddleware[AutoModeState, Any, Any]):
             mode = coerce_approval_mode(state.get("approval_mode"))
 
         plan = state.get("_auto_decision_plan") if isinstance(state, dict) else getattr(state, "_auto_decision_plan", None)
+        if mode is ApprovalMode.YOLO:
+            return {"_auto_decision_plan": None}
+        if isinstance(plan, dict) and plan.get("mode_at_proposal") == ApprovalMode.YOLO.value and mode is not ApprovalMode.MANUAL:
+            return {"_auto_decision_plan": None}
+
         if isinstance(plan, dict) and plan.get("decisions"):
             artificial: list[ToolMessage] = []
             human_review_needed = False
@@ -2352,6 +2364,11 @@ class AutoModeHITLMiddleware(HumanInTheLoopMiddleware[AutoModeState, Any, Any]):
             mode = coerce_approval_mode(state.get("approval_mode"))
 
         plan = state.get("_auto_decision_plan") if isinstance(state, dict) else getattr(state, "_auto_decision_plan", None)
+        if mode is ApprovalMode.YOLO:
+            return {"_auto_decision_plan": None}
+        if isinstance(plan, dict) and plan.get("mode_at_proposal") == ApprovalMode.YOLO.value and mode is not ApprovalMode.MANUAL:
+            return {"_auto_decision_plan": None}
+
         if isinstance(plan, dict) and plan.get("decisions"):
             artificial: list[ToolMessage] = []
             human_review_needed = False

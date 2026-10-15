@@ -646,10 +646,10 @@ class ServerHooksMiddleware(AgentMiddleware[ServerHooksState, ContextT, Response
     ) -> dict[str, Any] | None:
         if not self._emit_stop:
             return None
+        from opscloud.middleware.btw import is_btw_turn
         from opscloud.state.agent_session_channels import is_agent_session_turn
-        from opscloud.state.workflow_channels import is_workflow_turn
 
-        if is_workflow_turn(state) or is_agent_session_turn(state):
+        if is_agent_session_turn(state) or is_btw_turn(state, runtime):
             return None
         gate = _session_gate(runtime.context)
         if not _event_enabled(gate, HookEvent.STOP):

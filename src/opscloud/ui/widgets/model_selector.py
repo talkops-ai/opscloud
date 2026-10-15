@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, ClassVar
 
-from rich.markup import escape
+from opscloud.ui.widgets.modal_base import escape_markup as escape
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.content import Content

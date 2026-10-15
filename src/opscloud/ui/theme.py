@@ -534,8 +534,11 @@ def load_terminal_default() -> str | None:
 
 
 def load_theme_preference() -> str:
-    """Resolve active theme preference from environment -> per-terminal default -> config -> default."""
-    env_theme = os.environ.get("OPSCODE_THEME", "").strip()
+    """Resolve active theme preference from environment -> per-terminal default -> config -> settings.json -> default."""
+    env_theme = (
+        os.environ.get("OPSCODE_THEME", "").strip()
+        or os.environ.get("OPSCLOUD_THEME", "").strip()
+    )
     if env_theme and env_theme in get_registry():
         return env_theme
 
@@ -552,6 +555,17 @@ def load_theme_preference() -> str:
                 return theme
         except Exception:
             pass
+
+    try:
+        from opscloud.config.cli_settings import get_cli_settings_manager
+
+        mgr = get_cli_settings_manager()
+        cs = mgr.settings.color_scheme
+        if isinstance(cs, str) and cs in get_registry():
+            return cs
+    except Exception:
+        pass
+
     return "opscloud-dark"
 
 
@@ -590,9 +604,23 @@ def _write_config_toml_data(data: dict[str, Any]) -> bool:
 
 
 def save_theme_preference(name: str, config_path: Path | None = None) -> bool:
-    """Save global theme preference to ~/.opscloud/config.toml."""
+    """Save global theme preference to ~/.opscloud/config.toml and ~/.opscloud/settings.json."""
     from opscloud.config.toml_config import save_theme_preference as _save
-    return _save(name, config_path=config_path or CONFIG_PATH)
+
+    ok = _save(name, config_path=config_path or CONFIG_PATH)
+    if config_path is None:
+        try:
+            import copy
+            from opscloud.config.cli_settings import get_cli_settings_manager
+
+            mgr = get_cli_settings_manager()
+            if mgr.settings_load_error is None:
+                updated = copy.deepcopy(mgr.settings)
+                updated.color_scheme = name
+                mgr.write_cli_settings(updated)
+        except Exception:
+            logger.debug("Could not sync colorScheme to settings.json", exc_info=True)
+    return ok
 
 
 def save_terminal_theme_mapping(term_program: str, name: str) -> bool:

@@ -420,6 +420,19 @@ def configure_logging(
             _active_thread_id = thread_id
             os.environ["OPSCLOUD_THREAD_ID"] = thread_id
 
+        # Route Python's lastResort fallback and third-party MCP/HTTP/asyncio loggers + warnings
+        # away from sys.stderr when console logging is off
+        logging.captureWarnings(True)
+        if _current_log_to_console and _console_handler is not None:
+            logging.lastResort = _console_handler  # type: ignore[assignment]
+        elif _main_file_handler is not None:
+            logging.lastResort = _main_file_handler  # type: ignore[assignment]
+        else:
+            logging.lastResort = logging.NullHandler()  # type: ignore[assignment]
+
+        for ext_name in ("py.warnings", "mcp", "httpx", "httpcore", "asyncio"):
+            _apply_handlers(logging.getLogger(ext_name))
+
         # Re-apply updated handlers to all active registered loggers
         for item in _active_loggers.values():
             _apply_handlers(item._logger)

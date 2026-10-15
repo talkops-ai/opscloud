@@ -65,6 +65,8 @@ class ApprovalPolicyResolver:
     def _extract_explicit_mode(cls, context: object) -> ApprovalMode | None:
         """Extract explicit approval mode specified in context without defaulting."""
         if isinstance(context, Mapping):
+            if context.get("yolo") is True:
+                return ApprovalMode.YOLO
             if context.get("smart") is True:
                 return ApprovalMode.SMART
             raw = context.get("approval_mode")
@@ -74,6 +76,8 @@ class ApprovalPolicyResolver:
                 return ApprovalMode.AUTO
             cfg = context.get("configurable")
             if isinstance(cfg, Mapping):
+                if cfg.get("yolo") is True:
+                    return ApprovalMode.YOLO
                 if cfg.get("smart") is True:
                     return ApprovalMode.SMART
                 raw_cfg = cfg.get("approval_mode")
@@ -82,6 +86,8 @@ class ApprovalPolicyResolver:
                 if cfg.get("auto_approve") is True:
                     return ApprovalMode.AUTO
         elif context is not None:
+            if getattr(context, "yolo", None) is True:
+                return ApprovalMode.YOLO
             if getattr(context, "smart", None) is True:
                 return ApprovalMode.SMART
             raw = getattr(context, "approval_mode", None)
@@ -105,6 +111,8 @@ class ApprovalPolicyResolver:
             thread_id = context.get("thread_id") or context.get("context_id") or context.get("session_id")
             raw_mode = context.get("approval_mode")
             legacy_auto = context.get("auto_approve")
+            if context.get("yolo") is True:
+                return _DecidedMode(ApprovalMode.YOLO)
             if context.get("smart") is True:
                 return _DecidedMode(ApprovalMode.SMART)
 
@@ -115,6 +123,8 @@ class ApprovalPolicyResolver:
                 raw_mode = raw_mode or cfg.get("approval_mode")
                 if legacy_auto is None:
                     legacy_auto = cfg.get("auto_approve")
+                if cfg.get("yolo") is True:
+                    return _DecidedMode(ApprovalMode.YOLO)
                 if cfg.get("smart") is True:
                     return _DecidedMode(ApprovalMode.SMART)
 
@@ -133,6 +143,8 @@ class ApprovalPolicyResolver:
                 raw_mode = raw_mode or ctx_dict.get("approval_mode")
                 if legacy_auto is None:
                     legacy_auto = ctx_dict.get("auto_approve")
+                if ctx_dict.get("yolo") is True:
+                    return _DecidedMode(ApprovalMode.YOLO)
 
             has_typed_mode = raw_mode is not None
         elif context is not None:
@@ -144,6 +156,8 @@ class ApprovalPolicyResolver:
             )
             raw_mode = getattr(context, "approval_mode", None)
             legacy_auto = getattr(context, "auto_approve", None)
+            if getattr(context, "yolo", None) is True:
+                return _DecidedMode(ApprovalMode.YOLO)
             if getattr(context, "smart", None) is True:
                 return _DecidedMode(ApprovalMode.SMART)
             if legacy_auto is True and not raw_mode:

@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Sequence
 
-from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.content import Content
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from opscloud.ui.widgets.modal_base import OpsModalScreen
+from opscloud.ui.widgets.modal_base import OpsModalScreen, escape_markup as escape
 
 
 class WelcomeDetailPopup(OpsModalScreen[None]):

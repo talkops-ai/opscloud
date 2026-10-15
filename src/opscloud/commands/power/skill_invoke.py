@@ -86,15 +86,16 @@ class SkillInvokeHandler(BaseCommandHandler):
 
     def _resolve_skill(self, ctx: CommandContext, name: str) -> dict | None:
         """Resolve a skill by name from the app's discovered skills or direct discovery."""
+        from opscloud.skills.invocation import match_discovered_skill
+
         name = name.lower()
         app = ctx.app
         if app is not None and hasattr(app, "get_discovered_skills"):
             skills = app.get_discovered_skills()
             if skills:
-                for skill in skills:
-                    skill_name = str(skill.get("name") or "").lower()
-                    if skill_name == name or (":" in skill_name and skill_name.rsplit(":", 1)[-1] == name):
-                        return skill
+                matched = match_discovered_skill(skills, name)
+                if matched is not None:
+                    return matched
 
         # Fallback to direct skill loader discovery
         try:
@@ -110,11 +111,9 @@ class SkillInvokeHandler(BaseCommandHandler):
                 include_plugins=True,
                 project_root=settings.project_root,
             )
-            for skill_item in discovered:
-                skill_dict = dict(skill_item)
-                skill_name = str(skill_dict.get("name") or "").lower()
-                if skill_name == name or (":" in skill_name and skill_name.rsplit(":", 1)[-1] == name):
-                    return skill_dict
+            matched = match_discovered_skill([dict(s) for s in discovered], name)
+            if matched is not None:
+                return dict(matched)
         except Exception as exc:
             logger.warning("Failed fallback skill discovery for %s: %s", name, exc)
 

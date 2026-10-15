@@ -51,6 +51,8 @@ DEVOPS_EVENTS = frozenset(
         "aws.resource.create",
         "aws.resource.update",
         "aws.resource.delete",
+        "webhook.received",
+        "webhook.completed",
     }
 )
 

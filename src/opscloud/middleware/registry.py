@@ -88,6 +88,7 @@ class MiddlewareRegistry:
             "opscloud.middleware.ask_user",
             "opscloud.middleware.auto_mode",
             "opscloud.middleware.auto_mode_hitl",
+            "opscloud.middleware.btw",
             "opscloud.middleware.compaction",
             "opscloud.middleware.configurable_model",
             "opscloud.middleware.cost_tracking",

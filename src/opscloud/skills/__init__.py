@@ -20,10 +20,13 @@ from opscloud.skills.commands import (
     trust_skill_command,
 )
 from opscloud.skills.invocation import (
+    MAX_SKILL_CONTENT_CHARS,
     STATIC_SKILL_ALIASES,
     SkillInvocationEnvelope,
     build_skill_invocation_envelope,
     discover_skills_and_roots,
+    format_skill_slash_name,
+    match_discovered_skill,
     parse_skill_command,
 )
 from opscloud.skills.load import (
@@ -59,6 +62,7 @@ from opscloud.skills.trust import (
 )
 
 __all__ = [
+    "MAX_SKILL_CONTENT_CHARS",
     "STATIC_SKILL_ALIASES",
     "ExtendedSkillMetadata",
     "RevokeResult",
@@ -71,6 +75,7 @@ __all__ = [
     "clear_trusted_skill_dirs",
     "discover_skills_and_roots",
     "execute_skills_command",
+    "format_skill_slash_name",
     "get_skill_by_name",
     "get_skill_content_by_name",
     "get_skill_registry",
@@ -82,6 +87,7 @@ __all__ = [
     "list_trusted_skill_dirs",
     "load_skill_content",
     "load_trusted_skill_dirs",
+    "match_discovered_skill",
     "merge_skill",
     "parse_skill_command",
     "revoke_skill_dir_trust",

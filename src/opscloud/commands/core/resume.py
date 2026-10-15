@@ -74,6 +74,9 @@ class ResumeHandler(BaseCommandHandler):
                 return CommandResult(success=False, message="Usage: /resume [-r [ID]]")
             return await self._resume_thread(ctx, target_id)
 
+        if not args.startswith("-") and " " not in args:
+            return await self._resume_thread(ctx, args)
+
         return CommandResult(success=False, message="Usage: /resume [-r [ID]]")
 
     async def _resume_thread(self, ctx: CommandContext, thread_id: str) -> CommandResult:

@@ -20,6 +20,7 @@ Screen {
 }
 
 MarkdownFence {
+    overflow: hidden hidden;
     scrollbar-size-horizontal: 0;
     scrollbar-size-vertical: 0;
 }
@@ -54,17 +55,15 @@ Scrollbar:hover {
 /* ── Diff lines ──────────────────────────────────────── */
 
 .diff-line-added, .diff-added {
-    background: $success 20%;
-    color: $success;
+    background: transparent;
 }
 
 .diff-line-removed, .diff-removed {
-    background: $error 20%;
-    color: $error;
+    background: transparent;
 }
 
 .diff-line-hunk {
-    color: $primary;
+    color: $text-muted;
 }
 
 .diff-line-header {
@@ -72,12 +71,12 @@ Scrollbar:hover {
 }
 
 .diff-line-context {
-    color: $foreground;
+    color: $text-muted;
 }
 
 .diff-line-truncated {
-    color: $foreground;
-    text-style: italic;
+    color: $text-muted;
+    pointer: pointer;
 }
 
 /* ── Status bar ──────────────────────────────────────── */
@@ -382,7 +381,7 @@ SubagentPanel {
 
 .approval-menu .tool-info-scroll {
     height: auto;
-    max-height: 10;
+    max-height: 40;
     margin-top: 0;
 }
 
@@ -426,20 +425,22 @@ SubagentPanel {
 .diff-removed {
     height: auto;
     color: $text-error;
-    background: $error-muted;
-    padding: 0 1;
+    background: transparent;
+    padding: 0;
 }
 
 .diff-added {
     height: auto;
     color: $text-success;
-    background: $success-muted;
-    padding: 0 1;
+    background: transparent;
+    padding: 0;
 }
 
 .diff-context {
     height: auto;
     color: $text-muted;
-    padding: 0 1;
+    background: transparent;
+    padding: 0;
 }
+
 

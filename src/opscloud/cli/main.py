@@ -20,8 +20,10 @@ from opscloud.cli.commands import (
     run_auth_command,
     run_doctor_command,
     run_mcp_command,
+    run_serve_command,
     run_threads_command,
     setup_mcp_parser,
+    setup_serve_parser,
 )
 from opscloud.cli.interactive import run_interactive
 from opscloud.cli.non_interactive import run_non_interactive
@@ -181,23 +183,27 @@ def _apply_stdin_pipe(args: argparse.Namespace) -> None:
 
 
 def _resolve_approval_mode(args: argparse.Namespace) -> ApprovalMode:
-    """Resolve flags into typed ApprovalMode."""
+    """Resolve flags into typed ApprovalMode.
+
+    Enforces that `ApprovalMode.YOLO` is only permitted in headless CLI flows (`args.prompt`),
+    while interactive TUI flows are restricted to `manual`, `smart`, and `auto`.
+    """
+    from opscloud.approval_mode import coerce_approval_mode
+
+    is_headless = bool(getattr(args, "prompt", None))
+    if getattr(args, "yolo", False):
+        return ApprovalMode.YOLO if is_headless else ApprovalMode.MANUAL
     if getattr(args, "smart", False):
         return ApprovalMode.SMART
     if getattr(args, "auto_approve", False):
         return ApprovalMode.AUTO
     raw = getattr(args, "approval_mode", None)
     if raw:
-        if raw.lower() in ("smart", "s", "jev"):
-            return ApprovalMode.SMART
-        if raw.lower() in ("always", "manual"):
-            return ApprovalMode.MANUAL
-        if raw.lower() in ("auto", "a"):
-            return ApprovalMode.AUTO
+        return coerce_approval_mode(raw, allow_yolo=is_headless)
 
     # Non-interactive / headless execution (-p / --prompt) defaults to AUTO for autonomous execution,
     # while interactive TUI defaults to MANUAL for human-in-the-loop safety.
-    if getattr(args, "prompt", None):
+    if is_headless:
         return ApprovalMode.AUTO
     return ApprovalMode.MANUAL
 
@@ -379,9 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--approval-mode",
         dest="approval_mode",
         type=str,
-        choices=["manual", "auto", "smart"],
+        choices=["manual", "smart", "auto", "yolo"],
         default=None,
-        help="HITL tool approval mode: 'manual', 'auto', or 'smart' (TypeSafe AI Jev).",
+        help="Tool approval mode: 'manual', 'smart' (Jev System One gate), 'auto' (LLM classifier), or 'yolo' (headless/webhook only).",
     )
     approval_group.add_argument(
         "-y",
@@ -397,6 +403,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Enable Jev-powered Smart approval mode (<100ms System One safety gate).",
+    )
+    approval_group.add_argument(
+        "--yolo",
+        dest="yolo",
+        action="store_true",
+        default=False,
+        help="Enable unrestricted YOLO mode without human prompts or classifier gating (requires -p/--prompt or `opscloud serve`).",
     )
 
     # MCP
@@ -507,6 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_output_arg(threads_del)
 
     setup_mcp_parser(subparsers)
+    setup_serve_parser(subparsers)
 
     from opscloud.plugins.commands_cli import setup_plugin_parser
 
@@ -582,6 +596,15 @@ def _validate_args(args: argparse.Namespace) -> int | None:
         print("Error: --no-mcp and --mcp-config are mutually exclusive.", file=sys.stderr)
         return 2
 
+    raw_mode = str(getattr(args, "approval_mode", "") or "").strip().lower()
+    if (getattr(args, "yolo", False) or raw_mode == "yolo") and not getattr(args, "prompt", None):
+        print(
+            "Error: 'yolo' approval mode is only supported in CLI headless mode (-p/--prompt) "
+            "and webhook server mode (`opscloud serve`). Interactive sessions support: manual, smart, auto.",
+            file=sys.stderr,
+        )
+        return 2
+
     return None
 
 
@@ -604,6 +627,9 @@ def main(argv: list[str] | None = None) -> int:
         "auth",
         "threads",
         "mcp",
+        "serve",
+        "webhook",
+        "webhooks",
         "plugin",
         "plugins",
         "skill",
@@ -731,6 +757,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_threads_command(output_format)
     elif args.subcommand == "mcp":
         return run_mcp_command(args)
+    elif args.subcommand in {"serve", "webhook", "webhooks"}:
+        return run_serve_command(args)
     elif args.subcommand in {"plugin", "plugins"}:
         from opscloud.plugins.commands_cli import execute_plugin_command
 

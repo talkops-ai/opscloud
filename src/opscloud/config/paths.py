@@ -81,6 +81,9 @@ MCP_TRUST_PATH: Final[Path] = STATE_DIR / "mcp_trust.json"
 SKILL_TRUST_PATH: Final[Path] = STATE_DIR / "skill_trust.json"
 """``~/.opscloud/.state/skill_trust.json`` — Skill trust decisions."""
 
+COMMAND_USAGE_PATH: Final[Path] = STATE_DIR / "command_usage.json"
+"""``~/.opscloud/.state/command_usage.json`` — Custom command & skill usage counts/recency."""
+
 ONBOARDING_MARKER: Final[Path] = STATE_DIR / "onboarding_complete"
 """``~/.opscloud/.state/onboarding_complete`` — First-run marker."""
 
@@ -199,6 +202,21 @@ RELOADABLE_FIELDS: Final[frozenset[str]] = frozenset(
         "theme",
         "read_project_dotenv",
         "agent_pool",
+        "webhook_host",
+        "webhook_port",
+        "webhook_secret",
+        "webhook_pagerduty_secret",
+        "webhook_github_secret",
+        "webhook_gitlab_token",
+        "webhook_jenkins_token",
+        "webhook_dedupe_ttl_seconds",
+        "webhook_max_concurrent_runs",
+        "webhook_sns_auto_confirm",
+        "webhook_slack_url",
+        "webhook_pagerduty_api_key",
+        "webhook_pagerduty_from_email",
+        "webhook_github_token",
+        "webhook_callback_url",
     }
 )
 
@@ -311,6 +329,30 @@ def get_user_claude_skills_dir() -> Path | None:
     return USER_HOME / ".claude" / "skills"
 
 
+def user_commands_dir(name: str = DEFAULT_AGENT_NAME) -> Path:
+    """Return ``~/.opscloud/commands/`` for default agent, or ``~/.opscloud/agents/{name}/commands/``."""
+    if not name or name == DEFAULT_AGENT_NAME:
+        return DATA_DIR / "commands"
+    return agent_dir(name) / "commands"
+
+
+def get_user_commands_dir(name: str = DEFAULT_AGENT_NAME) -> Path:
+    """Return user custom commands directory."""
+    return user_commands_dir(name)
+
+
+def ensure_user_commands_dir(name: str = DEFAULT_AGENT_NAME) -> Path:
+    """Create and return user custom commands directory."""
+    d = user_commands_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_user_claude_commands_dir() -> Path | None:
+    """Return the user's ``~/.claude/commands`` directory."""
+    return USER_HOME / ".claude" / "commands"
+
+
 def user_agents_dir(name: str = DEFAULT_AGENT_NAME) -> Path:
     """Return ``~/.opscloud/agents/`` for default agent, or ``~/.opscloud/agents/{name}/agents/``."""
     if not name or name == DEFAULT_AGENT_NAME:
@@ -408,6 +450,69 @@ def get_project_agent_skills_dir(project_root: Path | None) -> Path | None:
 def get_project_claude_skills_dir(project_root: Path | None) -> Path | None:
     """Return the project's experimental ``.claude/skills`` directory."""
     return None if project_root is None else project_root / ".claude" / "skills"
+
+
+def project_commands_dir(project_root: Path) -> Path:
+    """Return ``{project_root}/.opscloud/commands/``."""
+    return project_opscloud_dir(project_root) / "commands"
+
+
+def get_project_commands_dir(project_root: Path | None) -> Path | None:
+    """Return the project-level opscloud custom commands directory, when in a project."""
+    return None if project_root is None else project_commands_dir(project_root)
+
+
+def ensure_project_commands_dir(project_root: Path | None) -> Path | None:
+    """Create and return the project-level opscloud custom commands directory."""
+    d = get_project_commands_dir(project_root)
+    if d is not None:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_project_claude_commands_dir(project_root: Path | None) -> Path | None:
+    """Return the project's ``.claude/commands`` directory."""
+    return None if project_root is None else project_root / ".claude" / "commands"
+
+
+def get_project_hierarchy_command_dirs(
+    cwd: Path | None = None,
+    project_root: Path | None = None,
+) -> list[Path]:
+    """Walk from ``cwd`` up to ``project_root`` (or home) collecting ``.opscloud/commands`` and ``.claude/commands``.
+
+    Allows monorepo subpackages to define their own scoped custom commands while
+    inheriting parent project commands.
+    """
+    try:
+        start = (cwd or Path.cwd()).resolve()
+    except OSError:
+        return []
+
+    stop_root = project_root.resolve() if project_root is not None else None
+    home = USER_HOME.resolve()
+    dirs: list[Path] = []
+    seen: set[Path] = set()
+
+    for current in [start, *start.parents]:
+        if current == home:
+            break
+        for rel in (Path(".opscloud") / "commands", Path(".claude") / "commands"):
+            candidate = current / rel
+            if candidate not in seen:
+                seen.add(candidate)
+                dirs.append(candidate)
+        if stop_root is not None and current == stop_root:
+            break
+
+    if stop_root is not None:
+        for rel in (Path(".opscloud") / "commands", Path(".claude") / "commands"):
+            candidate = stop_root / rel
+            if candidate not in seen:
+                seen.add(candidate)
+                dirs.append(candidate)
+
+    return dirs
 
 
 def display_path(path: Path | str) -> str:

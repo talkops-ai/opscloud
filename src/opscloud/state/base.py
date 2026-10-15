@@ -17,11 +17,12 @@ from langchain.agents.middleware.types import (
 )
 
 from opscloud.state.agent_session_channels import AgentSessionChannels
+from opscloud.state.btw_channels import BtwChannels
 from opscloud.state.cloud_context import CloudContextState
+from opscloud.state.custom_command_channels import CustomCommandChannels
 from opscloud.state.goal_channels import GoalRubricChannels
 from opscloud.state.resume_state import ResumeState
 from opscloud.state.service_context import ServiceContextState
-from opscloud.state.workflow_channels import WorkflowChannels
 
 
 def _merge_dict(
@@ -40,8 +41,9 @@ class OpsCloudAgentState(
     DeepAgentState,
     ResumeState,
     GoalRubricChannels,
-    WorkflowChannels,
     AgentSessionChannels,
+    BtwChannels,
+    CustomCommandChannels,
     CloudContextState,
     ServiceContextState,
 ):

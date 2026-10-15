@@ -52,6 +52,23 @@ class MCPServerInfo:
     disabled_tools: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if not self.tools or not self.name:
+            return
+        try:
+            from opscloud.ui.widgets.tool_display import (
+                extract_server_scope,
+                register_scoped_tool_name,
+            )
+
+            scope = extract_server_scope(self.name)
+            if scope:
+                for t in self.tools:
+                    if t.name and t.original_name:
+                        register_scoped_tool_name(t.name, t.original_name, scope)
+        except Exception:
+            pass
+
     @property
     def is_disabled(self) -> bool:
         """Check whether the server is disabled.

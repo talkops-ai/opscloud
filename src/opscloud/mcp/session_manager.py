@@ -145,16 +145,41 @@ def _filter_tool_name(
 class _MCPSessionEntry:
     """Internal tracking entry for an active MCP session connection."""
 
-    def __init__(self, session: Any, exit_stack: AsyncExitStack) -> None:
+    def __init__(
+        self,
+        session: Any,
+        exit_stack: AsyncExitStack,
+        *,
+        close_event: asyncio.Event | None = None,
+        owner_task: asyncio.Task[None] | None = None,
+    ) -> None:
         """Initialize tracking entry for an active MCP session.
 
         Args:
             session: Active MCP client session instance.
             exit_stack: AsyncExitStack managing connection cleanup.
+            close_event: Optional event signalling the owner task to close the session.
+            owner_task: Optional background task that entered the session context.
         """
         self.session = session
         self.exit_stack = exit_stack
         self._cached_tools: list[BaseTool] = []
+        self._close_event = close_event
+        self._owner_task = owner_task
+
+    async def aclose(self) -> None:
+        """Close the MCP session within its owning task to satisfy AnyIO cancel-scope invariants."""
+        if self._close_event is not None and self._owner_task is not None:
+            self._close_event.set()
+            try:
+                async with asyncio.timeout(5.0):
+                    await asyncio.shield(self._owner_task)
+            except TimeoutError:
+                self._owner_task.cancel()
+            except BaseException:
+                pass
+        else:
+            await self.exit_stack.aclose()
 
 
 def _enhance_mcp_error_diagnostics(error_text: str) -> str:
@@ -314,6 +339,18 @@ def _build_cached_mcp_tool(
         else None
     )
 
+    try:
+        from opscloud.ui.widgets.tool_display import (
+            extract_server_scope,
+            register_scoped_tool_name,
+        )
+
+        scope = extract_server_scope(server_name)
+        if scope:
+            register_scoped_tool_name(lc_tool_name, original_tool_name, scope)
+    except Exception:
+        pass
+
     metadata: dict[str, Any] = {
         "_opscloud_mcp": True,
         "_mcp_server": server_name,
@@ -468,16 +505,410 @@ def _build_cached_mcp_tool(
     )
 
 
+def _lazy_mcp_tools_enabled() -> bool:
+    """Return True when global lazy MCP tool loading is enabled."""
+    raw = (
+        os.environ.get("OPSCLOUD_MCP_LAZY_TOOLS")
+        or os.environ.get("OPSCLOUD_LAZY_MCP_TOOLS")
+        or "0"
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def split_enabled_tools_by_eager_lazy(
+    info: MCPServerInfo,
+    config: Mapping[str, Any] | None = None,
+) -> tuple[list[Any], list[Any]]:
+    """Partition an MCP server's enabled tools into ``(eager_tools, lazy_tools)``.
+
+    Resolution rules:
+    - Tools are eager by default so plugin subagents and skills can invoke their
+      declared ``<server>:<tool>`` tools directly in one turn, or lazy by default
+      when ``OPSCLOUD_MCP_LAZY_TOOLS=1`` / ``lazy_load: true`` / ``eager_tools`` is set.
+    - Server-level ``eager_load`` / ``eagerLoad: true`` marks all tools on the server eager
+      unless overridden per tool in ``tool_config`` / ``toolConfig`` or ``lazy_tools``.
+    - Server-level ``eager_tools`` / ``eagerTools`` list marks matching tools eager (and others lazy).
+    - Server-level ``lazy_tools`` / ``lazyTools`` list marks matching tools lazy.
+    - Per-tool ``tool_config[<tool_name>].eager_load`` / ``eagerLoad`` overrides the server default.
+    """
+    all_tools = list(getattr(info, "tools", ()) or ())
+    global_lazy = _lazy_mcp_tools_enabled()
+
+    tool_cfg_map: Mapping[str, Any] = {}
+    eager_tools_list: tuple[str, ...] = ()
+    lazy_tools_list: tuple[str, ...] = ()
+    has_server_lazy_cfg = False
+    server_eager = not global_lazy
+
+    if isinstance(config, Mapping):
+        raw_tc = config.get("tool_config") or config.get("toolConfig")
+        if isinstance(raw_tc, Mapping) and raw_tc:
+            tool_cfg_map = raw_tc
+            has_server_lazy_cfg = True
+        raw_et = config.get("eager_tools") or config.get("eagerTools")
+        if isinstance(raw_et, (list, tuple, set)):
+            eager_tools_list = tuple(str(x) for x in raw_et)
+            has_server_lazy_cfg = True
+        raw_lt = config.get("lazy_tools") or config.get("lazyTools")
+        if isinstance(raw_lt, (list, tuple, set)):
+            lazy_tools_list = tuple(str(x) for x in raw_lt)
+            has_server_lazy_cfg = True
+
+        if "lazy_load" in config or "lazyLoad" in config:
+            has_server_lazy_cfg = True
+            server_eager = not bool(config.get("lazy_load") or config.get("lazyLoad"))
+        elif "eager_load" in config or "eagerLoad" in config:
+            has_server_lazy_cfg = True
+            server_eager = bool(config.get("eager_load") or config.get("eagerLoad"))
+        elif eager_tools_list and not lazy_tools_list:
+            server_eager = False
+
+    if not global_lazy and not has_server_lazy_cfg:
+        return all_tools, []
+
+    eager: list[Any] = []
+    lazy: list[Any] = []
+    for tool in all_tools:
+        raw_name = getattr(tool, "original_name", None) or getattr(tool, "name", str(tool))
+        if isinstance(raw_name, str) and ":" in raw_name:
+            raw_name = raw_name.split(":", 1)[1]
+        full_name = str(getattr(tool, "name", raw_name))
+
+        is_eager = server_eager
+        if not is_eager and eager_tools_list:
+            if any(
+                pat in (str(raw_name), full_name)
+                or fnmatch.fnmatch(str(raw_name), pat)
+                or fnmatch.fnmatch(full_name, pat)
+                for pat in eager_tools_list
+            ):
+                is_eager = True
+        if is_eager and lazy_tools_list:
+            if any(
+                pat in (str(raw_name), full_name)
+                or fnmatch.fnmatch(str(raw_name), pat)
+                or fnmatch.fnmatch(full_name, pat)
+                for pat in lazy_tools_list
+            ):
+                is_eager = False
+        per_tool = tool_cfg_map.get(str(raw_name)) or tool_cfg_map.get(full_name)
+        if isinstance(per_tool, Mapping):
+            if "eager_load" in per_tool:
+                is_eager = bool(per_tool["eager_load"])
+            elif "eagerLoad" in per_tool:
+                is_eager = bool(per_tool["eagerLoad"])
+            elif "lazy_load" in per_tool:
+                is_eager = not bool(per_tool["lazy_load"])
+            elif "lazyLoad" in per_tool:
+                is_eager = not bool(per_tool["lazyLoad"])
+        elif isinstance(per_tool, bool):
+            is_eager = per_tool
+
+        if is_eager:
+            eager.append(tool)
+        else:
+            lazy.append(tool)
+
+    return eager, lazy
+
+
+def build_call_mcp_tool(
+    session_manager: MCPSessionManager,
+    *,
+    allowed_servers: Sequence[str] | set[str] | None = None,
+    server_infos: Sequence[MCPServerInfo] | None = None,
+) -> BaseTool:
+    """Build the ``call_mcp_tool`` dispatcher for lazy-loaded MCP tools.
+
+    Accepts ``server_name``, ``tool_name``, and ``arguments``, resolves the tool's
+    cached/on-disk schema for argument normalization and safety profiling, and
+    invokes the tool on the pooled ``MCPSessionManager`` session.
+    """
+    from langchain_mcp_adapters.tools import _convert_call_tool_result
+    from opscloud.mcp.preload import get_cached_mcp_server_infos, read_mcp_tool_schema
+    from opscloud.mcp.semantic_profiler import MCPSemanticProfiler
+
+    allowed_set: set[str] | None = set(allowed_servers) if allowed_servers is not None else None
+    info_by_name: dict[str, MCPServerInfo] = {
+        info.name: info for info in (server_infos or ()) if getattr(info, "name", None)
+    }
+
+    def _resolve_server_name(requested: str) -> str:
+        req = requested.strip()
+        if not req:
+            raise ToolException("server_name is required for call_mcp_tool.")
+
+        candidates = (
+            allowed_set
+            if allowed_set is not None
+            else (set(info_by_name.keys()) | set(session_manager._config.keys()) | set(session_manager._sessions.keys()))
+        )
+        if req in candidates:
+            return req
+
+        # Match scoped subagent/plugin server names by base server suffix
+        req_lower = req.lower()
+        for cand in sorted(candidates, key=len, reverse=True):
+            cand_lower = cand.lower()
+            if (
+                cand_lower == req_lower
+                or cand_lower.endswith(f"__{req_lower}")
+                or cand_lower.endswith(f"_{req_lower}")
+            ):
+                return cand
+
+        if allowed_set is not None:
+            allowed_display = ", ".join(sorted(allowed_set)) or "none"
+            raise ToolException(
+                f"MCP server {req!r} is not permitted or not configured for this agent. "
+                f"Allowed servers: [{allowed_display}]."
+            )
+        return req
+
+    def _resolve_tool_metadata(resolved_server: str, requested_tool: str) -> tuple[str, dict[str, Any], Any]:
+        req_tool = requested_tool.strip()
+        if ":" in req_tool:
+            prefix, rest = req_tool.split(":", 1)
+            if prefix == resolved_server or resolved_server.endswith(f"__{prefix}"):
+                req_tool = rest
+
+        info = info_by_name.get(resolved_server)
+        if info is None:
+            for cached in get_cached_mcp_server_infos():
+                if cached.name == resolved_server:
+                    info = cached
+                    break
+
+        if info is not None:
+            for t in info.tools:
+                orig = t.original_name or (t.name.split(":", 1)[1] if ":" in t.name else t.name)
+                if req_tool in (orig, t.name) or (
+                    t.name.endswith(f"_{req_tool}") or t.name.endswith(f":{req_tool}")
+                ):
+                    schema = t.input_schema if isinstance(t.input_schema, dict) else {}
+                    return str(orig), _clean_mcp_schema(schema), t
+
+        disk_schema = read_mcp_tool_schema(resolved_server, req_tool)
+        if isinstance(disk_schema, dict):
+            raw_input = disk_schema.get("inputSchema")
+            orig_name = str(disk_schema.get("name") or req_tool)
+            return orig_name, _clean_mcp_schema(raw_input), disk_schema
+
+        return req_tool, {}, None
+
+    def _handle_tool_error(error: ToolException) -> str:
+        raw_msg = str(error) or "call_mcp_tool failed with no error detail"
+        logger.info("MCP dispatcher call_mcp_tool returned error: %s", raw_msg)
+        return _enhance_mcp_error_diagnostics(raw_msg)
+
+    async def coroutine(
+        server_name: str = "",
+        tool_name: str = "",
+        arguments: dict[str, Any] | None = None,
+        *,
+        ServerName: str = "",
+        ToolName: str = "",
+        Arguments: dict[str, Any] | None = None,
+        runtime: Any = None,
+        **extra_kwargs: Any,
+    ) -> Any:
+        import time
+
+        raw_server = server_name or ServerName or str(extra_kwargs.pop("server", "") or "")
+        raw_tool = tool_name or ToolName or str(extra_kwargs.pop("tool", "") or "")
+        raw_args = arguments if arguments is not None else Arguments
+        if raw_args is None:
+            raw_args = extra_kwargs if extra_kwargs else {}
+        elif not isinstance(raw_args, dict):
+            raise ToolException(f"Invalid arguments for MCP tool {raw_tool!r}: expected an object/dict.")
+
+        resolved_server = _resolve_server_name(raw_server)
+        actual_tool_name, input_schema, tool_ref = _resolve_tool_metadata(resolved_server, raw_tool)
+        if not actual_tool_name:
+            raise ToolException("tool_name is required for call_mcp_tool.")
+
+        lc_tool_name = f"{resolved_server}:{actual_tool_name}"
+        profiler = MCPSemanticProfiler.get_instance()
+        profile = profiler.get_profile(resolved_server, actual_tool_name)
+        if profile is None:
+            target_for_profile = tool_ref if tool_ref is not None else actual_tool_name
+            profile = profiler.heuristic_profile(target_for_profile, server_name=resolved_server)
+            profiler.register_profile(resolved_server, actual_tool_name, profile)
+
+        start_time = time.perf_counter()
+        logger.info(
+            "Invoking lazy MCP tool '%s' on server '%s' via call_mcp_tool",
+            actual_tool_name,
+            resolved_server,
+            extra={"mcp_server": resolved_server, "tool_name": actual_tool_name},
+        )
+        cleaned_args = _normalize_mcp_arguments(dict(raw_args), input_schema)
+        try:
+            session = await session_manager.get_session(resolved_server)
+            result = await session.call_tool(actual_tool_name, cleaned_args)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, ToolException):
+            raise
+        except Exception as exc:
+            if not _is_transient_session_error(exc):
+                duration_ms = (time.perf_counter() - start_time) * 1000.0
+                logger.error(
+                    "Lazy MCP tool '%s' execution failed: %s",
+                    actual_tool_name,
+                    exc,
+                    exc_info=True,
+                    extra={
+                        "mcp_server": resolved_server,
+                        "tool_name": actual_tool_name,
+                        "duration_ms": round(duration_ms, 2),
+                    },
+                )
+                msg = f"MCP tool {lc_tool_name!r} failed on server {resolved_server!r}: {exc}"
+                raise ToolException(_enhance_mcp_error_diagnostics(msg)) from None
+
+            is_read_only = bool(
+                profile.read_only_hint
+                or (
+                    profile.inferred_tier
+                    and getattr(profile.inferred_tier, "value", str(profile.inferred_tier)) == "read_only"
+                )
+            )
+            if not is_read_only:
+                await session_manager.invalidate(resolved_server)
+                msg = (
+                    f"Connection lost while calling MCP tool {lc_tool_name!r}. "
+                    "The operation may have already been executed by AWS/cloud provider and was not "
+                    "automatically retried to prevent unintended duplicate side effects. "
+                    "Please verify the current resource state before trying again."
+                )
+                logger.warning("MCP connection lost on mutating lazy tool %r; avoiding blind replay", lc_tool_name)
+                raise ToolException(_enhance_mcp_error_diagnostics(msg)) from None
+
+            logger.info(
+                "MCP session for %r dead; retrying read-only lazy tool once",
+                resolved_server,
+                extra={"mcp_server": resolved_server},
+            )
+            await session_manager.invalidate(resolved_server)
+            try:
+                retry_session = await session_manager.get_session(resolved_server)
+                result = await retry_session.call_tool(actual_tool_name, cleaned_args)
+            except Exception as retry_exc:
+                duration_ms = (time.perf_counter() - start_time) * 1000.0
+                logger.error(
+                    "Lazy MCP tool '%s' execution failed after retry: %s",
+                    actual_tool_name,
+                    retry_exc,
+                    exc_info=True,
+                    extra={
+                        "mcp_server": resolved_server,
+                        "tool_name": actual_tool_name,
+                        "duration_ms": round(duration_ms, 2),
+                    },
+                )
+                msg = f"MCP tool {lc_tool_name!r} failed after retry on server {resolved_server!r}: {retry_exc}"
+                raise ToolException(_enhance_mcp_error_diagnostics(msg)) from None
+
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        logger.info(
+            "Lazy MCP tool '%s' executed in %.2fms",
+            actual_tool_name,
+            duration_ms,
+            extra={
+                "mcp_server": resolved_server,
+                "tool_name": actual_tool_name,
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        try:
+            converted = _convert_call_tool_result(result)
+            if isinstance(converted, tuple) and len(converted) == 2:
+                return converted
+            return converted, None
+        except ToolException:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Fallback formatting for lazy MCP tool '%s' on server '%s': %s",
+                actual_tool_name,
+                resolved_server,
+                exc,
+            )
+            content = getattr(result, "content", None)
+            if content is not None:
+                return content, None
+            return str(result), None
+
+    args_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "server_name": {
+                "type": "string",
+                "description": "Name of the MCP server to call.",
+            },
+            "tool_name": {
+                "type": "string",
+                "description": "Original name of the MCP tool on that server.",
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Dictionary of arguments matching the tool's JSON schema.",
+            },
+        },
+        "required": ["server_name", "tool_name"],
+    }
+    metadata: dict[str, Any] = {
+        "_opscloud_mcp": True,
+        "_opscloud_mcp_dispatcher": True,
+        "_mcp_allowed_servers": tuple(sorted(allowed_set)) if allowed_set is not None else (),
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+    return StructuredTool(
+        name="call_mcp_tool",
+        description=(
+            "Call a lazy-loaded MCP tool. Read the tool's schema file (<toolName>.json) "
+            "in the MCP server's schema directory to understand its arguments and usage."
+        ),
+        args_schema=args_schema,
+        coroutine=coroutine,
+        response_format="content_and_artifact",
+        metadata=metadata,
+        handle_tool_error=cast("Any", _handle_tool_error),
+    )
+
+
 def build_mcp_tools_from_server_infos(
     server_infos: Sequence[MCPServerInfo],
     session_manager: MCPSessionManager,
+    *,
+    configs: Mapping[str, Any] | None = None,
+    include_dispatcher: bool = False,
 ) -> list[BaseTool]:
-    """Build LangChain StructuredTools from preloaded/probed MCPServerInfo list without opening persistent sessions eagerly."""
+    """Build LangChain StructuredTools from preloaded/probed MCPServerInfo list.
+
+    Eager/Lazy tool partitioning:
+    - Materializes every active server's tool schemas to ``~/.opscloud/mcp/<server>/<tool>.json``.
+    - Eager tools are bound directly as individual ``StructuredTool`` objects.
+    - Lazy tools are invoked on-demand through a single shared ``call_mcp_tool`` dispatcher,
+      keeping thousands of lines of raw JSON schemas out of every LLM request payload.
+    """
+    from opscloud.mcp.preload import write_mcp_server_state
+
     tools: list[BaseTool] = []
+    has_lazy_tools = False
+    active_infos: list[MCPServerInfo] = []
+    cfg_lookup = configs if isinstance(configs, Mapping) else getattr(session_manager, "_config", {})
+
     for info in server_infos:
         if not info.enabled or info.status != "ok":
             continue
-        for t in info.tools:
+        active_infos.append(info)
+        write_mcp_server_state(info)
+        srv_cfg = cfg_lookup.get(info.name) if isinstance(cfg_lookup, Mapping) else None
+        eager_tools, lazy_tools = split_enabled_tools_by_eager_lazy(info, srv_cfg)
+        if lazy_tools:
+            has_lazy_tools = True
+        for t in eager_tools:
             tool_obj = _build_cached_mcp_tool(
                 mcp_tool=t,
                 server_name=info.name,
@@ -485,6 +916,22 @@ def build_mcp_tools_from_server_infos(
                 name_prefix_sep=":",
             )
             tools.append(tool_obj)
+
+    if has_lazy_tools or (include_dispatcher and active_infos):
+        allowed_servers = [i.name for i in active_infos]
+        if not allowed_servers and isinstance(cfg_lookup, Mapping):
+            allowed_servers = [
+                str(k)
+                for k, v in cfg_lookup.items()
+                if not isinstance(v, Mapping) or v.get("enabled", True)
+            ]
+        tools.append(
+            build_call_mcp_tool(
+                session_manager,
+                allowed_servers=allowed_servers or None,
+                server_infos=active_infos,
+            )
+        )
     return tools
 
 
@@ -583,9 +1030,53 @@ class MCPSessionManager:
             entry = self._sessions.pop(server_name, None)
             if entry is not None:
                 try:
-                    await entry.exit_stack.aclose()
+                    if hasattr(entry, "aclose") and callable(entry.aclose):
+                        await entry.aclose()
+                    else:
+                        await entry.exit_stack.aclose()
                 except Exception as exc:
                     logger.debug("Error closing invalidated session %s: %s", server_name, exc)
+
+    async def close_subagent_sessions(self, agent_name: str | None = None) -> int:
+        """Close and evict active MCP stdio/HTTP sessions owned by a subagent or `/agent` session.
+
+        Args:
+            agent_name: Optional subagent name or ID (e.g. ``aws-finops-agent@talkops-devops-plugins``).
+                When ``None``, closes all active ``subagent__*`` sessions.
+
+        Returns:
+            Number of closed subagent MCP sessions.
+        """
+        if agent_name:
+            from opscloud.plugins.adapters.mcp import _safe_mcp_name_part
+
+            short = agent_name.split("@", 1)[0].rsplit(":", 1)[-1].strip()
+            safe_full = _safe_mcp_name_part(agent_name)
+            safe_short = _safe_mcp_name_part(short)
+            prefixes: tuple[str, ...] = (
+                f"subagent__{safe_full}__",
+                f"subagent__{safe_short}__",
+                f"subagent__{short}__",
+                f"subagent__{short}_",
+                f"subagent__{agent_name}__",
+            )
+        else:
+            prefixes = ("subagent__",)
+
+        target_names = [
+            srv_name
+            for srv_name in list(self._sessions.keys())
+            if srv_name.startswith(prefixes)
+        ]
+        for srv_name in target_names:
+            await self.invalidate(srv_name)
+        if target_names:
+            logger.info(
+                "Closed %d subagent MCP session(s): %s",
+                len(target_names),
+                ", ".join(target_names),
+            )
+        return len(target_names)
 
     def remove_server_config(self, server_name: str) -> None:
         """Remove configuration for a disabled or deleted server."""
@@ -640,7 +1131,11 @@ class MCPSessionManager:
         async with self._lock:
             for name, entry in list(self._sessions.items()):
                 try:
-                    await asyncio.wait_for(entry.exit_stack.aclose(), timeout=5.0)
+                    if hasattr(entry, "aclose") and callable(entry.aclose):
+                        await entry.aclose()
+                    else:
+                        async with asyncio.timeout(5.0):
+                            await entry.exit_stack.aclose()
                 except TimeoutError:
                     logger.warning("MCP session %s teardown timed out after 5.0s", name)
                 except Exception as exc:
@@ -654,7 +1149,7 @@ class MCPSessionManager:
         await self.close_all()
 
     async def connect_server(self, name: str, config: Mapping[str, Any]) -> bool:
-        """Connect to a single MCP server and initialize its tools."""
+        """Connect to a single MCP server and initialize its tools inside a dedicated owner task."""
         enabled = bool(config.get("enabled", True))
         if not enabled:
             return False
@@ -679,20 +1174,69 @@ class MCPSessionManager:
             extra={"mcp_server": name, "transport": transport},
         )
 
-        exit_stack = AsyncExitStack()
+        loop = asyncio.get_running_loop()
+        ready_future: asyncio.Future[tuple[Any, Any, AsyncExitStack]] = loop.create_future()
+        close_event = asyncio.Event()
+
+        async def _session_owner() -> None:
+            exit_stack = AsyncExitStack()
+            try:
+                conn = create_mcp_connection(resolved_config)
+                async with asyncio.timeout(_CONNECT_TIMEOUT):
+                    if conn.get("transport") == "stdio":
+                        from mcp import ClientSession
+                        from mcp.client.stdio import StdioServerParameters, stdio_client
+                        from opscloud.utils.logger import DEFAULT_LOG_DIR
+
+                        try:
+                            DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+                            errlog_file = exit_stack.enter_context(
+                                open(DEFAULT_LOG_DIR / "mcp_stderr.log", "a", encoding="utf-8")
+                            )
+                        except Exception:
+                            errlog_file = exit_stack.enter_context(
+                                open(os.devnull, "w", encoding="utf-8")
+                            )
+                        server_params = StdioServerParameters(
+                            command=str(conn.get("command") or ""),
+                            args=list(conn.get("args") or []),
+                            env=conn.get("env"),
+                            cwd=conn.get("cwd"),
+                        )
+                        read_stream, write_stream = await exit_stack.enter_async_context(
+                            stdio_client(server_params, errlog=errlog_file)
+                        )
+                        session = await exit_stack.enter_async_context(
+                            ClientSession(read_stream, write_stream)
+                        )
+                    else:
+                        from langchain_mcp_adapters.sessions import create_session
+
+                        session = await exit_stack.enter_async_context(create_session(conn))
+                async with asyncio.timeout(_CONNECT_TIMEOUT):
+                    await session.initialize()
+                async with asyncio.timeout(_CONNECT_TIMEOUT):
+                    tools_result = await session.list_tools()
+
+                if not ready_future.done():
+                    ready_future.set_result((session, tools_result, exit_stack))
+                    await close_event.wait()
+            except BaseException as exc:
+                if not ready_future.done():
+                    ready_future.set_exception(exc)
+            finally:
+                try:
+                    async with asyncio.timeout(5.0):
+                        await exit_stack.aclose()
+                except BaseException as close_exc:
+                    logger.debug("Error closing exit stack for MCP server %s: %s", name, close_exc)
+
+        owner_task = loop.create_task(_session_owner(), name=f"mcp-owner-{name}")
+        self._background_tasks.add(owner_task)
+        owner_task.add_done_callback(self._background_tasks.discard)
+
         try:
-            from langchain_mcp_adapters.sessions import create_session
-
-            conn = create_mcp_connection(resolved_config)
-
-            session = await asyncio.wait_for(
-                exit_stack.enter_async_context(create_session(conn)),
-                timeout=_CONNECT_TIMEOUT,
-            )
-            await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT)
-
-            # Discover and wrap tools
-            tools_result = await asyncio.wait_for(session.list_tools(), timeout=_CONNECT_TIMEOUT)
+            session, tools_result, exit_stack = await ready_future
             raw_tools = getattr(tools_result, "tools", []) or []
             logger.info(
                 "Discovered %d tools from MCP server '%s'",
@@ -728,19 +1272,43 @@ class MCPSessionManager:
                 )
                 wrapped_tools.append(tool_obj)
 
-            entry = _MCPSessionEntry(session, exit_stack)
+            try:
+                from opscloud.mcp.preload import (
+                    build_mcp_server_info_from_raw_tools,
+                    set_cached_mcp_server_info,
+                )
+
+                info = build_mcp_server_info_from_raw_tools(name, resolved_config, raw_tools)
+                set_cached_mcp_server_info(info, config)
+            except Exception as cache_exc:
+                logger.debug("Failed to cache MCPServerInfo for '%s': %s", name, cache_exc)
+
+            entry = _MCPSessionEntry(
+                session,
+                exit_stack,
+                close_event=close_event,
+                owner_task=owner_task,
+            )
             entry._cached_tools = wrapped_tools
+
+            def _watch_owner(_task: asyncio.Task[Any]) -> None:
+                # If the owner task exits unexpectedly while this entry is still
+                # registered, evict it so the next tool call transparently reconnects.
+                if self._sessions.get(name) is entry and not close_event.is_set():
+                    self._sessions.pop(name, None)
+
+            owner_task.add_done_callback(_watch_owner)
 
             self._sessions[name] = entry
             self._errors.pop(name, None)
             return True
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            close_event.set()
+            if not owner_task.done():
+                owner_task.cancel()
             raise
         except BaseException as exc:
-            try:
-                await exit_stack.aclose()
-            except BaseException as close_exc:
-                logger.debug("Error closing exit stack for MCP server %s: %s", name, close_exc)
+            close_event.set()
             self._errors[name] = str(exc)
             logger.warning("Failed to connect to MCP server %s: %s", name, exc)
             return False
@@ -755,3 +1323,4 @@ class MCPSessionManager:
             ]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+

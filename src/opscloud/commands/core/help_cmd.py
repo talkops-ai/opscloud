@@ -63,7 +63,7 @@ class HelpHandler(BaseCommandHandler):
             "- **`Ctrl+\\`**: Toggle debug console\n"
             "- **`Shift+Tab`**: Toggle auto-approve mode\n"
             "- **`@filename`**: Complete files and inject content\n"
-            "- **`/command`**: Slash commands (`/help`, `/doctor`, `/reload`, `/workflow`, `/agent`)\n"
+            "- **`/command`**: Slash commands (`/help`, `/doctor`, `/reload`, `/agent`)\n"
             "- **`!command`**: Run shell command directly\n"
             "- **`!!command`**: Run shell command without adding output to context\n\n"
             "_Documentation: https://opscloud.dev/docs_"

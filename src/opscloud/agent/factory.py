@@ -159,9 +159,10 @@ def _should_interrupt_tool_call(
 
     Follows the unified approval mode hierarchy:
     1. If server hooks already decided permission -> False (never interrupt).
-    2. If mode in ("auto", "smart") -> False when classifier is enabled, True if classifier disabled.
-    3. Internal AGENTS.md writes or read-only filesystem tools -> False.
-    4. In "manual" mode -> True (require human confirmation).
+    2. If mode is "yolo" -> False (never interrupt).
+    3. If mode in ("auto", "smart") -> False when classifier is enabled, True if classifier disabled.
+    4. Internal AGENTS.md writes or read-only filesystem tools -> False.
+    5. In "manual" mode -> True (require human confirmation).
     """
     from opscloud._constants import READONLY_FS_TOOLS
     from opscloud.middleware.auto_mode import _async_routing_mode
@@ -201,6 +202,8 @@ def _should_interrupt_tool_call(
             ctx = state
         mode = _resolve_approval_mode(ctx, getattr(runtime, "store", None) if runtime else None)
 
+    if mode in (ApprovalMode.YOLO, "yolo"):
+        return False
     if mode in (ApprovalMode.AUTO, ApprovalMode.SMART, "auto", "smart"):
         return not auto_mode_enabled
 
@@ -770,10 +773,22 @@ def create_opscloud_agent(
             project_scope_root,
         )
 
+    _subagent_execution_guardrail = (
+        "\n\n## Subagent Execution & Anti-Recursion Discipline\n"
+        "- You are already the dedicated subagent for this task. Execute the work directly using your tools — do NOT re-delegate your entire assignment to another single subagent.\n"
+        "- Maximize parallel tool calls for independent read/discovery queries (`read_file`, `grep_search`, `glob`, read-only cloud CLI queries).\n"
+        "- Reference all files and manifests with exact `file_path:line_number` and preserve structured tables and actionable CLI commands in your final report."
+    )
+
     for name, subagent_meta in subagent_by_name.items():
         model_spec = subagent_meta.get("model")
         has_explicit_model = bool(model_spec)
-        sub_prompt = subagent_meta.get("system_prompt") or ""
+        raw_sub_prompt = (subagent_meta.get("system_prompt") or "").strip()
+        sub_prompt = (
+            f"{raw_sub_prompt}{_subagent_execution_guardrail}"
+            if raw_sub_prompt and "Anti-Recursion Discipline" not in raw_sub_prompt
+            else (raw_sub_prompt or _subagent_execution_guardrail.strip())
+        )
         subagent_dict: dict[str, Any] = {
             "name": subagent_meta.get("name") or name,
             "description": subagent_meta.get("description") or "",
@@ -833,7 +848,12 @@ def create_opscloud_agent(
     if not any(sub.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for sub in compiled_subagents):
         gp_name = GENERAL_PURPOSE_SUBAGENT["name"]
         gp_description = GENERAL_PURPOSE_SUBAGENT["description"]
-        gp_system_prompt = GENERAL_PURPOSE_SUBAGENT.get("system_prompt") or ""
+        raw_gp_prompt = (GENERAL_PURPOSE_SUBAGENT.get("system_prompt") or "").strip()
+        gp_system_prompt = (
+            f"{raw_gp_prompt}{_subagent_execution_guardrail}"
+            if raw_gp_prompt
+            else _subagent_execution_guardrail.strip()
+        )
         gp_middleware = _subagent_cli_middleware(
             has_explicit_model=False,
             assistant_id=assistant_id,
@@ -972,6 +992,16 @@ def create_opscloud_agent(
             )
         )
 
+    # 10.6b CustomCommandsMiddleware — zero-code custom commands & skills
+    from opscloud.middleware.custom_commands import CustomCommandsMiddleware
+
+    agent_middleware.append(
+        CustomCommandsMiddleware(
+            cwd=Path(effective_cwd) if effective_cwd else None,
+            project_root=project_scope_root,
+        )
+    )
+
     # 10.7 CodeInterpreterMiddleware (if enabled)
     if enable_interpreter:
         try:
@@ -1090,36 +1120,6 @@ def create_opscloud_agent(
 
     set_active_criteria_agent(criteria_agent, fallback_agent)
 
-    # 10.12a WorkflowMiddleware — isolated `/workflow` runbook agent.
-    # Runs before goal-criteria handling; a workflow turn jumps to "end" so the
-    # main deep agent never sees it. The workflow agent reuses the main agent's
-    # interrupt_on mapping, so plugin MCP tools / shell / writes follow exactly
-    # the same HITL approval policy.
-    from opscloud.middleware.workflow import WorkflowMiddleware
-
-    workflow_agent = None
-    try:
-        from opscloud.workflows.agent import create_workflow_agent
-
-        workflow_agent = create_workflow_agent(
-            model=active_model,
-            backend=composite_backend,
-            tools=all_tools,
-            worktree_root=effective_cwd,
-            assistant_id=assistant_id,
-            interactive=interactive,
-            auto_approve=auto_approve,
-            shell_allow_list=allow_list,
-            interrupt_on=interrupt_on,
-            mcp_server_info=coord_server_info,
-            mcp_config=mcp_configs,
-            mcp_tools=mcp_tools_list or None,
-        )
-    except Exception as exc:
-        logger.warning("Failed to create workflow agent: %s", exc, exc_info=True)
-
-    agent_middleware.append(WorkflowMiddleware(workflow_agent=workflow_agent))
-
     # 10.12b AgentSessionMiddleware — direct plugin agent session interaction.
     # Runs before goal-criteria handling; an agent session turn jumps to "end"
     # so the main deep agent never sees it. Each plugin subagent runnable is
@@ -1191,6 +1191,11 @@ def create_opscloud_agent(
 
     # 10.15 SubagentsMiddleware
     agent_middleware.append(SubagentsMiddleware(subagent_metas=list(subagent_by_name.values())))
+
+    # 10.15a BtwSideQuestionMiddleware — tool-free, single-turn side questions (/btw)
+    from opscloud.middleware.btw import BtwSideQuestionMiddleware
+
+    agent_middleware.append(BtwSideQuestionMiddleware())
 
     # 10.16 UnifiedSystemMessageMiddleware
     agent_middleware.append(UnifiedSystemMessageMiddleware())
