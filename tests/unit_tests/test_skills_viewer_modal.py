@@ -199,7 +199,7 @@ async def test_skills_viewer_namespaced_plugin_skill_formatting():
 
         # 1. Long skill name: displays clean short_name and [PLUGIN] badge without wrapping
         opt0 = opt_list.get_option_at_index(0)
-        plain0 = opt0.prompt.plain if hasattr(opt0.prompt, "plain") else str(opt0.prompt)
+        plain0 = getattr(opt0.prompt, "plain", None) or str(opt0.prompt)
         assert "setting-up-ec2-instance-profiles" in plain0
         assert "aws-compute@talkops-devops-plugins:" not in plain0
         assert "PLUGIN" in plain0
@@ -207,7 +207,7 @@ async def test_skills_viewer_namespaced_plugin_skill_formatting():
 
         # 2. Compact skill name: displays plugin identifier as badge [aws-compute]
         opt1 = opt_list.get_option_at_index(1)
-        plain1 = opt1.prompt.plain if hasattr(opt1.prompt, "plain") else str(opt1.prompt)
+        plain1 = getattr(opt1.prompt, "plain", None) or str(opt1.prompt)
         assert "ec2-runner" in plain1
         assert "aws-compute" in plain1
 

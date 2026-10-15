@@ -192,3 +192,45 @@ async def test_chat_text_area_render_line_ignores_hint_when_line_empty():
         strip = ci._text_area.render_line(0)
         rendered_plain = strip.text
         assert "[profile-name | status | list]" not in rendered_plain
+
+
+@pytest.mark.asyncio
+async def test_up_and_down_arrow_history_navigation_places_cursor_at_end():
+    """Pressing Up/Down arrows recalls previous prompts and positions cursor at the end."""
+    from tests.unit_tests.test_chat_input_chrome import _ThemedApp
+
+    app = _ThemedApp()
+    async with app.run_test(size=(100, 12)) as pilot:
+        ci = app.query_one(ChatInput)
+        ci.focus()
+
+        # Submit two prompts
+        ci.text = "first prompt"
+        ci._submit_value()
+        ci.text = "second prompt"
+        ci._submit_value()
+        assert ci.text == ""
+
+        # Press Up arrow -> should autofill "second prompt" with cursor at end
+        await pilot.press("up")
+        await pilot.pause()
+        assert ci.text == "second prompt"
+        assert ci._text_area.cursor_location == (0, len("second prompt"))
+
+        # Press Up arrow again -> should autofill "first prompt" with cursor at end
+        await pilot.press("up")
+        await pilot.pause()
+        assert ci.text == "first prompt"
+        assert ci._text_area.cursor_location == (0, len("first prompt"))
+
+        # Press Down arrow -> back to "second prompt"
+        await pilot.press("down")
+        await pilot.pause()
+        assert ci.text == "second prompt"
+        assert ci._text_area.cursor_location == (0, len("second prompt"))
+
+        # Press Down arrow again -> back to empty draft
+        await pilot.press("down")
+        await pilot.pause()
+        assert ci.text == ""
+        assert ci._text_area.cursor_location == (0, 0)

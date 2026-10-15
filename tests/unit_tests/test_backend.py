@@ -202,12 +202,14 @@ class TestOpsCloudCompositeBackend:
 
         # Read back through composite backend
         read_res = composite.read("/large_tool_results/test.txt")
+        assert read_res.file_data is not None
         assert read_res.file_data["content"] == "evidence data"
 
         # Write file to virtual /conversation_history/ prefix
         history_res = composite.write("/conversation_history/session_001.json", '{"history": []}')
         assert history_res.error is None
         read_hist = composite.read("/conversation_history/session_001.json")
+        assert read_hist.file_data is not None
         assert read_hist.file_data["content"] == '{"history": []}'
 
         composite.cleanup()

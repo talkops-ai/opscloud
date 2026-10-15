@@ -134,16 +134,16 @@ class CustomCommandHandler(BaseCommandHandler):
 
     async def execute(
         self,
-        ctx_or_args: CommandContext | str,
+        ctx: CommandContext | str,
         context: CommandContext | None = None,
     ) -> CommandResult:
         """Expand the custom command template and return structured execution payload."""
-        if isinstance(ctx_or_args, str):
-            raw_args = ctx_or_args
-            ctx = context or CommandContext(app=None, args=raw_args)
+        if isinstance(ctx, str):
+            raw_args = ctx
+            resolved_ctx = context or CommandContext(app=None, args=raw_args)
         else:
-            ctx = ctx_or_args
-            raw_args = ctx.args
+            resolved_ctx = ctx
+            raw_args = resolved_ctx.args
 
         record_command_usage(self.definition.name)
 
@@ -155,7 +155,7 @@ class CustomCommandHandler(BaseCommandHandler):
             effort,
             execute_shell,
             invoked_registry,
-        ) = _extract_context_fields(ctx, override_args=raw_args)
+        ) = _extract_context_fields(resolved_ctx, override_args=raw_args)
 
         expanded = expand_custom_command_prompt(
             self.definition,

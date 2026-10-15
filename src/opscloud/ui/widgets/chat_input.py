@@ -1321,67 +1321,28 @@ class ChatInput(Widget):
             app = getattr(self, "_app", None) or self.app
         except Exception:
             app = getattr(self, "_app", None)
-        pending_approval = getattr(app, "_pending_approval_widget", None) if app is not None else None
-        if pending_approval is not None and getattr(pending_approval, "is_mounted", False) and getattr(pending_approval, "display", True):
-            if key in ("up", "k"):
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_move_up()
-                return True
-            if key in ("down", "j"):
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_move_down()
-                return True
-            if key == "enter":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_select()
-                return True
-            if key == "y":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_select_approve()
-                return True
-            if key in ("s", "a"):
-                event.prevent_default()
-                event.stop()
-                if hasattr(pending_approval, "action_select_smart"):
-                    pending_approval.action_select_smart()
-                else:
-                    pending_approval.action_select_auto()
-                return True
-            if key in ("n", "escape"):
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_select_reject()
-                return True
-            if key == "1":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_select_position(0)
-                return True
-            if key == "2":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_select_position(1)
-                return True
-            if key == "3":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_select_position(2)
-                return True
-            if key == "e":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_toggle_expand()
-                return True
-            if key == "tab":
-                event.prevent_default()
-                event.stop()
-                pending_approval.action_reject_with_reason()
-                return True
-            if not getattr(pending_approval, "_reason_input_active", False):
+        prompts = getattr(app, "_prompts", None) if app is not None else None
+        if prompts is not None and prompts.route_key(event):
+            return True
+
+        pending_approval = (
+            getattr(app, "_pending_approval_widget", None) if app is not None else None
+        )
+        if (
+            pending_approval is not None
+            and getattr(pending_approval, "is_mounted", False)
+            and getattr(pending_approval, "display", True)
+        ):
+            from opscloud.ui.controllers.prompt_controller import PromptController
+
+            handled = (
+                bool(pending_approval.handle_scoped_key(key))
+                if hasattr(pending_approval, "handle_scoped_key")
+                else PromptController._dispatch_fallback_approval_key(
+                    pending_approval, key
+                )
+            )
+            if handled:
                 event.prevent_default()
                 event.stop()
                 return True
@@ -1423,32 +1384,33 @@ class ChatInput(Widget):
 
         # When `/btw` card is open and the input is empty in normal mode,
         # route Enter (dismiss/cancel), Tab (expand/collapse), and Left/Right (history).
+        app_any: Any = app
         if (
-            app is not None
-            and hasattr(app, "is_btw_open")
-            and app.is_btw_open()
+            app_any is not None
+            and hasattr(app_any, "is_btw_open")
+            and app_any.is_btw_open()
             and self.mode == "normal"
             and not self.text.strip()
         ):
             if key == "enter":
                 event.prevent_default()
                 event.stop()
-                app.dismiss_btw_response()
+                app_any.dismiss_btw_response()
                 return True
             if key == "tab":
                 event.prevent_default()
                 event.stop()
-                app.toggle_btw_expanded()
+                app_any.toggle_btw_expanded()
                 return True
             if key == "left":
                 event.prevent_default()
                 event.stop()
-                app.navigate_btw(-1)
+                app_any.navigate_btw(-1)
                 return True
             if key == "right":
                 event.prevent_default()
                 event.stop()
-                app.navigate_btw(1)
+                app_any.navigate_btw(1)
                 return True
 
         if key == "enter":

@@ -322,3 +322,189 @@ def test_multi_replace_file_content_renderer():
     diff_lines = data.get("diff_lines", [])
     assert any("@@ -10," in ln for ln in diff_lines)
     assert any("@@ -25," in ln for ln in diff_lines)
+
+
+def test_edit_file_renderer_computes_true_line_diff_with_context():
+    """Verify EditFileRenderer diffs old_string vs new_string line-by-line rather than dumping all lines."""
+    from opscloud.ui.widgets.tool_renderers import EditFileRenderer
+    from opscloud.ui.widgets.tool_widgets import _count_diff_stats
+
+    old_block = "line 1\nline 2\nold_value = 1\nline 4\nline 5"
+    new_block = "line 1\nline 2\nnew_value = 2\nline 4\nline 5"
+    _widget_cls, data = EditFileRenderer.get_approval_widget(
+        {
+            "file_path": "config.py",
+            "old_string": old_block,
+            "new_string": new_block,
+            "StartLine": 10,
+        }
+    )
+    diff_lines = data["diff_lines"]
+    added, removed = _count_diff_stats(diff_lines, old_block, new_block)
+    assert added == 1
+    assert removed == 1
+    assert " line 1" in diff_lines
+    assert "-old_value = 1" in diff_lines
+    assert "+new_value = 2" in diff_lines
+
+
+def test_compute_line_diff_folds_distant_unchanged_lines():
+    """Verify compute_line_diff keeps 3 context lines and folds larger gaps into hidden markers."""
+    from opscloud.ui.widgets.diff import compute_line_diff
+
+    old_lines = [f"ctx {i}" for i in range(1, 15)]
+    new_lines = list(old_lines)
+    new_lines[0] = "changed 1"
+    new_lines[-1] = "changed 14"
+
+    diff_lines = compute_line_diff(
+        "\n".join(old_lines), "\n".join(new_lines), context_lines=3, start_line=1
+    )
+    added = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+    assert added == 2
+    assert removed == 2
+    assert any("lines hidden @@" in ln for ln in diff_lines)
+
+
+def test_format_file_diff_header_and_render_diff_content_truncation():
+    """Verify header format (<path>  +N -M) and 33-line truncation footer (f for full diff)."""
+    from opscloud.ui.widgets.diff import format_file_diff_header, render_diff_content
+
+    diff_lines = ["@@ -1,40 +1,40 @@"] + [f"+added line {i}" for i in range(1, 41)]
+    header = format_file_diff_header("src/opscloud/app.py", additions=40, deletions=0)
+    assert "src/opscloud/app.py" in header.plain
+    assert "+40" in header.plain
+    assert "File:" not in header.plain
+
+    preview, remaining = render_diff_content("\n".join(diff_lines), max_lines=33, line_width=80)
+    assert remaining == 7
+    assert "… 7 more lines (f for full diff)" in preview.plain
+
+    expanded, remaining_exp = render_diff_content("\n".join(diff_lines), max_lines=None, line_width=80)
+    assert remaining_exp == 0
+    assert "more lines (f for full diff)" not in expanded.plain
+    assert "added line 40" in expanded.plain
+
+
+@pytest.mark.asyncio
+async def test_approval_menu_full_diff_toggle_and_auto_approve_hint():
+    """Verify pressing 'f' toggles full diff in ApprovalMenu and shift+tab hint is shown."""
+    from opscloud.ui.widgets.tool_widgets import EditFileApprovalWidget
+
+    old_str = "\n".join(f"line {i}" for i in range(1, 45))
+    new_str = "\n".join(f"modified {i}" for i in range(1, 45))
+    action_requests = [
+        {
+            "name": "edit_file",
+            "call_id": "call_diff_1",
+            "args": {
+                "file_path": "src/service.py",
+                "old_string": old_str,
+                "new_string": new_str,
+            },
+        }
+    ]
+    menu = ApprovalMenu(action_requests)
+    app = DummyApprovalMenuApp(menu)
+
+    async with app.run_test(size=(100, 45)) as pilot:
+        await pilot.pause()
+        edit_widget = menu.query_one(EditFileApprovalWidget)
+        assert edit_widget.has_expandable_diff is True
+        assert edit_widget._full_diff is False
+        assert "f full diff" in str(menu.border_subtitle)
+
+        # Toggle full diff via action_toggle_full_diff ('f' key)
+        menu.action_toggle_full_diff()
+        await pilot.pause()
+        assert edit_widget._full_diff is True
+
+        # Toggle back to compact preview
+        menu.action_toggle_full_diff()
+        await pilot.pause()
+        assert edit_widget._full_diff is False
+
+
+def test_tool_call_message_renders_diff_stats_and_diff_body_in_transcript():
+    """Verify ToolCallMessage header shows +N -M and body renders diff lines for edit_file."""
+    from opscloud.ui.widgets.messages import ToolCallMessage
+
+    msg = ToolCallMessage(
+        "edit_file",
+        {
+            "file_path": "src/main.py",
+            "old_string": "x = 1\ny = 2\n",
+            "new_string": "x = 1\ny = 3\nz = 4\n",
+        },
+    )
+    msg._status = "success"
+    header = msg._header_content()
+    assert "Edit" in header.plain
+    assert "src/main.py" in header.plain
+    assert "+2" in header.plain
+    assert "-1" in header.plain
+
+    formatted = msg._format_output("Successfully replaced 1 instance", is_preview=True)
+    assert "- y = 2" in formatted.content.plain
+    assert "+ y = 3" in formatted.content.plain
+    assert "+ z = 4" in formatted.content.plain
+
+
+@pytest.mark.asyncio
+async def test_write_and_edit_tools_collapse_under_forward_arrow_summary():
+    """Verify Write and Edit tools fold under a collapsible forward-arrow summary like Read."""
+    from opscloud.ui.widgets.messages import (
+        MessageList,
+        ToolCallMessage,
+        ToolGroupSummary,
+    )
+
+    class DummyMessagesApp(App[None]):
+        def compose(self) -> ComposeResult:
+            yield MessageList(id="messages")
+
+    app = DummyMessagesApp()
+    async with app.run_test(size=(100, 40)) as pilot:
+        messages = app.query_one("#messages", MessageList)
+
+        messages.add_tool_call(
+            "write_file",
+            "call_write_1",
+            {"file_path": "report.md", "content": "# Audit Report\nLine 2\n"},
+            live=True,
+        )
+        # Simulate interrupt boundary closing active group while tool is still pending
+        await messages.regroup_completed_tools()
+        # Simulate tool completion after approval
+        messages.update_tool_result("call_write_1", "Wrote 2 lines to report.md", success=True)
+        await messages.regroup_completed_tools()
+        await pilot.pause()
+
+        summaries = list(messages.query(ToolGroupSummary))
+        tool_rows = list(messages.query(ToolCallMessage))
+        assert len(summaries) == 1
+        assert len(tool_rows) == 1
+
+        summary = summaries[0]
+        tool_row = tool_rows[0]
+
+        # By default after completion, the summary shows the forward arrow (▸) and hides the tool row
+        assert summary._collapsed is True
+        assert tool_row.display is False
+        assert "▸ Wrote 1 file" in str(summary.content)
+
+        # Clicking/toggling the forward arrow expands the group to show the tool and its diff
+        summary.toggle()
+        await pilot.pause()
+        assert summary._collapsed is False
+        assert tool_row.display is True
+        assert "▾ Wrote 1 file" in str(summary.content)
+
+        # Toggling again collapses the tool back behind the forward arrow
+        summary.toggle()
+        await pilot.pause()
+        assert summary._collapsed is True
+        assert tool_row.display is False
+
+

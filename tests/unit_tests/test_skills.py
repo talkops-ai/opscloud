@@ -267,14 +267,20 @@ def test_build_skill_invocation_envelope():
         "description": "Fix ECS crashloops",
         "source": "user",
     }
-    content = "Follow step 1, step 2"
+    content = "---\nname: ecs-remediate\ndescription: Fix ECS crashloops\n---\nFollow step 1, step 2"
     envelope = build_skill_invocation_envelope(skill, content, args="cluster=prod")
 
     assert envelope.skill_name == "ecs-remediate"
     assert "I'm invoking the skill `ecs-remediate`." in envelope.prompt
-    assert "Follow step 1, step 2" in envelope.prompt
+    assert (
+        "<SKILL>The user has explicitly invoked the (ecs-remediate) skill. "
+        "You must strictly follow the instructions in this skill to process their request. "
+        "Here are its contents:\nFollow step 1, step 2</SKILL>"
+    ) in envelope.prompt
     assert "**User request:** cluster=prod" in envelope.prompt
     assert envelope.message_kwargs["additional_kwargs"]["__skill"]["args"] == "cluster=prod"
+    assert envelope.message_kwargs["additional_kwargs"]["__skill"]["slash_command"] == "/ecs-remediate"
+    assert envelope.message_kwargs["additional_kwargs"]["__skill"]["kind"] == "SLASH_COMMAND_KIND_SKILL"
 
 
 def test_parse_skill_command():
@@ -286,9 +292,53 @@ def test_parse_skill_command():
     assert name == "eks-debug"
     assert args == ""
 
+    name, args = parse_skill_command("/chrome-devtools-plugin:a11y-debugging check login page")
+    assert name == "chrome-devtools-plugin:a11y-debugging"
+    assert args == "check login page"
+
+    name, args = parse_skill_command("/reverse-engineer-anything")
+    assert name == "reverse-engineer-anything"
+    assert args == ""
+
+    name, args = parse_skill_command("/skill eks-debug check pods")
+    assert name == "eks-debug"
+    assert args == "check pods"
+
     name, args = parse_skill_command("not a skill command")
     assert name == ""
     assert args == ""
+
+
+def test_format_and_match_plugin_skills():
+    from opscloud.skills.invocation import format_skill_slash_name, match_discovered_skill
+
+    aws_skill = {
+        "name": "aws-core@agent-toolkit-for-aws:signing-in-to-aws",
+        "description": "Sign in to AWS",
+        "source": "plugin",
+        "plugin_id": "aws-core@agent-toolkit-for-aws",
+    }
+    devtools_skill = {
+        "name": "chrome-devtools-plugin@default:chrome-devtools-plugin:a11y-debugging",
+        "description": "Accessibility debugging",
+        "source": "plugin",
+    }
+    user_skill = {
+        "name": "reverse-engineer-anything",
+        "description": "Reverse engineer binaries",
+        "source": "user",
+    }
+
+    assert format_skill_slash_name(aws_skill) == "aws-core:signing-in-to-aws"
+    assert format_skill_slash_name(devtools_skill) == "chrome-devtools-plugin:a11y-debugging"
+    assert format_skill_slash_name(user_skill) == "reverse-engineer-anything"
+
+    skills = [aws_skill, devtools_skill, user_skill]
+    assert match_discovered_skill(skills, "/aws-core:signing-in-to-aws") is aws_skill
+    assert match_discovered_skill(skills, "aws-core@agent-toolkit-for-aws:signing-in-to-aws") is aws_skill
+    assert match_discovered_skill(skills, "signing-in-to-aws") is aws_skill
+    assert match_discovered_skill(skills, "/chrome-devtools-plugin:a11y-debugging") is devtools_skill
+    assert match_discovered_skill(skills, "/reverse-engineer-anything") is user_skill
 
 
 # ── CLI Commands Tests ───────────────────────────────────────────────────────
@@ -466,5 +516,123 @@ Body text goes here.
     assert msg._expanded is True
     msg.toggle_body()
     assert msg._expanded is False
+
+
+def test_plugin_skill_envelope_and_adapter_stream_input():
+    from opscloud.ui.textual_adapter import TextualAdapter
+
+    skill = {
+        "name": "aws-core@agent-toolkit-for-aws:signing-in-to-aws",
+        "description": "Use when CLI/SDK commands fail with missing credentials.",
+        "source": "plugin",
+        "plugin_id": "aws-core@agent-toolkit-for-aws",
+        "path": "/tmp/plugins/aws-core/skills/signing-in-to-aws/SKILL.md",
+    }
+    raw_md = (
+        "---\n"
+        "name: signing-in-to-aws\n"
+        "description: Use when CLI/SDK commands fail\n"
+        "---\n"
+        "# Sign In — Get CLI/SDK Credentials\n\n"
+        "Install `@aws-sdk/client-sts` if needed."
+    )
+    envelope = build_skill_invocation_envelope(skill, raw_md, args="")
+
+    assert "I'm invoking the skill `aws-core:signing-in-to-aws`." in envelope.prompt
+    assert "aws-core@agent-toolkit-for-aws" not in envelope.prompt
+    assert (
+        "<SKILL>The user has explicitly invoked the (aws-core:signing-in-to-aws) skill. "
+        "You must strictly follow the instructions in this skill to process their request. "
+        "Here are its contents:\n# Sign In — Get CLI/SDK Credentials\n\n"
+        "Install `@aws-sdk/client-sts` if needed.</SKILL>"
+    ) in envelope.prompt
+    assert "Skill directory on disk: `/tmp/plugins/aws-core/skills/signing-in-to-aws`" in envelope.prompt
+
+    adapter = TextualAdapter(client=None, assistant_id="agent")
+    input_msg, turn_id = adapter._prepare_stream_input(
+        envelope.prompt,
+        None,
+        message_kwargs=envelope.message_kwargs,
+    )
+    assert turn_id is not None
+    human_msg = input_msg["messages"][0]
+    assert human_msg.content == envelope.prompt
+    assert "__skill" in human_msg.additional_kwargs
+    assert human_msg.additional_kwargs["__skill"]["slash_command"] == "/aws-core:signing-in-to-aws"
+    assert human_msg.additional_kwargs["__skill"]["kind"] == "SLASH_COMMAND_KIND_SKILL"
+    assert (
+        human_msg.additional_kwargs["opscloud_user_prompt"]["literal_user_text"]
+        == "/aws-core:signing-in-to-aws"
+    )
+
+
+def test_lean_core_built_in_skills_registered() -> None:
+    """Verify only the lean core built-in skills (commit, remember, simplify, skill-creator) are shipped."""
+    built_in_dir = Path(__file__).resolve().parents[2] / "src" / "opscloud" / "built_in_skills"
+    skills = list_skills(built_in_skills_dir=built_in_dir)
+    names = {s["name"] for s in skills if s.get("source") == "built-in"}
+
+    expected = {
+        "commit",
+        "remember",
+        "simplify",
+        "skill-creator",
+    }
+    assert names == expected
+    for pruned in (
+        "batch",
+        "commit-push-pr",
+        "fewer-permission-prompts",
+        "init",
+        "pr",
+        "run",
+        "security-review",
+        "update-config",
+        "verify",
+        "verify-infra",
+        "incident-triage",
+        "simplify-iac",
+        "cost-audit",
+    ):
+        assert pruned not in names
+
+
+def test_skill_invocation_envelope_dynamic_precomputation(tmp_path: Path) -> None:
+    """Verify $ARGUMENTS, ${OPSCLOUD_SKILL_DIR}, and inline !`cmd` shell pre-computation in SKILL.md."""
+    skill_dir = tmp_path / "custom-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md_path = skill_dir / "SKILL.md"
+    raw_md = (
+        "---\n"
+        "name: custom-skill\n"
+        "description: Test dynamic skill expansion\n"
+        "---\n"
+        "Skill dir: ${OPSCLOUD_SKILL_DIR}\n"
+        "Inline output: !`printf 'hello-dynamic-skill'`\n"
+        "Target arg: $ARGUMENTS"
+    )
+    skill_md_path.write_text(raw_md, encoding="utf-8")
+
+    skill = {
+        "name": "custom-skill",
+        "description": "Test dynamic skill expansion",
+        "source": "user",
+        "path": str(skill_md_path),
+    }
+    envelope = build_skill_invocation_envelope(skill, raw_md, args="src/main.py")
+    assert f"Skill dir: {skill_dir}" in envelope.prompt
+    assert "Inline output: hello-dynamic-skill" in envelope.prompt
+    assert "Target arg: src/main.py" in envelope.prompt
+
+
+def test_skill_tool_resolves_built_in_skills() -> None:
+    """Verify the Skill tool resolves built-in skills such as simplify and verify."""
+    from opscloud.middleware.custom_commands import create_custom_command_skill_tool
+
+    skill_tool = create_custom_command_skill_tool()
+    output = skill_tool.invoke({"skill": "simplify", "args": "src/opscloud"})
+    assert "<command-name>/simplify</command-name>" in output
+    assert "Phase 1 — Review (4 cleanup angles)" in output
+    assert "src/opscloud" in output
 
 

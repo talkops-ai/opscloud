@@ -263,10 +263,10 @@ def test_mcp_discovery_from_files(tmp_path: Path) -> None:
     discovery = MCPDiscovery()
     configs = discovery.discover(project_root=tmp_path)
     assert "aws-cloudwatch" in configs
-    assert configs["aws-cloudwatch"]["command"] == "uvx"
-    assert configs["aws-cloudwatch"]["args"] == ["mcp-server-aws-cloudwatch"]
-    assert configs["aws-cloudwatch"]["source"] == "project"
-    assert configs["aws-cloudwatch"]["enabled"] is True
+    assert configs["aws-cloudwatch"].get("command") == "uvx"
+    assert configs["aws-cloudwatch"].get("args") == ["mcp-server-aws-cloudwatch"]
+    assert configs["aws-cloudwatch"].get("source") == "project"
+    assert configs["aws-cloudwatch"].get("enabled") is True
 
 
 def test_mcp_discovery_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,19 +328,21 @@ def test_mcp_discovery_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     configs = discovery.discover(project_root=project_dir)
 
     # Project wins for shared-server
-    assert configs["shared-server"]["command"] == "project-cmd"
-    assert configs["shared-server"]["env"]["REGION"] == "project-reg"
-    assert configs["shared-server"]["source"] == "project"
+    assert configs["shared-server"].get("command") == "project-cmd"
+    shared_env = configs["shared-server"].get("env")
+    assert shared_env is not None
+    assert shared_env["REGION"] == "project-reg"
+    assert configs["shared-server"].get("source") == "project"
 
     # All tiers are discovered
-    assert configs["global-only"]["command"] == "global-only-cmd"
-    assert configs["global-only"]["source"] == "global"
+    assert configs["global-only"].get("command") == "global-only-cmd"
+    assert configs["global-only"].get("source") == "global"
 
-    assert configs["user-only"]["command"] == "user-only-cmd"
-    assert configs["user-only"]["source"] == "user"
+    assert configs["user-only"].get("command") == "user-only-cmd"
+    assert configs["user-only"].get("source") == "user"
 
-    assert configs["project-only"]["command"] == "project-only-cmd"
-    assert configs["project-only"]["source"] == "project"
+    assert configs["project-only"].get("command") == "project-only-cmd"
+    assert configs["project-only"].get("source") == "project"
 
 
 def test_mcp_trust_store(tmp_path: Path) -> None:
@@ -737,3 +739,177 @@ async def test_transient_error_retry_safety() -> None:
 def test_run_mcp_command_cli() -> None:
     args = argparse.Namespace(action="list", json_output=True, probe=False)
     assert run_mcp_command(args) == 0
+
+
+def test_write_and_read_mcp_server_state_materializes_and_prunes(tmp_path: Path) -> None:
+    """Verify write_mcp_server_state atomically writes <tool>.json files and prunes stale ones."""
+    from opscloud.mcp.preload import read_mcp_tool_schema, write_mcp_server_state
+
+    server_dir = tmp_path / "aws-ec2"
+    server_dir.mkdir(parents=True)
+    stale_file = server_dir / "old_removed_tool.json"
+    stale_file.write_text("{}", encoding="utf-8")
+
+    info = MCPServerInfo(
+        name="aws-ec2",
+        transport="stdio",
+        status="ok",
+        tools=(
+            MCPToolInfo(
+                name="aws-ec2:describe_instances",
+                original_name="describe_instances",
+                description="Describe EC2 instances",
+                input_schema={"type": "object", "properties": {"region": {"type": "string"}}},
+            ),
+            MCPToolInfo(
+                name="aws-ec2:terminate_instances",
+                original_name="terminate_instances",
+                description="Terminate EC2 instances",
+                input_schema={"type": "object", "required": ["instance_ids"]},
+            ),
+        ),
+    )
+
+    out_dir = write_mcp_server_state(info, state_dir=tmp_path)
+    assert out_dir == server_dir
+    assert not stale_file.exists()
+    assert (server_dir / "describe_instances.json").is_file()
+    assert (server_dir / "terminate_instances.json").is_file()
+
+    schema = read_mcp_tool_schema("aws-ec2", "describe_instances", state_dir=tmp_path)
+    assert schema is not None
+    assert schema["name"] == "describe_instances"
+    assert schema["qualified_name"] == "aws-ec2:describe_instances"
+    assert schema["parameters"]["properties"]["region"]["type"] == "string"
+
+
+@pytest.mark.asyncio
+async def test_lazy_mcp_tools_split_and_call_mcp_tool_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Eager/Lazy split binds eager tools directly and routes lazy tools via call_mcp_tool."""
+    from mcp.types import CallToolResult, TextContent
+    from opscloud.mcp.session_manager import (
+        build_mcp_tools_from_server_infos,
+        split_enabled_tools_by_eager_lazy,
+    )
+
+    monkeypatch.setenv("OPSCLOUD_MCP_SCHEMA_DIR", str(tmp_path))
+    monkeypatch.setenv("OPSCLOUD_LAZY_MCP_TOOLS", "1")
+
+    info = MCPServerInfo(
+        name="k8s-server",
+        transport="stdio",
+        status="ok",
+        tools=(
+            MCPToolInfo(
+                name="k8s-server:get_pods",
+                original_name="get_pods",
+                description="List pods",
+                input_schema={"type": "object", "properties": {"namespace": {"type": "string"}}},
+            ),
+            MCPToolInfo(
+                name="k8s-server:describe_node",
+                original_name="describe_node",
+                description="Describe node",
+                input_schema={
+                    "type": "object",
+                    "properties": {"node": {"type": "string"}, "optional_filter": {"type": "string"}},
+                    "required": ["node"],
+                },
+            ),
+        ),
+    )
+
+    srv_cfg = {"transport": "stdio", "command": "fake", "eager_tools": ["get_pods"]}
+    eager, lazy = split_enabled_tools_by_eager_lazy(info, srv_cfg)
+    assert [t.original_name for t in eager] == ["get_pods"]
+    assert [t.original_name for t in lazy] == ["describe_node"]
+
+    mock_session = AsyncMock()
+    mock_session.call_tool = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text="node-1 Ready")],
+            isError=False,
+        )
+    )
+    manager = MCPSessionManager({"k8s-server": srv_cfg})
+    manager.get_session = AsyncMock(return_value=mock_session)
+
+    tools = build_mcp_tools_from_server_infos([info], manager, configs={"k8s-server": srv_cfg})
+    tool_names = [t.name for t in tools]
+    assert "k8s-server:get_pods" in tool_names
+    assert "call_mcp_tool" in tool_names
+    assert "k8s-server:describe_node" not in tool_names
+
+    dispatcher = next(t for t in tools if t.name == "call_mcp_tool")
+    res = await dispatcher.ainvoke(
+        {
+            "server_name": "k8s-server",
+            "tool_name": "describe_node",
+            "arguments": {"node": "ip-10-0-1-1", "optional_filter": ""},
+        }
+    )
+    assert "node-1 Ready" in str(res)
+    # Empty string for optional_filter must be normalized away using the on-disk schema
+    mock_session.call_tool.assert_awaited_once_with("describe_node", {"node": "ip-10-0-1-1"})
+
+
+@pytest.mark.asyncio
+async def test_stdio_connect_server_redirects_errlog_away_from_stderr() -> None:
+    """Verify MCPSessionManager.connect_server passes non-stderr errlog to stdio_client."""
+    import sys
+
+    captured_errlog: list[ object] = []
+
+    mock_session = AsyncMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+
+    mock_session_ctx = AsyncMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    def _fake_stdio_client(server_params: object, errlog: object = sys.stderr) -> AsyncMock:
+        captured_errlog.append(errlog)
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    cfg = {"transport": "stdio", "command": "uvx", "args": ["awslabs.billing-mcp"], "enabled": True}
+    manager = MCPSessionManager({"billing": cfg})
+
+    with (
+        patch("mcp.client.stdio.stdio_client", side_effect=_fake_stdio_client),
+        patch("mcp.ClientSession", return_value=mock_session_ctx),
+    ):
+        ok = await manager.connect_server("billing", cfg)
+        assert ok is True
+        assert len(captured_errlog) == 1
+        assert captured_errlog[0] is not sys.stderr
+        await manager.cleanup()
+
+
+def test_truncated_subagent_tool_name_display_and_summary() -> None:
+    """Verify truncated 64-char subagent MCP tool names parse cleanly in TUI headers and summaries."""
+    from opscloud.ui.widgets.messages import summarize_tool_group
+    from opscloud.ui.widgets.tool_display import (
+        get_tool_display_name,
+        parse_scoped_tool_name,
+    )
+
+    srv_name = "subagent__aws-finops-agent_talkops-devops-plugins_a5270392__billing"
+    cost_explorer_name = _mcp_tool_name(srv_name, "cost-explorer")
+    cost_opt_name = _mcp_tool_name(srv_name, "cost-optimization")
+
+    assert parse_scoped_tool_name(cost_explorer_name) == ("cost-explorer", "aws-finops-agent")
+    assert parse_scoped_tool_name(cost_opt_name) == ("cost-optimization", "aws-finops-agent")
+    assert get_tool_display_name(cost_explorer_name) == "CostExplorer [aws-finops-agent]"
+
+    summary = summarize_tool_group([cost_explorer_name, cost_explorer_name, cost_opt_name])
+    assert "subagent__" not in summary
+    assert "Ran 2 cost-explorer calls [aws-finops-agent]" in summary
+    assert "ran 1 cost-optimization call [aws-finops-agent]" in summary
+

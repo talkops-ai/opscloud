@@ -56,7 +56,10 @@ def test_middleware_build_single():
 
 
 def test_repository_bounds_safe_path():
-    bounds = RepositoryBounds(backend=None, root="/workspace/project")
+    from typing import Any
+
+    none_backend: Any = None
+    bounds = RepositoryBounds(backend=none_backend, root="/workspace/project")
     assert bounds.root == "/workspace/project"
 
     # Valid child paths

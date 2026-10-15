@@ -35,7 +35,9 @@ def test_subagents_middleware():
     assert "`cve-scan`" in prompt_block_with_plugin
 
     # Test before_agent state injection
-    state_update = mw.before_agent({}, None)
+    empty_state: Any = {}
+    none_runtime: Any = None
+    state_update = mw.before_agent(empty_state, none_runtime)
     assert state_update is not None
     assert "_subagent_registry" in state_update
     assert "eks-specialist" in state_update["_subagent_registry"]
@@ -89,12 +91,12 @@ Analyze pod status and diagnose node health.
     assert parsed is not None
     assert parsed["name"] == "eks-operator"
     assert parsed["description"] == "Kubernetes and EKS cluster management specialist"
-    assert parsed["model"] == "anthropic:claude-3-5-sonnet-20241022"
-    assert parsed["skills"] == ["k8s-diag", "helm-ops"]
-    assert parsed["tools"] == ["kubectl", "helm", "read_file"]
-    assert parsed["permission_tier"] == "tier2"
-    assert parsed["capabilities"] == ["cluster_admin", "log_stream"]
-    assert parsed["mcp_config"] == {"k8s-mcp": {"command": "k8s-mcp-server"}}
+    assert parsed.get("model") == "anthropic:claude-3-5-sonnet-20241022"
+    assert parsed.get("skills") == ["k8s-diag", "helm-ops"]
+    assert parsed.get("tools") == ["kubectl", "helm", "read_file"]
+    assert parsed.get("permission_tier") == "tier2"
+    assert parsed.get("capabilities") == ["cluster_admin", "log_stream"]
+    assert parsed.get("mcp_config") == {"k8s-mcp": {"command": "k8s-mcp-server"}}
     assert "You are an expert Kubernetes cluster administrator." in parsed["system_prompt"]
     assert parsed["source"] == "custom"
     assert parsed["path"] == str(agent_file)
@@ -208,8 +210,8 @@ Authorization = "Bearer ${OPSCLOUD_AUTH_TOKEN}"
     assert secops["name"] == "remote_secops"
     assert secops["description"] == "Remote security compliance scanner"
     assert secops["graph_id"] == "secops-scanner"
-    assert secops["url"] == "https://cloud.internal/api/v1"
-    assert secops["headers"] == {"Authorization": "Bearer bearer-xyz123"}
+    assert secops.get("url") == "https://cloud.internal/api/v1"
+    assert secops.get("headers") == {"Authorization": "Bearer bearer-xyz123"}
 
 
 def test_subagent_panel_header_meta_parts():
@@ -365,7 +367,7 @@ def test_subagent_cost_transfers_empty_scope():
     root_mw = CostTrackingMiddleware(nested=False)
 
     # Simulate nested subagent state with some cost and tokens
-    subagent_state = {
+    subagent_state: Any = {
         "_session_cost_usd": 0.15,
         "_session_total_tokens": 12000,
     }
@@ -388,7 +390,7 @@ def test_subagent_cost_transfers_empty_scope():
     assert entry["owner_scope"] == ""
 
     # Now verify root charges and claims the transfer
-    root_state = {
+    root_state: Any = {
         "_session_cost_transfers": transfers,
         "_session_cost_usd": 0.05,
         "_session_total_tokens": 500,
@@ -433,7 +435,7 @@ def test_subagent_telemetry_middleware_wrap_tool_call():
 
     called = False
 
-    def dummy_handler(req):
+    def dummy_handler(req: Any) -> Any:
         nonlocal called
         called = True
         return "tool_result"
@@ -469,7 +471,7 @@ def test_subagent_telemetry_middleware_wrap_model_call():
 
     called = False
 
-    def dummy_handler(req):
+    def dummy_handler(req: Any) -> Any:
         nonlocal called
         called = True
         return "model_response"
@@ -495,7 +497,7 @@ def test_subagent_transcript_config_thread_id_binding():
     call.name = "task"
     call.id = "call_abc123"
 
-    config = {
+    config: Any = {
         "configurable": {"thread_id": "thread-main-777"},
         "metadata": {"some_key": "val"},
     }
@@ -503,7 +505,7 @@ def test_subagent_transcript_config_thread_id_binding():
     assert ACTIVE_SESSION_THREAD_ID.get() is None
 
     with _subagent_transcript_config(call, config):
-        child_cfg = var_child_runnable_config.get()
+        child_cfg: Any = var_child_runnable_config.get()
         assert child_cfg is not None
         assert child_cfg["metadata"]["subagent_transcript_id"] == "call_abc123"
         assert child_cfg["metadata"]["thread_id"] == "thread-main-777"
@@ -546,7 +548,7 @@ def test_subagent_transcript_config_js_eval():
     call.name = "js_eval"
     call.id = "eval_call_456"
 
-    config = {
+    config: Any = {
         "configurable": {"thread_id": "thread-eval-999"},
         "metadata": {"some_key": "val"},
     }
@@ -554,7 +556,7 @@ def test_subagent_transcript_config_js_eval():
     assert ACTIVE_SESSION_THREAD_ID.get() is None
 
     with _subagent_transcript_config(call, config):
-        child_cfg = var_child_runnable_config.get()
+        child_cfg: Any = var_child_runnable_config.get()
         assert child_cfg is not None
         assert child_cfg["metadata"]["subagent_transcript_id"] == "eval_call_456"
         assert child_cfg["metadata"]["thread_id"] == "thread-eval-999"
@@ -659,7 +661,7 @@ def test_pending_thread_transfers_bridge_to_charge():
     runtime.stream_writer = MagicMock()
 
     # State with NO _session_cost_transfers (simulating dropped state from js_eval)
-    state: dict[str, Any] = {
+    state: Any = {
         "messages": [],
         "_session_cost_usd": 0.05,
         "_session_total_tokens": 10000,

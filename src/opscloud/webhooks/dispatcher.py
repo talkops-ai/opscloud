@@ -306,8 +306,9 @@ async def default_langgraph_run_executor(
     error_msg = str(error_obj.get("message") or error_obj) if isinstance(error_obj, dict) else (str(error_obj) if error_obj else None)
 
     state = await client.threads.get_state(lg_thread_id)
-    values = state.get("values") if isinstance(state, dict) else None
-    if isinstance(values, dict) and isinstance(values.get("messages"), list):
+    raw_values = state.get("values") if isinstance(state, dict) else None
+    values: dict[str, Any] | None = raw_values if isinstance(raw_values, dict) else None
+    if values is not None and isinstance(values.get("messages"), list):
         _log_messages_tool_activity(
             values["messages"],
             run_id=run_id,

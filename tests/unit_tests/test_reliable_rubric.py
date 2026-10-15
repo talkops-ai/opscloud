@@ -36,7 +36,9 @@ def test_without_internal_control_messages():
     ai_msg = AIMessage(content="Checking configuration now...")
     tool_msg = ToolMessage(content="aws sts get-caller-identity returned ok", tool_call_id="call_1")
 
-    state = {
+    from typing import Any
+
+    state: Any = {
         "messages": [human_msg, control_msg, ai_msg, tool_msg],
         "rubric": "- Ensure least privilege",
     }
@@ -68,11 +70,13 @@ def test_reliable_rubric_stream_event_emission():
 
 
 def test_reliable_rubric_grader_input_signature_and_correction():
+    from typing import Any
+
     middleware = ReliableRubricMiddleware(
         model="anthropic:claude-3-5-haiku-20241022",
         max_iterations=2,
     )
-    state = {
+    state: Any = {
         "messages": [HumanMessage(content="test")],
         "rubric": "1. Must pass lint",
         "_current_grading_run_id": "run-42",

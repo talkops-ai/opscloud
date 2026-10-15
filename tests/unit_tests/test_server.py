@@ -460,3 +460,106 @@ def test_concurrent_same_port_and_free_port_toctou_resilience():
     for p in procs:
         assert str(p.port) in str(p.runtime_dir)
         p.stop()
+
+
+@pytest.mark.asyncio
+async def test_in_process_server_handle_and_agent_lifecycle(tmp_path: Path):
+    """Verify start_server_and_get_agent uses InProcessServerHandle by default without spawning a subprocess."""
+    from langchain_core.messages import AIMessageChunk
+    from opscloud.cli.server_manager import InProcessServerHandle, start_server_and_get_agent
+    from opscloud.server.server_graph import ServerRuntime
+    from opscloud.ui.remote_client import InProcessAgent
+
+    fake_graph = MagicMock()
+
+    async def _fake_astream(input_data, **kwargs):
+        del input_data, kwargs
+        yield ((), "messages", (AIMessageChunk(content="Hello in-process!"), {"run_id": "run-inproc-1"}))
+
+    fake_graph.astream = _fake_astream
+    fake_graph.aget_state = AsyncMock(return_value=MagicMock(values={"messages": []}))
+    fake_graph.aupdate_state = AsyncMock(return_value=None)
+
+    fake_runtime = ServerRuntime(agent=fake_graph, backend=MagicMock())
+
+    with (
+        patch(
+            "opscloud.server.server_graph._build_default_runtime_async",
+            new_callable=AsyncMock,
+            return_value=fake_runtime,
+        ) as mock_build_runtime,
+        patch(
+            "opscloud.state.session.get_db_path",
+            return_value=tmp_path / "sessions.db",
+        ),
+    ):
+        client, handle = await start_server_and_get_agent(cwd=tmp_path)
+
+        assert isinstance(handle, InProcessServerHandle)
+        assert handle.is_in_process is True
+        assert handle.process is None
+        assert isinstance(client, InProcessAgent)
+        assert client.is_in_process is True
+        mock_build_runtime.assert_awaited_once()
+
+        chunks = []
+        async for ns, mode, data in client.astream(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            config={
+                "configurable": {
+                    "thread_id": "11111111-2222-3333-4444-555555555555",
+                    "approval_mode": "auto",
+                }
+            },
+            context={
+                "working_dir": str(tmp_path),
+                "cwd": str(tmp_path),
+                "workspace": {"cwd": str(tmp_path)},
+                "interactive": True,
+                "custom_field": "ok",
+            },
+        ):
+            chunks.append((ns, mode, data))
+
+        assert len(chunks) == 1
+        assert chunks[0][1] == "messages"
+        assert chunks[0][2][0].content == "Hello in-process!"
+
+        # Also verify LangGraph's _coerce_context directly with CLIContextSchema and dict containing working_dir
+        from langgraph.pregel.main import _coerce_context
+        from langgraph.types import Interrupt
+        from opscloud.agent.config import CLIContextSchema
+        from opscloud.ui.remote_client import _convert_interrupts
+        from opscloud.ui.textual_adapter import TextualAdapter
+
+        coerced = _coerce_context(
+            CLIContextSchema,
+            {"working_dir": "/tmp/work", "interactive": True, "unknown_key": 123},
+        )
+        assert isinstance(coerced, CLIContextSchema)
+        assert coerced.cwd == "/tmp/work"
+        assert coerced.working_dir == "/tmp/work"
+        assert coerced.get("unknown_key") == 123
+
+        # Verify in-process Pregel tuple of Interrupts is flattened so HITL prompts are never skipped
+        tuple_interrupts = (
+            Interrupt(
+                value={"action_requests": [{"name": "execute", "args": {"command": "date -u"}}]},
+                id="int-tuple-1",
+            ),
+        )
+        converted_ints = _convert_interrupts(tuple_interrupts)
+        assert len(converted_ints) == 1
+        assert isinstance(converted_ints[0], Interrupt)
+        assert converted_ints[0].id == "int-tuple-1"
+
+        from typing import Any
+
+        adapter = TextualAdapter.__new__(TextualAdapter)
+        pending: dict[str, Any] = {}
+        adapter._handle_updates_stream_event({"__interrupt__": converted_ints}, pending)
+        assert "int-tuple-1" in pending
+        assert pending["int-tuple-1"]["action_requests"][0]["name"] == "execute"
+
+        await handle.astop()
+

@@ -109,7 +109,10 @@ def _is_auto_mode_classifier_chunk(metadata: dict[str, Any] | None) -> bool:
     """
     if metadata is None:
         return False
-    return metadata.get("lc_source") == "auto_mode_classifier"
+    return metadata.get("lc_source") in {
+        "auto_mode_classifier",
+        "conversation_title_generator",
+    }
 
 
 def _format_rubric_event(data: dict[str, Any]) -> str | None:

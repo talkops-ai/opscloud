@@ -38,7 +38,7 @@ class GoalState:
     def __init__(self) -> None:
         # ── Goal fields ──────────────────────────────────
         self.objective: str | None = None
-        self.status: GoalStatus | None = None
+        self.status: GoalStatus | str | None = None
         self.rubric: str | None = None
         self.pending_rubric: str | None = None
         self.pending_objective: str | None = None

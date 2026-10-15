@@ -342,6 +342,18 @@ def _build_console_handler(level: int, is_json: bool) -> logging.StreamHandler:
     return handler
 
 
+class _GoogleGenAiAfcNoiseFilter(logging.Filter):
+    """Suppress false-positive google-genai AFC messages when called via LangChain."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "Direct use of automatic function calling (AFC)" in msg:
+            return False
+        if "AFC is enabled with max remote calls:" in msg:
+            return False
+        return True
+
+
 def _apply_handlers(py_logger: logging.Logger) -> None:
     """Synchronize a python Logger instance with the global active handlers."""
     py_logger.handlers.clear()
@@ -430,8 +442,12 @@ def configure_logging(
         else:
             logging.lastResort = logging.NullHandler()  # type: ignore[assignment]
 
-        for ext_name in ("py.warnings", "mcp", "httpx", "httpcore", "asyncio"):
+        for ext_name in ("py.warnings", "mcp", "httpx", "httpcore", "asyncio", "google_genai.models"):
             _apply_handlers(logging.getLogger(ext_name))
+
+        genai_logger = logging.getLogger("google_genai.models")
+        if not any(isinstance(f, _GoogleGenAiAfcNoiseFilter) for f in genai_logger.filters):
+            genai_logger.addFilter(_GoogleGenAiAfcNoiseFilter())
 
         # Re-apply updated handlers to all active registered loggers
         for item in _active_loggers.values():

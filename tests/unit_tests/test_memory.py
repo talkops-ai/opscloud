@@ -40,19 +40,21 @@ def test_memory_registry_scopes(tmp_path: Path):
 
 
 def test_managed_memory_guard(tmp_path: Path):
+    from typing import Any
+
     guarded_file = tmp_path / "AGENTS.md"
     guarded_file.touch()
 
     guard = ManagedMemoryGuardMiddleware(guarded_paths=[guarded_file])
 
     # Attempt to write to guarded file
-    bad_req = SimpleNamespace(
+    bad_req: Any = SimpleNamespace(
         tool_call={"name": "write_file", "args": {"file_path": str(guarded_file)}}
     )
     assert guard._guarded_path(bad_req) == guarded_file.resolve()
 
     # Attempt to write to non-guarded file
-    safe_req = SimpleNamespace(
+    safe_req: Any = SimpleNamespace(
         tool_call={"name": "write_file", "args": {"file_path": str(tmp_path / "normal.txt")}}
     )
     assert guard._guarded_path(safe_req) is None

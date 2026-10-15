@@ -8,9 +8,7 @@ activated path-conditional commands, and forked subagent turn recursion guards.
 from __future__ import annotations
 
 from typing import Annotated, Any, NotRequired
-from typing_extensions import TypedDict
-
-from langchain.agents.middleware.types import PrivateStateAttr
+from langchain.agents.middleware.types import AgentState, PrivateStateAttr
 
 
 def _merge_invoked_commands(
@@ -25,7 +23,7 @@ def _merge_invoked_commands(
     return {**existing, **new}
 
 
-class CustomCommandChannels(TypedDict):
+class CustomCommandChannels(AgentState):
     """TypedDict mixin for custom command state in `OpsCloudAgentState`."""
 
     custom_command_request: NotRequired[dict[str, Any] | None]

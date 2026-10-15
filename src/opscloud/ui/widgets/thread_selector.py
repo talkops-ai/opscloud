@@ -261,17 +261,24 @@ class ThreadSelectorScreen(OpsModalScreen[str | None]):
         return 82
 
     def _build_options(self) -> list[Option]:
+        from opscloud.state.conversation_title import get_thread_display_label
+
         width = self._get_row_width()
         options = [Option("+ Start New Thread", id="__new__")]
         for idx, t in enumerate(self._threads, start=1):
             tid = t.get("thread_id", "unknown")
             msg_cnt = t.get("message_count", 0)
-            init_prompt = (t.get("initial_prompt") or "(No initial prompt)").replace("\n", " ")
+            init_prompt = get_thread_display_label(t, fallback="(No initial prompt)")
+            raw_prompt = (t.get("initial_prompt") or "").replace("\n", " ")
 
-            # Apply filter query
+            # Apply filter query across thread ID, generated title, and initial prompt
             if self._filter_query:
                 q = self._filter_query.lower()
-                if q not in tid.lower() and q not in init_prompt.lower():
+                if (
+                    q not in tid.lower()
+                    and q not in init_prompt.lower()
+                    and q not in raw_prompt.lower()
+                ):
                     continue
 
             is_curr = " [bold $success](active)[/bold $success]" if tid == self._current_thread_id else ""

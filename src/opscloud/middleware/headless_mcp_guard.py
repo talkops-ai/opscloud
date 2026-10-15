@@ -67,13 +67,12 @@ class HeadlessMCPGuardMiddleware(HumanInTheLoopMiddleware[AgentState[Any], Any, 
                 if qualified in self._tool_names or target_tool in self._tool_names:
                     blocked = True
                 elif target_tool:
-                    from opscloud.mcp.profiler import MCPSemanticProfiler
+                    from opscloud.mcp.semantic_profiler import MCPSemanticProfiler
 
-                    profile = MCPSemanticProfiler.get_instance().profile_tool(
+                    profiler = MCPSemanticProfiler.get_instance()
+                    profile = profiler.get_profile(srv, target_tool) or profiler.heuristic_profile(
                         target_tool,
-                        "",
-                        None,
-                        None,
+                        server_name=srv,
                     )
                     if not (profile.read_only_hint and not profile.destructive_hint):
                         blocked = True

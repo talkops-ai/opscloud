@@ -246,12 +246,14 @@ async def test_tui_action_uninstall_integration(isolated_plugin_env: Path) -> No
         screen._selected_plugin = row
 
         # Simulate clicking uninstall action
+        from typing import Any
         from textual.widgets._option_list import Option
         class DummyOptionSelected:
             option_id = "action:uninstall"
             option = Option("Uninstall", id="action:uninstall")
 
-        await screen.on_option_list_option_selected(DummyOptionSelected())
+        ev1: Any = DummyOptionSelected()
+        await screen.on_option_list_option_selected(ev1)
         await pilot.pause()
 
         # Verify status reports uninstalled
@@ -302,12 +304,14 @@ async def test_tui_action_uninstall_cross_project_preservation(
         await pilot.pause()
         screen._selected_plugin = installed_rows[0]
 
+        from typing import Any
         from textual.widgets._option_list import Option
 
         class DummyOptionSelected:
             option = Option("Uninstall", id="action:uninstall")
 
-        await screen.on_option_list_option_selected(DummyOptionSelected())
+        ev2: Any = DummyOptionSelected()
+        await screen.on_option_list_option_selected(ev2)
         await pilot.pause()
 
         assert "Uninstalled" in (screen._status or "")

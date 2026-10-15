@@ -248,3 +248,64 @@ async def test_session_manager_maintain_database_lease_contention(tmp_path):
             assert busy_res["performed"] is False
             assert busy_res["reason"] == "lease_busy"
             fcntl.flock(lock_fp, fcntl.LOCK_UN)
+
+
+@pytest.mark.asyncio
+async def test_checkpointer_aprune_agent_session_namespaces_and_resolved_interrupts():
+    """Verify aprune drops AgentSessionMiddleware namespaces and resolved HITL interrupts."""
+    async with OpsCloudCheckpointer.from_conn_string(":memory:") as saver:
+        await saver.setup()
+        # 1. Historical root checkpoint with a RESOLVED interrupt (__interrupt__ + __resume__)
+        cfg_resolved_hitl: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-bloat",
+                "checkpoint_ns": "",
+                "checkpoint_id": "cp-root-001",
+            }
+        }
+        stored_root_1 = await saver.aput(cfg_resolved_hitl, _make_checkpoint("cp-root-001"), cast(CheckpointMetadata, {}), {})
+        await saver.aput_writes(stored_root_1, [("__interrupt__", {"approval": True})], task_id="task-hitl")
+        await saver.aput_writes(stored_root_1, [("__resume__", {"type": "approve"})], task_id="task-resume")
+
+        # 2. Historical root checkpoint with a RESOLVED interrupt via branch:to:*
+        cfg_branched_hitl: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-bloat",
+                "checkpoint_ns": "",
+                "checkpoint_id": "cp-root-002",
+            }
+        }
+        stored_root_2 = await saver.aput(cfg_branched_hitl, _make_checkpoint("cp-root-002"), cast(CheckpointMetadata, {}), {})
+        await saver.aput_writes(stored_root_2, [("__interrupt__", {"approval": True})], task_id="task-hitl-2")
+        await saver.aput_writes(stored_root_2, [("branch:to:model", None)], task_id="task-branch-2")
+
+        # 3. Latest root checkpoint
+        cfg_latest: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-bloat",
+                "checkpoint_ns": "",
+                "checkpoint_id": "cp-root-003",
+            }
+        }
+        await saver.aput(cfg_latest, _make_checkpoint("cp-root-003"), cast(CheckpointMetadata, {}), {})
+
+        # 4. Orphaned AgentSessionMiddleware subgraph checkpoint
+        cfg_agent_ns: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-bloat",
+                "checkpoint_ns": "AgentSessionMiddleware.before_agent:abc123",
+                "checkpoint_id": "cp-agent-001",
+            }
+        }
+        await saver.aput(cfg_agent_ns, _make_checkpoint("cp-agent-001"), cast(CheckpointMetadata, {}), {})
+
+        await saver.aprune(["thread-bloat"], strategy="keep_latest", prune_subagents=True)
+
+        # Resolved interrupt checkpoints must be pruned
+        assert await saver.aget_tuple(cfg_resolved_hitl) is None
+        assert await saver.aget_tuple(cfg_branched_hitl) is None
+        # Latest root checkpoint must remain
+        assert await saver.aget_tuple(cfg_latest) is not None
+        # Orphaned AgentSessionMiddleware namespace must be pruned
+        assert await saver.aget_tuple(cfg_agent_ns) is None
+

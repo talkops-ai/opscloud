@@ -408,13 +408,16 @@ class TestHooksConfigModels:
 
     def test_command_handler_spec_validation(self) -> None:
         """Verify CommandHandlerSpec parses command, argv, and timeout."""
-        spec = CommandHandlerSpec(
-            type="command",
-            command="audit_aws.sh",
-            argv=["audit_aws.sh", "--verbose"],
-            timeout=10.0,
-            status_message="Running AWS audit hook",
-        )
+        from typing import Any
+
+        spec_kwargs: dict[str, Any] = {
+            "type": "command",
+            "command": "audit_aws.sh",
+            "argv": ["audit_aws.sh", "--verbose"],
+            "timeout": 10.0,
+            "status_message": "Running AWS audit hook",
+        }
+        spec = CommandHandlerSpec(**spec_kwargs)
         assert spec.type == "command"
         assert spec.command == "audit_aws.sh"
         assert spec.argv == ["audit_aws.sh", "--verbose"]

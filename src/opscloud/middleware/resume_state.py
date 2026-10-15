@@ -45,12 +45,92 @@ def _extract_context_tokens(message: AIMessage) -> int | None:
     return total or None
 
 
+def _extract_runtime_thread_and_model(
+    state: ResumeState,
+    runtime: Runtime[ContextT],
+) -> tuple[str | None, str, str | None]:
+    """Return ``(thread_id, checkpoint_ns, model_spec)`` from LangGraph runtime and state."""
+    execution_info = getattr(runtime, "execution_info", None)
+    thread_id = getattr(execution_info, "thread_id", None)
+    checkpoint_ns = getattr(execution_info, "checkpoint_ns", None) or ""
+
+    ctx = getattr(runtime, "context", None)
+    model_spec: str | None = None
+    if isinstance(ctx, dict):
+        if not thread_id:
+            tid = ctx.get("thread_id")
+            if isinstance(tid, str) and tid:
+                thread_id = tid
+        raw_model = ctx.get("model")
+        if isinstance(raw_model, str) and raw_model:
+            model_spec = raw_model
+
+    cfg = getattr(runtime, "config", None)
+    if isinstance(cfg, dict):
+        configurable = cfg.get("configurable")
+        if isinstance(configurable, dict):
+            if not thread_id:
+                tid = configurable.get("thread_id")
+                if isinstance(tid, str) and tid:
+                    thread_id = tid
+            if not checkpoint_ns:
+                c_ns = configurable.get("checkpoint_ns")
+                if isinstance(c_ns, str):
+                    checkpoint_ns = c_ns
+
+    if not model_spec:
+        state_spec = state.get("_model_spec")
+        if isinstance(state_spec, str) and state_spec:
+            model_spec = state_spec
+
+    return (
+        thread_id if isinstance(thread_id, str) and thread_id else None,
+        checkpoint_ns,
+        model_spec,
+    )
+
+
 @register_middleware(name="resume_state")
 class ResumeStateMiddleware(AgentMiddleware[ResumeState, ContextT]):
-    """Persists per-checkpoint resume facts after each model call."""
+    """Persists per-checkpoint resume facts and schedules first-turn thread title generation."""
 
     trace_policy = TracePolicy(process_inputs=omit_payload)
     state_schema = ResumeState
+
+    async def abefore_agent(
+        self,
+        state: ResumeState,
+        runtime: Runtime[ContextT],
+    ) -> dict[str, Any] | None:
+        """Schedule non-blocking conversation title generation on the first turn of a main thread.
+
+        Mirrors ``(*CascadeManager).maybeGenerateConversationTitle`` (0x101d812a0):
+        - Only runs on the first turn (no prior ``AIMessage`` in state).
+        - Only runs on root conversation trajectories (``checkpoint_ns == ""``).
+        - Skips non-conversational background requests (e.g. ``goal_criteria_request``).
+        """
+        if state.get("goal_criteria_request"):
+            return None
+
+        messages = list(state.get("messages") or [])
+        if not messages or any(isinstance(m, AIMessage) for m in messages):
+            return None
+
+        thread_id, checkpoint_ns, model_spec = _extract_runtime_thread_and_model(state, runtime)
+        if not thread_id or checkpoint_ns:
+            return None
+
+        from opscloud.state.conversation_title import schedule_conversation_title_generation
+        from opscloud.state.session import _initial_prompt_from_messages
+
+        initial_prompt = _initial_prompt_from_messages(messages)
+        if initial_prompt:
+            schedule_conversation_title_generation(
+                thread_id,
+                initial_prompt,
+                model_spec=model_spec,
+            )
+        return None
 
     def after_model(
         self,

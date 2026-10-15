@@ -200,9 +200,10 @@ class CommandRouter:
 
         if handler is None:
             skill_handler = self._handlers.get("/skill:")
-            if skill_handler is not None and hasattr(skill_handler, "_resolve_skill"):
+            resolve_skill_fn = getattr(skill_handler, "_resolve_skill", None)
+            if callable(resolve_skill_fn):
                 try:
-                    if skill_handler._resolve_skill(ctx, cmd_name.lstrip("/")):
+                    if resolve_skill_fn(ctx, cmd_name.lstrip("/")):
                         handler = skill_handler
                 except Exception:
                     pass

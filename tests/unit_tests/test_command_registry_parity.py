@@ -27,7 +27,7 @@ def test_command_descriptors_match_discovered_handlers() -> None:
     handlers = {handler.name for handler in discover_command_handlers()}
 
     assert descriptors == handlers
-    assert len(descriptors) == 51
+    assert len(descriptors) == 50
 
 
 def test_aliases_parity() -> None:
@@ -111,14 +111,10 @@ def test_get_command_resolution() -> None:
     assert get_command("/aws") is not None
     assert get_command("/aws").name == "/cloud"  # type: ignore
 
-    # Prefix resolution for dynamic skills & workflows
+    # Prefix resolution for dynamic skills & agents
     skill_desc = get_command("/skill:my-custom-skill")
     assert skill_desc is not None
     assert skill_desc.name == "/skill:"
-
-    wf_desc = get_command("/workflow:my-flow")
-    assert wf_desc is not None
-    assert wf_desc.name == "/workflow:"
 
     agent_desc = get_command("/agent:my-agent")
     assert agent_desc is not None

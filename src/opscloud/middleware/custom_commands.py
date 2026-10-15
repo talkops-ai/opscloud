@@ -397,7 +397,8 @@ class CustomCommandsMiddleware(AgentMiddleware):
 
     def _prepare_model_request(self, request: ModelRequest) -> ModelRequest:
         state = request.state if isinstance(request.state, Mapping) else {}
-        perms = state.get("_active_command_permissions") or {}
+        raw_perms = state.get("_active_command_permissions")
+        perms: Mapping[str, Any] = raw_perms if isinstance(raw_perms, Mapping) else {}
         is_forked = bool(state.get("_forked_command_turn"))
 
         overrides: dict[str, Any] = {}

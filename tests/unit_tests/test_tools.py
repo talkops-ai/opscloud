@@ -27,19 +27,22 @@ def test_goal_and_rubric_snapshots():
 
     rubric = _rubric_snapshot(state)
     assert rubric["active"] is True
+    assert rubric["criteria"] is not None
     assert "Distribution is deployed" in rubric["criteria"]
 
 
 @pytest.mark.asyncio
 async def test_goal_tools_middleware_notice_generation_and_deduplication():
+    from typing import Any
     from opscloud.middleware.goal_tools import GoalToolsMiddleware
 
     middleware = GoalToolsMiddleware()
     # No goal -> no notice
-    assert await middleware.abefore_model({"messages": []}, runtime=None) is None
+    empty_state: Any = {"messages": []}
+    assert await middleware.abefore_model(empty_state, runtime=None) is None
 
     # Active goal -> generates notice via build_goal_state_notice(mapping)
-    state = {
+    state: Any = {
         "_goal_objective": "Configure AWS CloudFront CDN",
         "_goal_status": "active",
         "messages": [],

@@ -298,7 +298,8 @@ async def test_refresh_all_marketplaces_shows_intermediate_status_and_completes(
             screen._select_tab("marketplaces")
             await pilot.pause()
 
-            await screen.on_option_list_option_selected(DummyEvent())
+            ev1: Any = DummyEvent()
+            await screen.on_option_list_option_selected(ev1)
             # Intermediate state must be immediate:
             assert screen._is_refreshing_marketplaces is True
             assert screen._status == "Refreshing all marketplaces..."
@@ -337,7 +338,8 @@ async def test_refresh_single_marketplace_shows_intermediate_status_and_complete
             screen._refresh_view()
             await pilot.pause()
 
-            await screen.on_option_list_option_selected(DummyEvent())
+            ev2: Any = DummyEvent()
+            await screen.on_option_list_option_selected(ev2)
             # Intermediate state must be immediate:
             assert screen._is_refreshing_marketplaces is True
             assert "Refreshing marketplace talkops..." in str(screen._status)

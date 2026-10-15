@@ -10,6 +10,13 @@ from typing import Any
 from opscloud.webhooks.models import NormalizedWebhookEvent, WebhookConfig
 
 
+def as_dict(value: Any, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return ``value`` if it is a ``dict``, otherwise ``fallback`` (or ``{}``)."""
+    if isinstance(value, dict):
+        return value
+    return fallback if fallback is not None else {}
+
+
 class WebhookParseError(ValueError):
     """Raised when an incoming webhook payload cannot be decoded or is malformed."""
 

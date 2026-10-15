@@ -12,7 +12,7 @@ from opscloud.webhooks.models import (
     WebhookEventStatus,
     WebhookSeverity,
 )
-from opscloud.webhooks.providers.base import WebhookParseError, WebhookProviderAdapter
+from opscloud.webhooks.providers.base import WebhookParseError, WebhookProviderAdapter, as_dict
 
 _ACTIONABLE_PD_EVENTS = frozenset(
     {
@@ -60,16 +60,16 @@ class PagerDutyWebhookAdapter(WebhookProviderAdapter):
     ) -> NormalizedWebhookEvent:
         event_id = str(event.get("id") or "")
         event_type = str(event.get("event_type") or "incident.triggered").strip()
-        event_data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        event_data = as_dict(event.get("data"))
 
         # For incident.annotated, PagerDuty places the incident under data.incident and note in data.content
         if event_type == "incident.annotated":
-            incident_ref = event_data.get("incident") if isinstance(event_data.get("incident"), dict) else event_data
+            incident_ref = as_dict(event_data.get("incident"), fallback=event_data)
             incident_id = str(incident_ref.get("id") or event_data.get("id") or "pd-incident")
             incident_title = str(incident_ref.get("summary") or incident_ref.get("title") or f"Incident {incident_id}")
             note_content = str(event_data.get("content") or "").strip()
             html_url = incident_ref.get("html_url")
-            service_obj = incident_ref.get("service") if isinstance(incident_ref.get("service"), dict) else {}
+            service_obj = as_dict(incident_ref.get("service"))
             service_name = str(service_obj.get("summary") or "") or None
 
             # Loop prevention: ignore annotations written by OpsCloud itself
@@ -100,10 +100,10 @@ class PagerDutyWebhookAdapter(WebhookProviderAdapter):
         status_str = str(event_data.get("status") or "triggered").lower()
         html_url = event_data.get("html_url")
 
-        service_obj = event_data.get("service") if isinstance(event_data.get("service"), dict) else {}
+        service_obj = as_dict(event_data.get("service"))
         service_name = str(service_obj.get("summary") or service_obj.get("name") or "") or None
 
-        priority_obj = event_data.get("priority") if isinstance(event_data.get("priority"), dict) else {}
+        priority_obj = as_dict(event_data.get("priority"))
         priority_name = str(priority_obj.get("summary") or priority_obj.get("name") or "")
 
         severity = (
@@ -166,12 +166,12 @@ class PagerDutyWebhookAdapter(WebhookProviderAdapter):
         config: WebhookConfig,
     ) -> NormalizedWebhookEvent:
         event_type = str(msg.get("event") or "incident.trigger")
-        incident = msg.get("incident") if isinstance(msg.get("incident"), dict) else {}
+        incident = as_dict(msg.get("incident"))
         incident_id = str(incident.get("id") or "pd-v2-incident")
         title = str(incident.get("title") or incident.get("summary") or f"Incident {incident_id}")
         urgency = str(incident.get("urgency") or "high")
         html_url = incident.get("html_url")
-        service = incident.get("service") if isinstance(incident.get("service"), dict) else {}
+        service = as_dict(incident.get("service"))
         service_name = str(service.get("name") or service.get("summary") or "") or None
 
         is_trigger = "trigger" in event_type or "escalate" in event_type

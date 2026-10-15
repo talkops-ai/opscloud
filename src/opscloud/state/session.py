@@ -47,6 +47,7 @@ _MAX_MESSAGE_COUNT_CACHE = 4096
 _initial_prompt_cache: dict[str, tuple[str | None, str | None]] = {}
 _MAX_INITIAL_PROMPT_CACHE = 4096
 _cloud_badge_cache: dict[str, tuple[str | None, str | None]] = {}
+_thread_title_cache: dict[str, str] = {}
 _recent_threads_cache: dict[tuple[str | None, int], list[ThreadInfo]] = {}
 _MAX_RECENT_THREADS_CACHE_KEYS = 16
 _DEFAULT_SQLITE_TIMEOUT = 5.0
@@ -109,6 +110,7 @@ def set_db_path(path: Path) -> None:
     _message_count_cache.clear()
     _initial_prompt_cache.clear()
     _cloud_badge_cache.clear()
+    _thread_title_cache.clear()
     _recent_threads_cache.clear()
 
 
@@ -137,6 +139,7 @@ class ThreadInfo(TypedDict):
     updated_at: str | None
     created_at: NotRequired[str | None]
     git_branch: NotRequired[str | None]
+    title: NotRequired[str | None]
     initial_prompt: NotRequired[str | None]
     message_count: NotRequired[int]
     latest_checkpoint_id: NotRequired[str | None]
@@ -205,6 +208,131 @@ async def _table_exists(conn: Any, table: str) -> bool:
 
 
 _THREADS_LIST_INDEX = "idx_opscloud_threads_list"
+_THREAD_SUMMARIES_TABLE = "thread_summaries"
+
+
+async def _ensure_thread_summaries_table(conn: Any) -> None:
+    """Ensure the SQLite ``thread_summaries`` table exists (mirrors agy conversation_summaries)."""
+    await conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_THREAD_SUMMARIES_TABLE} (
+            thread_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            preview TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+
+async def _load_thread_titles_batch(
+    conn: Any,
+    thread_ids: list[str],
+) -> dict[str, tuple[str, str]]:
+    """Batch-load ``(title, preview)`` tuples from ``thread_summaries`` for given thread IDs."""
+    if not thread_ids or not await _table_exists(conn, _THREAD_SUMMARIES_TABLE):
+        return {}
+    results: dict[str, tuple[str, str]] = {}
+    for start in range(0, len(thread_ids), _SQLITE_MAX_VARIABLE_NUMBER):
+        chunk = thread_ids[start : start + _SQLITE_MAX_VARIABLE_NUMBER]
+        placeholders = ",".join("?" * len(chunk))
+        query = (
+            f"SELECT thread_id, title, preview FROM {_THREAD_SUMMARIES_TABLE} "
+            f"WHERE thread_id IN ({placeholders})"
+        )
+        async with conn.execute(query, chunk) as cursor:
+            rows = await cursor.fetchall()
+        for tid, title_val, preview_val in rows:
+            t_str = title_val.strip() if isinstance(title_val, str) else ""
+            p_str = preview_val.strip() if isinstance(preview_val, str) else ""
+            if t_str:
+                _thread_title_cache[tid] = t_str
+            results[tid] = (t_str, p_str)
+    return results
+
+
+async def get_thread_title(thread_id: str) -> str | None:
+    """Retrieve the persisted LLM-generated title for ``thread_id``, if any."""
+    if not thread_id or not isinstance(thread_id, str):
+        return None
+    cached = _thread_title_cache.get(thread_id)
+    if cached:
+        return cached
+
+    async with _connect() as conn:
+        if not await _table_exists(conn, _THREAD_SUMMARIES_TABLE):
+            return None
+        async with conn.execute(
+            f"SELECT title FROM {_THREAD_SUMMARIES_TABLE} WHERE thread_id = ? LIMIT 1",
+            (thread_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and isinstance(row[0], str) and row[0].strip():
+                title_val = row[0].strip()
+                _thread_title_cache[thread_id] = title_val
+                return title_val
+    return None
+
+
+async def set_thread_title(
+    thread_id: str,
+    title: str,
+    *,
+    preview: str | None = None,
+    only_if_empty: bool = True,
+) -> bool:
+    """Persist an LLM-generated conversation title to SQLite ``thread_summaries``.
+
+    When ``only_if_empty=True`` (the default, matching agy ``maybeGenerateConversationTitle.func1``
+    at ``0x101d8dd08``), an existing non-empty title is never overwritten.
+    """
+    if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
+        return False
+
+    from opscloud.state.conversation_title import (
+        postprocess_conversation_title,
+        truncate_summary_preview,
+    )
+
+    cleaned_title = postprocess_conversation_title(title)
+    if not cleaned_title:
+        return False
+
+    cleaned_preview = truncate_summary_preview(preview) if preview else ""
+    now_iso = datetime.now().astimezone().isoformat()
+
+    async with _connect() as conn:
+        await _ensure_thread_summaries_table(conn)
+        if only_if_empty:
+            async with conn.execute(
+                f"SELECT title FROM {_THREAD_SUMMARIES_TABLE} WHERE thread_id = ? LIMIT 1",
+                (thread_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row and isinstance(row[0], str) and row[0].strip():
+                    existing = row[0].strip()
+                    _thread_title_cache[thread_id] = existing
+                    return False
+
+        await conn.execute(
+            f"""
+            INSERT INTO {_THREAD_SUMMARIES_TABLE} (thread_id, title, preview, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                title = excluded.title,
+                preview = CASE
+                    WHEN excluded.preview != '' THEN excluded.preview
+                    ELSE {_THREAD_SUMMARIES_TABLE}.preview
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (thread_id, cleaned_title, cleaned_preview, now_iso),
+        )
+        await conn.commit()
+
+    _thread_title_cache[thread_id] = cleaned_title
+    _recent_threads_cache.clear()
+    return True
 
 
 async def _ensure_threads_list_index(conn: Any) -> None:
@@ -289,7 +417,7 @@ def _coerce_prompt_text(content: object) -> str | None:
     return None
 
 
-def _initial_prompt_from_messages(messages: list[object]) -> str | None:
+def _initial_prompt_from_messages(messages: Sequence[object]) -> str | None:
     for msg in messages:
         if is_internal_message(msg):
             continue
@@ -668,6 +796,22 @@ async def list_threads(
                 for r in rows
             ]
 
+        if threads:
+            summary_rows = await _load_thread_titles_batch(
+                conn,
+                [t["thread_id"] for t in threads],
+            )
+            for t in threads:
+                tid = t["thread_id"]
+                t_title, t_preview = summary_rows.get(tid, ("", ""))
+                if t_title:
+                    t["title"] = t_title
+                else:
+                    cached_t = _thread_title_cache.get(tid)
+                    t["title"] = cached_t if cached_t else None
+                if t_preview and not t.get("initial_prompt"):
+                    t["initial_prompt"] = t_preview
+
         if include_message_count and threads:
             await _populate_checkpoint_fields(
                 conn,
@@ -688,7 +832,7 @@ async def prewarm_thread_message_counts(limit: int = 50) -> None:
 
 
 async def delete_thread(thread_id: str) -> bool:
-    """Delete a thread and all associated checkpoints and writes."""
+    """Delete a thread and all associated checkpoints, writes, and summaries."""
     deleted = False
     async with _connect() as conn:
         if await _table_exists(conn, "checkpoints"):
@@ -700,11 +844,18 @@ async def delete_thread(thread_id: str) -> bool:
                 await conn.execute(
                     "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
                 )
-            await conn.commit()
-            if deleted:
-                _message_count_cache.pop(thread_id, None)
-                _initial_prompt_cache.pop(thread_id, None)
-                _cloud_badge_cache.pop(thread_id, None)
+        if await _table_exists(conn, _THREAD_SUMMARIES_TABLE):
+            summary_cursor = await conn.execute(
+                f"DELETE FROM {_THREAD_SUMMARIES_TABLE} WHERE thread_id = ?",
+                (thread_id,),
+            )
+            deleted = deleted or (summary_cursor.rowcount > 0)
+        await conn.commit()
+        if deleted:
+            _message_count_cache.pop(thread_id, None)
+            _initial_prompt_cache.pop(thread_id, None)
+            _cloud_badge_cache.pop(thread_id, None)
+            _thread_title_cache.pop(thread_id, None)
     return deleted
 
 
@@ -862,6 +1013,20 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (target_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, w_type, value_blob),
                 )
+            if await _table_exists(self.conn, _THREAD_SUMMARIES_TABLE):
+                await cur.execute(
+                    f"SELECT title, preview, updated_at FROM {_THREAD_SUMMARIES_TABLE} WHERE thread_id = ?",
+                    (source_id,),
+                )
+                summary_row = await cur.fetchone()
+                if summary_row:
+                    await cur.execute(
+                        f"INSERT OR REPLACE INTO {_THREAD_SUMMARIES_TABLE} (thread_id, title, preview, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (target_id, summary_row[0], summary_row[1], summary_row[2]),
+                    )
+                    if isinstance(summary_row[0], str) and summary_row[0].strip():
+                        _thread_title_cache[target_id] = summary_row[0].strip()
             await self.conn.commit()
 
     async def aprune(
@@ -883,12 +1048,23 @@ class OpsCloudCheckpointer(AsyncSqliteSaver):
             if thread_ids is not None:
                 for tid in thread_ids:
                     await self.adelete_thread(tid)
+                    if await _table_exists(self.conn, _THREAD_SUMMARIES_TABLE):
+                        async with self.lock, self.conn.cursor() as cur:
+                            await cur.execute(
+                                f"DELETE FROM {_THREAD_SUMMARIES_TABLE} WHERE thread_id = ?",
+                                (tid,),
+                            )
+                            await self.conn.commit()
+                    _thread_title_cache.pop(tid, None)
             else:
                 await self.setup()
                 async with self.lock, self.conn.cursor() as cur:
                     await cur.execute("DELETE FROM writes")
                     await cur.execute("DELETE FROM checkpoints")
+                    if await _table_exists(self.conn, _THREAD_SUMMARIES_TABLE):
+                        await cur.execute(f"DELETE FROM {_THREAD_SUMMARIES_TABLE}")
                     await self.conn.commit()
+                _thread_title_cache.clear()
             return
         if strategy != "keep_latest":
             raise ValueError(f"Unknown prune strategy: {strategy}")
@@ -1039,6 +1215,25 @@ class SessionManager:
             limit=limit,
             agent_name=agent_name,
             include_message_count=include_message_count,
+        )
+
+    @staticmethod
+    async def get_thread_title(thread_id: str) -> str | None:
+        return await get_thread_title(thread_id)
+
+    @staticmethod
+    async def set_thread_title(
+        thread_id: str,
+        title: str,
+        *,
+        preview: str | None = None,
+        only_if_empty: bool = True,
+    ) -> bool:
+        return await set_thread_title(
+            thread_id,
+            title,
+            preview=preview,
+            only_if_empty=only_if_empty,
         )
 
     @staticmethod
@@ -1198,8 +1393,10 @@ __all__ = [
     "get_checkpointer",
     "get_db_path",
     "get_most_recent",
+    "get_thread_title",
     "list_threads",
     "prewarm_thread_message_counts",
     "set_db_path",
+    "set_thread_title",
     "thread_exists",
 ]

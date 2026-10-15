@@ -161,172 +161,52 @@ def _split_model_spec(spec: str) -> tuple[str, str]:
     return provider, spec
 
 
-# ── MCP Reload / Respawn Types and Helpers ──────────────
+# ── Domain Controllers & MCP Helpers ────────────────────
 
-_McpRefreshStatus = Literal["fresh", "disabled", "unavailable"]
+from opscloud.ui.controllers import (
+    BtwController,
+    GoalController,
+    ModalController,
+    PromptController,
+    ServerLifecycleController,
+    ShellController,
+    ThreadController,
+)
+from opscloud.ui.controllers.server_controller import (
+    _McpRefreshStatus,
+    _ServerRespawnResult,
+    _format_mcp_server_changes,
+)
 
 
-@dataclass(frozen=True)
-class _ServerRespawnResult:
-    """Result of restarting the app-owned server."""
-
-    restarted: bool
-    mcp_server_info: list[MCPServerInfo] | None = None
-    mcp_status: _McpRefreshStatus = "unavailable"
-    mcp_error: str | None = None
+def _btw_ctrl(app: Any) -> BtwController:
+    ctrl = getattr(app, "__dict__", {}).get("_btw")
+    return ctrl if isinstance(ctrl, BtwController) else BtwController(app)
 
 
-def _format_mcp_server_changes(
-    previous: list[MCPServerInfo] | None,
-    current: list[MCPServerInfo] | None,
-    error: str | None = None,
-) -> str:
-    """Format MCP server changes for the /reload report."""
-    from opscloud.config.settings import get_glyphs
+def _shell_ctrl(app: Any) -> ShellController:
+    ctrl = getattr(app, "__dict__", {}).get("_shell")
+    return ctrl if isinstance(ctrl, ShellController) else ShellController(app)
 
-    glyphs = get_glyphs()
-    if current is None:
-        detail = f" ({error})" if error else ""
-        return f"MCP server changes couldn't be determined{detail}; use /mcp to check."
 
-    servers = {s.name: s for s in current if s.transport != "config"}
-    config_errors = sorted(s.name for s in current if s.transport == "config")
+def _goals_ctrl(app: Any) -> GoalController:
+    ctrl = getattr(app, "__dict__", {}).get("_goals")
+    return ctrl if isinstance(ctrl, GoalController) else GoalController(app)
 
-    if previous is None:
-        usable = sorted(name for name, s in servers.items() if s.status == "ok")
-        unusable = sorted(
-            f"{name} ({s.status})" for name, s in servers.items() if s.status != "ok"
-        )
-        parts = [f"currently loaded: {', '.join(usable) or 'none'}"]
-        if unusable:
-            parts.append(f"unavailable: {', '.join(unusable)}")
-        if config_errors:
-            parts.append(f"config errors: {', '.join(config_errors)}")
-        return (
-            "MCP server changes couldn't be determined (no baseline metadata); "
-            f"{'; '.join(parts)}."
-        )
 
-    before = {s.name: s for s in previous if s.transport != "config"}
-    before_config_errors = {s.name for s in previous if s.transport == "config"}
+def _threads_ctrl(app: Any) -> ThreadController:
+    ctrl = getattr(app, "__dict__", {}).get("_threads")
+    return ctrl if isinstance(ctrl, ThreadController) else ThreadController(app)
 
-    loaded = sorted(
-        name for name in servers.keys() - before.keys() if servers[name].status == "ok"
-    )
-    removed = sorted(before.keys() - servers.keys())
-    failing = sorted(
-        name
-        for name, server in servers.items()
-        if server.status == "error"
-        and (name not in before or before[name].status != "error")
-    )
-    unavailable = sorted(
-        name
-        for name, server in servers.items()
-        if name not in before and server.status not in {"ok", "error"}
-    )
-    recovered = sorted(
-        name
-        for name, server in servers.items()
-        if server.status == "ok" and before.get(name, server).status != "ok"
-    )
-    status_changed = sorted(
-        name
-        for name, server in servers.items()
-        if (
-            name in before
-            and before[name].status != server.status
-            and name not in failing
-            and name not in recovered
-        )
-    )
-    reconfigured = sorted(
-        name
-        for name, server in servers.items()
-        if name in before
-        and before[name].status == server.status
-        and (
-            before[name].transport != server.transport
-            or len(before[name].tools) != len(server.tools)
-        )
-    )
-    new_config_errors = [
-        name for name in config_errors if name not in before_config_errors
-    ]
-    resolved_config_errors = sorted(before_config_errors - set(config_errors))
 
-    reported = (
-        set(loaded)
-        | set(failing)
-        | set(unavailable)
-        | set(recovered)
-        | set(status_changed)
-        | set(reconfigured)
-    )
-    stuck = sorted(
-        [
-            name
-            for name, server in servers.items()
-            if name not in reported
-            and (server.status == "error" or server.needs_attention())
-        ]
-        + list(set(config_errors) & before_config_errors),
-    )
+def _server_ctrl(app: Any) -> ServerLifecycleController:
+    ctrl = getattr(app, "__dict__", {}).get("_server_lifecycle")
+    return ctrl if isinstance(ctrl, ServerLifecycleController) else ServerLifecycleController(app)
 
-    if not (
-        loaded
-        or removed
-        or failing
-        or unavailable
-        or recovered
-        or status_changed
-        or reconfigured
-        or new_config_errors
-        or resolved_config_errors
-    ):
-        if stuck:
-            return (
-                "MCP server changes: no changes detected "
-                f"(still needs attention: {', '.join(stuck)}; use /mcp)."
-            )
-        return "MCP server changes: no changes detected."
 
-    lines = ["MCP server changes:"]
-    if loaded:
-        lines.append(f"  - Loaded: {', '.join(loaded)}")
-    if removed:
-        lines.append(f"  - Removed: {', '.join(removed)}")
-    if failing:
-        lines.append(f"  - Failed to load: {', '.join(failing)} (use /mcp for details)")
-    if unavailable:
-        statuses = ", ".join(f"{name} ({servers[name].status})" for name in unavailable)
-        lines.append(f"  - Unavailable: {statuses} (use /mcp for details)")
-    if recovered:
-        lines.append(f"  - Recovered: {', '.join(recovered)}")
-    if status_changed:
-        transitions = ", ".join(
-            f"`{name}` ({before[name].status} {glyphs.arrow_right} {servers[name].status})"
-            for name in status_changed
-        )
-        lines.append(f"  - **Status changed:** {transitions}")
-    if reconfigured:
-        edits = []
-        for name in reconfigured:
-            was, now = before[name], servers[name]
-            if was.transport != now.transport:
-                edits.append(
-                    f"{name} ({was.transport} {glyphs.arrow_right} {now.transport})"
-                )
-            else:
-                edits.append(
-                    f"{name} ({len(was.tools)} {glyphs.arrow_right} {len(now.tools)} tools)"
-                )
-        lines.append(f"  - Reconfigured: {', '.join(edits)}")
-    if new_config_errors:
-        lines.append(f"  - Config errors: {', '.join(new_config_errors)}")
-    if resolved_config_errors:
-        lines.append(f"  - Resolved config errors: {', '.join(resolved_config_errors)}")
-    return "\n".join(lines)
+def _modals_ctrl(app: Any) -> ModalController:
+    ctrl = getattr(app, "__dict__", {}).get("_modals")
+    return ctrl if isinstance(ctrl, ModalController) else ModalController(app)
 
 
 # ── Queued Message ───────────────────────────────────────
@@ -364,19 +244,6 @@ class OpsCloudApp(App):
         Binding("ctrl+x", "open_editor", "External Editor", show=False),
         Binding("ctrl+n", "open_notifications", "Notifications", show=False),
         Binding("ctrl+o", "toggle_tool_output", "Toggle Output", show=False, priority=True),
-        # Approval menu keys (handled at App level for reliability)
-        Binding("up", "approval_up", "Up", show=False),
-        Binding("k", "approval_up", "Up", show=False),
-        Binding("down", "approval_down", "Down", show=False),
-        Binding("j", "approval_down", "Down", show=False),
-        Binding("enter", "approval_select", "Select", show=False),
-        Binding("y", "approval_yes", "Yes", show=False),
-        Binding("1", "approval_position(0)", "Select first", show=False),
-        Binding("2", "approval_position(1)", "Select second", show=False),
-        Binding("3", "approval_position(2)", "Select third", show=False),
-        Binding("s", "approval_smart", "Smart", show=False),
-        Binding("a", "approval_smart", "Auto", show=False),
-        Binding("n", "approval_no", "No", show=False),
     ]
 
     # ── App-level Lifecycle Messages ─────────────────────
@@ -421,7 +288,7 @@ class OpsCloudApp(App):
         initial_prompt: str | None = None,
         initial_skill: str | None = None,
         startup_cmd: str | None = None,
-        cwd: str | None = None,
+        cwd: str | Path | None = None,
         check_workspace_trust: bool | None = None,
         defer_server_start: bool = False,
         server_kwargs: dict[str, Any] | None = None,
@@ -488,6 +355,18 @@ class OpsCloudApp(App):
         self._initial_skill = initial_skill
         self._startup_cmd = startup_cmd
         self._agent_thread_id: str | None = None
+        self._previous_thread_id: str | None = None
+        self._message_timestamps_visible: bool = False
+        self._auto_mode_notice_pending: bool = False
+        self._active_goal: str | None = goal
+        self._goal_status: str | None = "active" if goal else None
+        self._active_rubric: str | None = None
+        self._goal_status_note: str | None = None
+        self._pending_goal_completion_note: str | None = None
+        self._pending_goal_objective: str | None = None
+        self._pending_goal_rubric: str | None = None
+        self._pending_goal_kind: str | None = None
+        self._pending_goal_request_id: str | None = None
         from opscloud.config.cli_settings import resolve_path_no_slash
 
         raw_cwd = cwd or (server_kwargs.get("cwd") if isinstance(server_kwargs, dict) else None) or str(Path.cwd())
@@ -520,15 +399,27 @@ class OpsCloudApp(App):
         self._debug_console_cleared_upto = -1
         self._debug_console_click_to_copy = False
 
-        # ── Goal State Synchronization ────────────────────
+        # ── Goal State Synchronization & Domain Controllers ──
         self._goal_state_lock = asyncio.Lock()
         self._goal_state_mutating = False
         self._agent_reconciling = False
-        self._pending_goal_review_widget: Any | None = None
-        self._pending_goal_review_future: Any | None = None
-        self._pending_approval_widget: Any | None = None
-        self._pending_ask_user_widget: AskUserMenu | None = None
-        self._approval_placeholder: Any | None = None
+        from opscloud.ui.controllers import (
+            BtwController,
+            GoalController,
+            ModalController,
+            PromptController,
+            ServerLifecycleController,
+            ShellController,
+            ThreadController,
+        )
+
+        self._prompts = PromptController(self)
+        self._btw = BtwController(self)
+        self._shell = ShellController(self)
+        self._goals = GoalController(self)
+        self._threads = ThreadController(self)
+        self._server_lifecycle = ServerLifecycleController(self)
+        self._modals = ModalController(self)
 
         # ── Worker Handles ───────────────────────────────
         self._agent_worker: Worker[None] | None = None
@@ -557,6 +448,7 @@ class OpsCloudApp(App):
         # ── Adapter & Widgets ────────────────────────────
         self._adapter: TextualAdapter | None = None
         self._chat_input: ChatInput | None = None
+        self._input_dock: Any | None = None
         # Autocomplete is now managed inline by ChatInput
         self._loading_widget: Any | None = None
 
@@ -599,6 +491,60 @@ class OpsCloudApp(App):
         self._command_router.auto_discover()
 
     @property
+    def ui_phase(self) -> Any:
+        """Return the current deterministic `UIPhase`."""
+        from opscloud.ui.state.ui_phase import derive_ui_phase
+
+        return derive_ui_phase(self)
+
+    @property
+    def ui_state(self) -> Any:
+        """Return the current immutable `UIState` snapshot."""
+        from opscloud.ui.state.ui_phase import derive_ui_state
+
+        return derive_ui_state(self)
+
+    @property
+    def _pending_approval_widget(self) -> Any | None:
+        return self._prompts.pending_approval_widget
+
+    @_pending_approval_widget.setter
+    def _pending_approval_widget(self, value: Any | None) -> None:
+        self._prompts.pending_approval_widget = value
+
+    @property
+    def _approval_placeholder(self) -> Any | None:
+        return self._prompts.approval_placeholder
+
+    @_approval_placeholder.setter
+    def _approval_placeholder(self, value: Any | None) -> None:
+        self._prompts.approval_placeholder = value
+
+    @property
+    def _pending_ask_user_widget(self) -> AskUserMenu | None:
+        return self._prompts.pending_ask_user_widget
+
+    @_pending_ask_user_widget.setter
+    def _pending_ask_user_widget(self, value: AskUserMenu | None) -> None:
+        self._prompts.pending_ask_user_widget = value
+
+    @property
+    def _pending_goal_review_widget(self) -> Any | None:
+        return self._prompts.pending_goal_review_widget
+
+    @_pending_goal_review_widget.setter
+    def _pending_goal_review_widget(self, value: Any | None) -> None:
+        self._prompts.pending_goal_review_widget = value
+
+    @property
+    def _pending_goal_review_future(self) -> Any | None:
+        return self._prompts.pending_goal_review_future
+
+    @_pending_goal_review_future.setter
+    def _pending_goal_review_future(self, value: Any | None) -> None:
+        self._prompts.pending_goal_review_future = value
+
+    @property
     def settings(self) -> Any:
         """Return the active runtime settings instance."""
         return getattr(self, "_settings", None)
@@ -635,14 +581,11 @@ class OpsCloudApp(App):
     # ── Layout ───────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        from opscloud.ui.widgets.goal_status import GoalStatusPanel
-        from opscloud.ui.widgets.subagent_panel import SubagentPanel
+        from opscloud.ui.widgets.input_dock import InputDock
+
         yield MessageList(id="messages")
-        with Container(id="bottom-container"):
-            yield SubagentPanel(id="subagent-panel")
-            yield GoalStatusPanel(id="goal-status-panel")
-            yield BtwCardPanel(id="btw-card-panel")
-            yield ChatInput(id="input-area")
+        self._input_dock = InputDock(id="bottom-container")
+        yield self._input_dock
         yield StatusBar(cwd=self._cwd, id="status-bar")
 
     # ── Lifecycle ────────────────────────────────────────
@@ -712,122 +655,13 @@ class OpsCloudApp(App):
             await self._continue_post_trust_startup()
 
     async def _evaluate_startup_trust_and_settings(self) -> None:
-        """Evaluate CLI settings validity and startup workspace folder trust."""
-        from opscloud.config.cli_settings import get_cli_settings_manager
-        from opscloud.ui.widgets.workspace_trust import SettingsErrorScreen
-
-        mgr = get_cli_settings_manager()
-        mgr.init_cli_settings()
-
-        if mgr.settings_load_error is not None:
-            if self._status_bar is not None:
-                self._status_bar.set_status("Settings error")
-
-            def _on_settings_error_decided(quarantine: bool | None) -> None:
-                if quarantine is True:
-                    mgr.quarantine_cli_settings()
-                    self.run_worker(
-                        self._prompt_workspace_trust_if_needed(),
-                        group="workspace-trust-gate",
-                    )
-                else:
-                    self._exit = True
-                    self.exit()
-
-            self.push_screen(
-                SettingsErrorScreen(mgr.settings_path, mgr.settings_load_error),
-                _on_settings_error_decided,
-            )
-            return
-
-        await self._prompt_workspace_trust_if_needed()
+        await _server_ctrl(self).evaluate_startup_trust_and_settings()
 
     async def _prompt_workspace_trust_if_needed(self) -> None:
-        """Check whether the startup workspace is trusted; push WorkspaceTrustScreen if not."""
-        from opscloud.config.cli_settings import get_cli_settings_manager
-        from opscloud.ui.widgets.workspace_trust import WorkspaceTrustScreen
-
-        mgr = get_cli_settings_manager()
-        trusted = mgr.init_workspace_dirs(self._cwd)
-        if trusted or mgr.workspace_trusted(self._cwd):
-            self._workspace_trusted = True
-            await self._continue_post_trust_startup()
-            return
-
-        self._workspace_trusted = False
-        if self._status_bar is not None:
-            self._status_bar.set_status("Workspace trust required")
-
-        def _on_workspace_trust_decided(accepted: bool | None) -> None:
-            if accepted is True:
-                mgr.trust_workspace(self._cwd)
-                self._workspace_trusted = True
-                try:
-                    from opscloud.config.settings import _load_dotenv
-
-                    _load_dotenv(start_path=Path(self._cwd), refresh_loaded=True)
-                except Exception:
-                    logger.debug("Dotenv refresh after workspace trust failed", exc_info=True)
-                self.run_worker(
-                    self._continue_post_trust_startup(),
-                    group="post-trust-startup",
-                )
-            else:
-                self._exit = True
-                self.exit()
-
-        self.push_screen(
-            WorkspaceTrustScreen(self._cwd),
-            _on_workspace_trust_decided,
-        )
+        await _server_ctrl(self).prompt_workspace_trust_if_needed()
 
     async def _continue_post_trust_startup(self) -> None:
-        """Run skill discovery, background server startup, and initial goal after workspace trust is satisfied."""
-        status_bar = self._status_bar or self.query_one("#status-bar", StatusBar)
-
-        if self._chat_input is not None:
-            self._chat_input.focus()
-
-        # Discover skills in background to populate autocomplete
-        self.run_worker(self._discover_startup_skills(), group="skill-discovery")
-
-        if self._server_startup_deferred:
-            status_bar.set_status("No model configured")
-            await self._mount_message(
-                SystemMessage(
-                    "No model is configured yet. Run `/model` to choose one.\n\n"
-                    "OpsCloud will ask for credentials for the selected provider."
-                )
-            )
-        elif self._connecting:
-            # Deferred server startup — TUI is visible immediately
-            status_bar.set_status("Connecting...")
-            self._startup_sequence_running = True
-            self.run_worker(self._start_server_background(), group="server-startup")
-        elif self._client:
-            # Eagerly-provided client (e.g. tests or pre-started server)
-            if self._adapter:
-                self._adapter.set_client(self._client)
-            await self._finalize_connection(self._client)
-            try:
-                banner = self.query_one(WelcomeBanner)
-                banner.set_connected()
-            except Exception:
-                pass
-            if not self._mcp_server_info and not self._mcp_preload_kwargs.get("no_mcp"):
-                self.run_worker(self._preload_mcp_metadata_background(), group="mcp-preload")
-        else:
-            # No server at all — offline/widget-only mode
-            self._agent_thread_id = "local_session"
-            await self._mount_message(
-                SystemMessage(
-                    "**OpsCloud TUI Ready** (offline) — "
-                    "Type `/help` for slash commands."
-                )
-            )
-
-        if self._goal:
-            self.call_later(self._send_goal)
+        await _server_ctrl(self).continue_post_trust_startup()
 
     def _sync_banner_model(self, model_spec: str, effort: str = "") -> None:
         """Mirror the active model / effort onto the welcome banner, if present."""
@@ -895,14 +729,7 @@ class OpsCloudApp(App):
     # ── Widget Mount Helper ──────────────────────────────
 
     async def _mount_message(self, widget: Any) -> None:
-        """Mount a message widget in the message list.
-
-        Centralizes mount logic so scroll anchoring and error handling
-        are in one place.
-
-        Args:
-            widget: Message widget to mount.
-        """
+        """Mount a message widget in the message list."""
         try:
             messages = self.query_one("#messages", MessageList)
             if (
@@ -917,258 +744,31 @@ class OpsCloudApp(App):
         except Exception:
             logger.debug("Could not mount message (app closing?)", exc_info=True)
 
-    # ── Deferred Server Startup ──────────────────────────
+    # ── Deferred Server Startup (ServerLifecycleController) ──
 
     async def maybe_start_deferred_server(self) -> bool:
-        """Start the background server if startup was deferred due to missing credentials."""
-        if not self._server_startup_deferred:
-            return False
-
-        from opscloud.exceptions import ModelConfigError, NoCredentialsConfiguredError
-        from opscloud.model.factory import _get_default_model_spec
-
-        try:
-            model_spec = _get_default_model_spec()
-        except (NoCredentialsConfiguredError, ModelConfigError):
-            return False
-
-        self._server_startup_deferred = False
-        self._model = model_spec
-        if not getattr(self, "_manual_model", None):
-            self._manual_model = model_spec
-        self._connecting = True
-        if self._server_kwargs is None:
-            self._server_kwargs = {
-                "assistant_id": self._assistant_id,
-                "model_name": model_spec,
-                "auto_approve": self._auto_approve,
-            }
-        else:
-            self._server_kwargs["model_name"] = model_spec
-
-        try:
-            status_bar = self.query_one(StatusBar)
-            status_bar.set_status("Connecting...")
-        except Exception:
-            pass
-
-        await self._mount_message(
-            SystemMessage(
-                f"**Credentials configured!** Starting agent server for model `{model_spec}`..."
-            )
-        )
-        self.run_worker(self._start_server_background(), group="server-startup")
-        return True
+        return await _server_ctrl(self).maybe_start_deferred_server()
 
     async def _start_server_background(self) -> None:
-        """Background worker: start the LangGraph server subprocess and preload MCP metadata.
-
-        On success → posts ``ServerReady(client, server_proc, mcp_server_info)``
-        On failure → posts ``ServerStartFailed(error)``
-        """
-        from opscloud.cli.server_manager import start_server_and_get_agent
-
-        try:
-            kwargs: dict[str, Any] = dict(self._server_kwargs or {})
-            assistant_id = str(kwargs.pop("assistant_id", self._assistant_id))
-
-            client, server_proc = await start_server_and_get_agent(
-                assistant_id=assistant_id,
-                on_spawn=lambda proc: setattr(self, "_server_proc", proc),
-                **kwargs,
-            )
-            self._server_proc = server_proc
-            if self._exit:
-                try:
-                    server_proc.stop()
-                except Exception:
-                    pass
-                return
-
-            # Do not block ServerReady on cold MCP server discovery. Use any warm
-            # cached MCPServerInfo immediately so the TUI unlocks at once, and
-            # refresh MCP metadata in the background.
-            mcp_info = None
-            if self._mcp_preload_kwargs is not None and not self._mcp_preload_kwargs.get("no_mcp"):
-                from opscloud.mcp.preload import get_cached_mcp_server_infos
-
-                cached = get_cached_mcp_server_infos()
-                mcp_info = cached if cached else None
-                self.run_worker(
-                    self._preload_mcp_metadata_background(),
-                    group="mcp-preload",
-                    exclusive=True,
-                )
-
-            self.post_message(
-                self.ServerReady(
-                    client=client,
-                    server_proc=server_proc,
-                    mcp_server_info=mcp_info,
-                )
-            )
-        except Exception as exc:
-            logger.exception("Server startup failed: %s", exc)
-            self.post_message(self.ServerStartFailed(error=exc))
+        await _server_ctrl(self).start_server_background()
 
     async def _preload_mcp_metadata_background(self) -> None:
-        """Preload MCP server metadata in background and refresh open viewer if active."""
-        try:
-            from opscloud.mcp.preload import preload_mcp_server_info
-
-            infos = await preload_mcp_server_info(**self._mcp_preload_kwargs)
-            if infos:
-                self._mcp_server_info = infos
-                logger.debug("Background MCP preload populated %d servers", len(infos))
-                self._sync_banner_mcp()
-                try:
-                    from opscloud.ui.widgets.mcp_viewer import MCPViewerScreen
-
-                    if isinstance(self.screen, MCPViewerScreen):
-                        await self.screen.refresh_server_info(infos)
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.warning("Background MCP preload failed: %s", exc)
+        await _server_ctrl(self).preload_mcp_metadata_background()
 
     @on(ServerReady)
     async def _on_server_ready(self, event: ServerReady) -> None:
-        """Handle successful background server startup."""
-        self._client = event.client
-        self._server_proc = event.server_proc
-        if event.mcp_server_info is not None:
-            self._mcp_server_info = event.mcp_server_info
-            try:
-                from opscloud.ui.widgets.mcp_viewer import MCPViewerScreen
-
-                if isinstance(self.screen, MCPViewerScreen):
-                    await self.screen.refresh_server_info(self._mcp_server_info)
-            except Exception:
-                pass
-
-        # Bind the now-live client to the adapter
-        if self._adapter:
-            self._adapter.set_client(event.client)
-
-        await self._finalize_connection(event.client)
-        self._connecting = False
-        self._startup_sequence_running = False
-
-        logger.debug("TUI: server ready, client bound to adapter")
-
-        # Transition the welcome banner status indicator to green.
-        try:
-            banner = self.query_one(WelcomeBanner)
-            banner.set_connected()
-        except Exception:
-            pass  # Banner may have been dismissed already
-        self._sync_banner_mcp()
-
-        # Restore focus to input after async server startup
-        if self._chat_input:
-            self._chat_input.focus()
-
-        # Drain any messages queued during connection
-        await self._process_next_from_queue()
+        await _server_ctrl(self).on_server_ready(event)
 
     @on(ServerStartFailed)
     async def _on_server_start_failed(self, event: ServerStartFailed) -> None:
-        """Handle server startup failure — show error and allow recovery."""
-        self._connecting = False
-        self._startup_sequence_running = False
-        self._server_startup_error = event.error
-
-        # Clear any queued messages
-        self._pending_messages.clear()
-        while self._queued_widgets:
-            widget = self._queued_widgets.popleft()
-            try:
-                await widget.remove()
-            except Exception:
-                pass
-
-        self._connecting = False
-        self._server_startup_error = event.error
-        try:
-            status_bar = self.query_one("#status-bar", StatusBar)
-            status_bar.set_status("Server Error")
-        except Exception:
-            pass
-
-        try:
-            banner = self.query_one(WelcomeBanner)
-            banner.set_error()
-        except Exception:
-            pass
-
-        from opscloud.exceptions import MissingCredentialsError, MissingProviderPackageError
-
-        if isinstance(event.error, MissingCredentialsError):
-            env_var_hint = f" (`{event.error.env_var}`)" if event.error.env_var else ""
-            provider_hint = f" for provider `{event.error.provider}`{env_var_hint}" if event.error.provider else ""
-            msg = (
-                f"Server startup failed: {event.error}\n\n"
-                f"Hint: Run `/auth` to configure credentials{provider_hint}, or use `/model` to select a different model."
-            )
-        elif isinstance(event.error, MissingProviderPackageError):
-            msg = (
-                f"Server startup failed: {event.error}\n\n"
-                f"Hint: Install `{event.error.package}` to use provider `{event.error.provider}`, or switch models with `/model`."
-            )
-        else:
-            msg = (
-                f"Server startup failed: {event.error}\n\n"
-                "Hint: Check credentials with `/auth` or use `/model` to reconfigure."
-            )
-
-        await self._mount_message(ErrorMessage(msg))
-        logger.error("Server startup failed: %s", event.error)
-
-        # Keep input focusable for slash commands even after failure
-        if self._chat_input:
-            self._chat_input.focus()
+        await _server_ctrl(self).on_server_start_failed(event)
 
     async def _finalize_connection(self, client: Any) -> None:
-        """Create thread and mark the app as ready for agent turns."""
-        if self._resume_thread:
-            self._agent_thread_id = self._resume_thread
-            session_state = getattr(self, "_session_state", None)
-            if session_state:
-                session_state.thread_id = self._resume_thread
-            await self._mount_message(
-                SystemMessage(f"Resumed thread: `{self._resume_thread}`")
-            )
-            await self._load_thread_history(self._resume_thread)
-        else:
-            import uuid
-            self._agent_thread_id = str(uuid.uuid4())
-
-        try:
-            status_bar = self.query_one("#status-bar", StatusBar)
-            status_bar.set_status("Ready")
-        except NoMatches:
-            pass
-        if self._agent_thread_id:
-            bind_logging_to_thread(self._agent_thread_id)
-        logger.debug("TUI: connection finalized, thread_id=%s", self._agent_thread_id)
-
-        if self._startup_cmd:
-            await self._mount_message(SystemMessage(f"Running startup command: `{self._startup_cmd}`"))
-            await self._submit_input(self._startup_cmd, "shell")
-
-        if self._initial_skill:
-            await self._submit_input(f"/skill {self._initial_skill}", "normal")
-
-        if self._initial_prompt:
-            await self._submit_input(self._initial_prompt, "normal")
-
-        if self._goal:
-            await self._send_goal()
+        await _server_ctrl(self).finalize_connection(client)
 
     async def _send_goal(self) -> None:
-        """Submit the initial goal objective if present."""
-        if self._goal:
-            await self._submit_input(self._goal, "normal")
+        await _server_ctrl(self).send_goal()
+
 
     # ── Autocomplete Event Handlers ──────────────────────
 
@@ -1388,221 +988,41 @@ class OpsCloudApp(App):
         except Exception:
             pass
 
-    # ── Ephemeral `/btw` Side-Question Manager ───────────
+    # ── Ephemeral `/btw` Side-Question Manager (BtwController) ──
 
     def _refresh_btw_card(self) -> None:
-        """Update the `BtwCardPanel` widget from `self._btw_items` and `self._btw_index`."""
-        with suppress(Exception):
-            card = self.query_one("#btw-card-panel", BtwCardPanel)
-            card.render_state(self._btw_items, self._btw_index)
+        _btw_ctrl(self).refresh_btw_card()
 
     def is_btw_active(self) -> bool:
-        """Return True if any `/btw` side question is currently loading."""
-        return any(item.loading for item in self._btw_items)
+        return _btw_ctrl(self).is_btw_active()
 
     def is_btw_open(self) -> bool:
-        """Return True if the `/btw` overlay card is currently visible."""
-        return 0 <= self._btw_index < len(self._btw_items)
+        return _btw_ctrl(self).is_btw_open()
 
     def show_btw_history(self) -> bool:
-        """Reopen the most recent `/btw` card if history exists (`ShowBtwHistory` parity)."""
-        if not self._btw_items:
-            return False
-        self._btw_index = len(self._btw_items) - 1
-        self._refresh_btw_card()
-        return True
+        return _btw_ctrl(self).show_btw_history()
 
     def dismiss_btw_response(self) -> None:
-        """Dismiss the `/btw` card and cancel any in-flight `/btw` generation (`DismissBtwResponse` parity)."""
-        self._btw_cancel_event.set()
-        if self._btw_worker is not None and not self._btw_worker.is_finished:
-            self._cancel_worker(self._btw_worker)
-        self._btw_worker = None
-        for item in self._btw_items:
-            if item.loading:
-                item.loading = False
-                if not item.error:
-                    item.error = "cancelled"
-        self._btw_index = -1
-        self._refresh_btw_card()
+        _btw_ctrl(self).dismiss_btw_response()
 
     def clear_active_btw(self) -> None:
-        """Clear all `/btw` history and dismiss any open `/btw` card (`ClearActiveBtw` parity)."""
-        self.dismiss_btw_response()
-        self._btw_items.clear()
-        self._btw_index = -1
-        self._refresh_btw_card()
+        _btw_ctrl(self).clear_active_btw()
 
     def toggle_btw_expanded(self) -> None:
-        """Toggle expanded/collapsed state on the currently visible `/btw` card (`ToggleBtwExpanded` parity)."""
-        if 0 <= self._btw_index < len(self._btw_items):
-            self._btw_items[self._btw_index].expanded = not self._btw_items[self._btw_index].expanded
-            self._refresh_btw_card()
+        _btw_ctrl(self).toggle_btw_expanded()
 
     def navigate_btw(self, delta: int) -> None:
-        """Navigate backward/forward through `/btw` history (`NavigateBtw` parity)."""
-        if not self._btw_items or self._btw_index < 0:
-            return
-        new_idx = max(0, min(len(self._btw_items) - 1, self._btw_index + delta))
-        if new_idx != self._btw_index:
-            self._btw_index = new_idx
-            self._refresh_btw_card()
+        _btw_ctrl(self).navigate_btw(delta)
 
     def get_btw_copy_status(self) -> tuple[str | None, str | None]:
-        """Return `(answer, error_message)` for `/copy btw` (`copyBtwAnswer` parity)."""
-        if not self._btw_items:
-            return None, "No /btw response to copy."
-        idx = self._btw_index if 0 <= self._btw_index < len(self._btw_items) else len(self._btw_items) - 1
-        item = self._btw_items[idx]
-        if item.loading:
-            return None, "The /btw answer is still being generated."
-        if item.error:
-            return None, f"The /btw question failed: {item.error}"
-        if not item.answer.strip():
-            return None, "No /btw response to copy."
-        return item.answer, None
+        return _btw_ctrl(self).get_btw_copy_status()
 
     async def _send_ephemeral_message(self, question: str) -> None:
-        """Start an isolated `/btw` side question in a background worker (`SendSideQuestion` parity).
-
-        Runs concurrently even while `self._agent_running` is True without mutating
-        the main conversation transcript or checkpoint.
-        """
-        from opscloud.middleware.btw import BTW_PROMPT_PREFIX
-
-        clean_q = question.strip()
-        if clean_q.startswith(BTW_PROMPT_PREFIX):
-            clean_q = clean_q[len(BTW_PROMPT_PREFIX) :].strip()
-        elif clean_q.startswith("[ASIDE — ephemeral side question"):
-            lines = [ln for ln in clean_q.splitlines() if not ln.startswith("[ASIDE") and not ln.startswith("[/ASIDE")]
-            clean_q = "\n".join(lines).strip()
-
-        if self.is_btw_active():
-            self.notify(
-                "A /btw question is already in progress. Please wait for it to finish.",
-                severity="warning",
-                timeout=3,
-            )
-            return
-
-        exchange = BtwExchange(question=clean_q, answer="", loading=True, error="", expanded=False)
-        self._btw_items.append(exchange)
-        item_index = len(self._btw_items) - 1
-        self._btw_index = item_index
-        self._btw_cancel_event = asyncio.Event()
-        self._refresh_btw_card()
-
-        self._btw_worker = self.run_worker(
-            self._run_btw_task(item_index, clean_q),
-            group="btw-worker",
-            exclusive=False,
-        )
+        await _btw_ctrl(self).send_ephemeral_message(question)
 
     async def _run_btw_task(self, item_index: int, question: str) -> None:
-        """Execute the isolated `/btw` side question with a 60-second timeout."""
-        from opscloud.middleware.btw import BTW_TIMEOUT_SECONDS, format_btw_prompt
+        await _btw_ctrl(self).run_btw_task(item_index, question)
 
-        client = self._client or (getattr(self._adapter, "_client", None) if self._adapter else None)
-        if client is None:
-            if 0 <= item_index < len(self._btw_items):
-                self._btw_items[item_index].loading = False
-                self._btw_items[item_index].error = "Agent not connected"
-                self._refresh_btw_card()
-            return
-
-        from opscloud.config.cloud_profiles import get_active_aws_profile, get_active_aws_region
-
-        context: dict[str, Any] = {"_btw_side_question": True}
-        if self._model:
-            context["model"] = self._model
-        active_aws_prof = get_active_aws_profile()
-        active_aws_reg = get_active_aws_region()
-        if active_aws_prof:
-            context["aws_profile"] = active_aws_prof
-        if active_aws_reg:
-            context["aws_region"] = active_aws_reg
-
-        ui_messages = self.get_thread_messages()
-        fragments: list[str] = []
-
-        try:
-            async with asyncio.timeout(BTW_TIMEOUT_SECONDS):
-                if hasattr(client, "astream_side_question"):
-                    async for chunk in client.astream_side_question(
-                        question,
-                        parent_thread_id=self._agent_thread_id,
-                        context=context,
-                        messages_override=ui_messages,
-                    ):
-                        if self._btw_cancel_event.is_set():
-                            break
-                        if chunk:
-                            fragments.append(chunk)
-                            if 0 <= item_index < len(self._btw_items):
-                                self._btw_items[item_index].answer = "".join(fragments)
-                                self._refresh_btw_card()
-                elif hasattr(client, "astream"):
-                    from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
-
-                    temp_tid = f"btw-{uuid.uuid4()}"
-                    seed_msgs = [
-                        m for m in ui_messages if getattr(m, "type", "") in ("human", "HumanMessage", "ai", "AIMessage")
-                    ]
-                    side_msg = HumanMessage(
-                        content=format_btw_prompt(question),
-                        additional_kwargs={"ephemeral": True},
-                    )
-                    async for raw_event in client.astream(
-                        {"messages": [*seed_msgs, side_msg], "_btw_side_question": True},
-                        stream_mode=["messages", "updates"],
-                        subgraphs=False,
-                        config={"configurable": {"thread_id": temp_tid}},
-                        context=context,
-                    ):
-                        if self._btw_cancel_event.is_set():
-                            break
-                        if not isinstance(raw_event, tuple):
-                            continue
-                        mode = raw_event[1] if len(raw_event) == 3 else raw_event[0]
-                        data = raw_event[2] if len(raw_event) == 3 else raw_event[1]
-                        if mode == "messages":
-                            msg_obj = data[0] if isinstance(data, tuple) else data
-                            if isinstance(msg_obj, (AIMessage, AIMessageChunk)) or getattr(
-                                msg_obj, "type", ""
-                            ) in ("ai", "AIMessage", "AIMessageChunk"):
-                                content = getattr(msg_obj, "content", "")
-                                if isinstance(content, str) and content:
-                                    fragments.append(content)
-                                    if 0 <= item_index < len(self._btw_items):
-                                        self._btw_items[item_index].answer = "".join(fragments)
-                                        self._refresh_btw_card()
-
-            if 0 <= item_index < len(self._btw_items):
-                item = self._btw_items[item_index]
-                item.loading = False
-                if self._btw_cancel_event.is_set() and not item.error:
-                    item.error = "cancelled"
-                self._refresh_btw_card()
-        except asyncio.CancelledError:
-            if 0 <= item_index < len(self._btw_items):
-                item = self._btw_items[item_index]
-                item.loading = False
-                if not item.error:
-                    item.error = "cancelled"
-                self._refresh_btw_card()
-        except TimeoutError:
-            if 0 <= item_index < len(self._btw_items):
-                item = self._btw_items[item_index]
-                item.loading = False
-                item.error = "timed out after 60s"
-                self._refresh_btw_card()
-        except Exception as exc:
-            logger.debug("/btw side question failed: %s", exc, exc_info=True)
-            if 0 <= item_index < len(self._btw_items):
-                item = self._btw_items[item_index]
-                item.loading = False
-                item.error = _format_error_detail(exc) or str(exc)
-                self._refresh_btw_card()
 
     # ── Agent Turn Lifecycle ─────────────────────────────
 
@@ -1756,6 +1176,20 @@ class OpsCloudApp(App):
             }
             if message_kwargs is not None:
                 stream_kwargs["message_kwargs"] = message_kwargs
+            if (
+                criteria_request_id is None
+                and not agent_session_turn
+                and self._agent_thread_id
+                and message
+                and message.strip()
+            ):
+                from opscloud.state.conversation_title import schedule_conversation_title_generation
+
+                schedule_conversation_title_generation(
+                    self._agent_thread_id,
+                    message,
+                    model_spec=self._model,
+                )
             await self._adapter.stream_turn(**stream_kwargs)
             logger.info("TUI: Agent turn completed successfully | thread_id=%s", self._agent_thread_id)
             task_succeeded = True
@@ -1911,56 +1345,14 @@ class OpsCloudApp(App):
 
     @asynccontextmanager
     async def _goal_state_mutation_boundary(self) -> AsyncGenerator[None, None]:
-        """Serialize an out-of-run goal mutation with graph checkpoints."""
-        async with self._goal_state_lock:
-            self._goal_state_mutating = True
-            try:
-                # Wait for agent quiescence.
-                while self._agent_running or self._agent_reconciling:
-                    await asyncio.sleep(0.05)
-                yield
-            finally:
-                self._goal_state_mutating = False
+        async with _goals_ctrl(self).goal_state_mutation_boundary():
+            yield
 
     async def _aupdate_thread_state(self, update: dict[str, Any]) -> None:
-        """Write one state update through the graph client.
-
-        """
-        if not self._adapter or not self._adapter.connected or not self._agent_thread_id:
-            return
-        config: dict[str, Any] = {"configurable": {"thread_id": self._agent_thread_id}}
-        client = self._adapter._client
-
-        if hasattr(client, "aensure_thread"):
-            await client.aensure_thread(config)
-            await client.aupdate_state(config, update, as_node="model")
-        else:
-            await client.aupdate_state(config, update)
+        await _goals_ctrl(self).aupdate_thread_state(update)
 
     def _goal_state_update(self) -> dict[str, Any]:
-        """Build checkpoint state for goal/rubric metadata managed by the TUI.
-
-        """
-        from opscloud.commands.power.goal import get_goal_state
-
-        state = get_goal_state(self)
-        return {
-            "rubric": (
-                None
-                if state.objective and state.status in {"paused", "complete"}
-                else state.rubric
-            ),
-            "_sticky_rubric": state.rubric,
-            "_goal_objective": state.objective,
-            "_goal_status": state.status if state.objective else None,
-            "_goal_rubric": state.rubric if state.objective else None,
-            "_goal_status_note": state.status_note if state.objective else None,
-            "_pending_goal_objective": state.pending_objective,
-            "_pending_goal_rubric": state.pending_rubric,
-            "_pending_goal_kind": (
-                state.pending_kind if state.pending_objective else None
-            ),
-        }
+        return _goals_ctrl(self).goal_state_update()
 
     async def _persist_goal_rubric_state(
         self,
@@ -1968,201 +1360,28 @@ class OpsCloudApp(App):
         notice: Any | None = None,
         state_update: dict[str, Any] | None = None,
     ) -> bool:
-        """Persist TUI-owned goal state and an optional notice atomically.
-
-
-        Returns:
-            ``True`` when the state was written or there is no thread to write
-            to yet; ``False`` when a write was attempted and failed.
-        """
-        if not self._adapter or not self._adapter.connected or not self._agent_thread_id:
-            return True
-        update = dict(state_update or self._goal_state_update())
-        if notice is not None:
-            if hasattr(notice, "content") and hasattr(notice, "type"):
-                update["messages"] = [{"role": getattr(notice, "type", "system"), "content": str(notice.content)}]
-            elif isinstance(notice, dict):
-                update["messages"] = [notice]
-            else:
-                update["messages"] = [str(notice)]
-        try:
-            await self._aupdate_thread_state(update)
-        except Exception:
-            logger.warning("Failed to persist goal/rubric state", exc_info=True)
-            self.notify(
-                "Could not persist goal/rubric state for this thread.",
-                severity="warning",
-                markup=False,
-            )
-            return False
-        return True
+        return await _goals_ctrl(self).persist_goal_rubric_state(
+            notice=notice,
+            state_update=state_update,
+        )
 
     async def _get_thread_state_values(self, thread_id: str | None = None) -> dict[str, Any]:
-        """Fetch thread state values from the checkpoint.
-
-        In server mode the LangGraph dev server starts with an empty in-memory
-        thread store, so ``aget_state`` returns empty state for any thread that
-        was not registered in the current server session.  Calling
-        ``aensure_thread`` first registers the thread idempotently so the
-        subsequent ``aget_state`` call can read from the checkpointer correctly,
-        including proper reconstruction of delta channels.
-
-        When the remote path returns empty (server restarting, delta-channel
-        messages not yet replayed), a **local checkpointer fallback** reads the
-        same SQLite database and reconstructs messages by replaying the writes
-        table through LangChain's ``add_messages`` reducer. The fallback
-        filters ``checkpoint_ns = ''`` (parent graph only) so sub-graph messages never leak.
-
-        Args:
-            thread_id: Explicit thread ID to fetch.  Defaults to the current
-                active thread (``self._agent_thread_id``).
-        """
-        tid = thread_id or self._agent_thread_id
-        if not tid:
-            return {}
-
-        config: dict[str, Any] = {"configurable": {"thread_id": tid}}
-
-        # ── Path 1: Remote agent ──────────────────────────────────
-        if self._adapter and self._adapter.connected:
-            client = self._adapter._client
-            if hasattr(client, "aensure_thread"):
-                try:
-                    await client.aensure_thread(config)
-                except Exception:
-                    logger.debug("aensure_thread failed for %s, proceeding anyway", tid)
-
-            try:
-                state = await client.aget_state(config)
-                if state and state.values:
-                    res = dict(state.values)
-                    # Merge goal channels from local DB if missing or empty in remote state
-                    if not res.get("_goal_objective"):
-                        local_state = await self._reconstruct_state_from_local_db(tid)
-                        for k, v in local_state.items():
-                            if (k not in res or res[k] is None) and v is not None:
-                                res[k] = v
-                    return res
-            except Exception:
-                logger.debug(
-                    "Remote aget_state failed for %s; trying local checkpointer",
-                    tid,
-                    exc_info=True,
-                )
-
-        # ── Path 2: Local checkpointer fallback ───────────────────
-        # Reconstruct messages from the SQLite writes table through the
-        # add_messages reducer (with checkpoint_ns='').
-        return await self._reconstruct_state_from_local_db(tid)
+        return await _goals_ctrl(self).get_thread_state_values(thread_id)
 
     async def _reconstruct_state_from_local_db(
         self,
         thread_id: str,
     ) -> dict[str, Any]:
-        """Reconstruct thread state from the local SQLite checkpoint database.
-
-        This is the fallback when ``RemoteGraph.aget_state`` returns empty
-        (e.g. after a server restart before the thread is fully rehydrated).
-
-        The method reads message-channel writes from the ``writes`` table —
-        filtered to ``checkpoint_ns = ''`` (parent graph only) — and replays them through
-        LangChain's ``add_messages`` reducer.  This handles deduplication by
-        message ID, ``RemoveMessage`` deletions, and ``Overwrite`` resets,
-        producing the same result as ``Pregel.aget_state``'s
-        ``DeltaChannel.replay_writes``.
-
-        Returns:
-            State-values dict with a ``messages`` key.  Empty dict when the
-            database is missing or the thread has no writes.
-        """
-        import asyncio
-
-        from opscloud.state.session import get_db_path
-
-        db_path = get_db_path()
-        if not db_path.exists():
-            return {}
-
-        try:
-            import aiosqlite
-            from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-
-            serde = JsonPlusSerializer()
-
-            async with aiosqlite.connect(db_path) as conn:
-                # Read all message-channel writes for the parent graph only.
-                # Ordered by (checkpoint_id, task_id, idx) to replay oldest →
-                # newest, matching LangGraph's application order.
-                async with conn.execute(
-                    """
-                    SELECT type, value
-                    FROM writes
-                    WHERE thread_id = ?
-                      AND checkpoint_ns = ''
-                      AND channel = 'messages'
-                    ORDER BY checkpoint_id ASC, task_id ASC, idx ASC
-                    """,
-                    (thread_id,),
-                ) as cursor:
-                    rows: list[tuple[str, bytes]] = [
-                        (r[0], r[1]) for r in await cursor.fetchall()
-                    ]
-
-            if not rows:
-                return {}
-
-            # Decode + reduce in a worker thread (CPU-bound for large histories).
-            loop = asyncio.get_running_loop()
-            messages = await loop.run_in_executor(
-                None, self._reduce_message_writes, rows, serde
-            )
-            if messages:
-                return {"messages": messages}
-        except Exception:
-            logger.warning(
-                "Local DB reconstruction failed for thread %s",
-                thread_id,
-                exc_info=True,
-            )
-
-        return {}
+        return await _goals_ctrl(self).reconstruct_state_from_local_db(thread_id)
 
     @staticmethod
     def _reduce_message_writes(
         rows: list[tuple[str, bytes]],
         serde: Any,
     ) -> list[Any]:
-        """Replay message-channel write rows through ``add_messages``.
+        from opscloud.ui.controllers.goal_controller import GoalController
 
-        Runs synchronously in a worker thread.
-        """
-        from langgraph.graph.message import add_messages
-
-        accumulated: list[Any] = []
-
-        for type_str, value_blob in rows:
-            if not type_str or not value_blob:
-                continue
-            try:
-                delta = serde.loads_typed((type_str, value_blob))
-            except Exception:
-                logger.warning(
-                    "Failed to decode a message write row; skipping",
-                    exc_info=True,
-                )
-                continue
-
-            # Each delta is either a single message or a list of messages.
-            # add_messages handles dedup by ID, RemoveMessage, etc.
-            # Cast to list — add_messages returns a Messages union type but
-            # always produces a list at runtime.
-            if isinstance(delta, list):
-                accumulated = list(add_messages(accumulated, delta))
-            else:
-                accumulated = list(add_messages(accumulated, [delta]))
-
-        return accumulated
-
+        return GoalController.reduce_message_writes(rows, serde)
 
     async def _sync_goal_state_from_checkpoint(
         self,
@@ -2171,312 +1390,26 @@ class OpsCloudApp(App):
         proposal_request_id: str | None = None,
         allow_pending_proposal: bool = True,
     ) -> bool:
-        """Refresh goal/rubric metadata from the active checkpoint.
-
-        grading correlation, one-shot rubric bookkeeping, or auto-accept).
-
-        Args:
-            force: Read the checkpoint even when no goal fields are set locally.
-            proposal_request_id: When set, restore a pending proposal only if
-                it originated from this criteria request.
-            allow_pending_proposal: Whether a proposal from this turn may be
-                restored.  Failed/cancelled criteria turns set ``False``.
-
-        Returns:
-            Whether state was successfully reconciled.
-        """
-        from opscloud.commands.power.goal import GoalHandler, get_goal_state
-        from opscloud.ui.widgets.messages import AppMessage, ErrorMessage
-
-        goal_state = get_goal_state(self)
-        if not force and not (
-            goal_state.objective
-            or goal_state.rubric
-            or goal_state.next_rubric
-            or goal_state.status_note
-            or goal_state.pending_objective
-            or goal_state.pending_rubric
-        ):
-            return True
-
-        try:
-            state_values = await self._get_thread_state_values()
-        except Exception:
-            logger.warning("Failed to refresh goal/rubric state", exc_info=True)
-            if force:
-                # Criteria were generated but couldn't be loaded
-                # (reference: app.py L11840-L11845).
-                if goal_state.pending_objective and goal_state.pending_rubric:
-                    self._open_goal_review(
-                        goal_state.pending_objective,
-                        goal_state.pending_rubric,
-                    )
-                else:
-                    await self._mount_message(
-                        ErrorMessage(
-                            "Acceptance criteria were generated but could not be "
-                            "loaded from the thread. Run `/goal` again to retry."
-                        )
-                    )
-            return False
-
-        if not state_values:
-            return True
-
-        # ── Extract checkpoint goal fields ────────────────
-        pending_obj = None
-        pending_rubric = None
-        pending_kind = None
-        pending_request_id = None
-
-        raw_pending_obj = state_values.get("_pending_goal_objective")
-        if isinstance(raw_pending_obj, str) and raw_pending_obj.strip():
-            pending_obj = raw_pending_obj.strip()
-        raw_pending_rubric = state_values.get("_pending_goal_rubric")
-        if isinstance(raw_pending_rubric, str) and raw_pending_rubric.strip():
-            pending_rubric = raw_pending_rubric.strip()
-        raw_pending_kind = state_values.get("_pending_goal_kind")
-        if isinstance(raw_pending_kind, str) and raw_pending_kind.strip():
-            pending_kind = raw_pending_kind.strip()
-        raw_pending_request_id = state_values.get("_pending_goal_request_id")
-        if isinstance(raw_pending_request_id, str):
-            pending_request_id = raw_pending_request_id
-
-        # ── Active goal fields from checkpoint ───────────
-        raw_obj = state_values.get("_goal_objective")
-        if isinstance(raw_obj, str) and raw_obj.strip():
-            goal_state.objective = raw_obj.strip()
-        raw_status = state_values.get("_goal_status")
-        if isinstance(raw_status, str) and raw_status in {
-            "active", "blocked", "complete", "paused",
-        }:
-            goal_state.status = raw_status  # type: ignore[assignment]
-        raw_note = state_values.get("_goal_status_note")
-        if isinstance(raw_note, str) and raw_note.strip():
-            goal_state.status_note = raw_note.strip()
-        raw_rubric = state_values.get("_goal_rubric") or state_values.get("_sticky_rubric")
-        if isinstance(raw_rubric, str) and raw_rubric.strip():
-            goal_state.rubric = raw_rubric.strip()
-
-        # ── Resolve goal completion from rubric evaluation ──
-        rubric_status = state_values.get("_rubric_status")
-        pending_completion_note = state_values.get("_pending_goal_completion_note")
-        previous_status = raw_status or goal_state.status
-
-        if (
-            (rubric_status == "satisfied" or goal_state.status == "complete")
-            and goal_state.objective
-            and (raw_status == "active" or goal_state.status == "complete")
-        ):
-            note = pending_completion_note or goal_state.status_note or "Acceptance criteria satisfied."
-            goal_state.status = "complete"
-            goal_state.status_note = note
-            goal_state.pending_objective = None
-            goal_state.pending_rubric = None
-            goal_state.pending_kind = None
-
-            from opscloud.middleware.goal_state_notice import build_goal_state_notice
-            state_update = self._goal_state_update()
-            state_update["_pending_goal_completion_note"] = None
-            state_update["_rubric_status"] = None
-            persisted = await self._persist_goal_rubric_state(
-                notice=build_goal_state_notice(state_update),
-                state_update=state_update,
-            )
-            if persisted and previous_status != "complete":
-                await self._mount_message(AppMessage(f"Goal marked complete.\n\n{note}"))
-        elif rubric_status == "max_iterations_reached" and pending_completion_note:
-            await self._mount_message(
-                ErrorMessage(
-                    "Goal completion was not recorded: the iteration limit was reached "
-                    "with unmet criteria. The goal remains active for resume, "
-                    "amendment, retry, or clearing."
-                )
-            )
-
-        # ── Gate pending proposal on request correlation ──
-        discard = False
-        if not allow_pending_proposal and pending_obj is not None:
-            if proposal_request_id is None or pending_request_id == proposal_request_id:
-                discard = True
-        if (
-            proposal_request_id is not None
-            and pending_request_id != proposal_request_id
-        ):
-            discard = True
-
-        if discard:
-            pending_obj = None
-            pending_rubric = None
-            pending_kind = None
-            pending_request_id = None
-            goal_state.pending_objective = None
-            goal_state.pending_rubric = None
-            goal_state.pending_kind = None
-        else:
-            goal_state.pending_objective = pending_obj
-            goal_state.pending_rubric = pending_rubric
-            goal_state.pending_kind = pending_kind
-
-        GoalHandler._sync_status_rubric(self, goal_state)
-
-        # ── Mount review if pending proposal exists ──────
-        if pending_obj and pending_rubric:
-            self._open_goal_review(pending_obj, pending_rubric)
-
-        return True
+        return await _goals_ctrl(self).sync_goal_state_from_checkpoint(
+            force=force,
+            proposal_request_id=proposal_request_id,
+            allow_pending_proposal=allow_pending_proposal,
+        )
 
     async def _sync_session_cost_from_checkpoint(self) -> None:
-        """Reconcile displayed context tokens, cumulative cost, and session tokens from the checkpoint.
-
-        The streamed totals already track spend during a turn; this settles the
-        display at the end of one from the authoritative SQLite checkpointer.
-        """
-        if not self._agent_thread_id:
-            return
-        try:
-            state_values = await self._get_thread_state_values(self._agent_thread_id)
-        except Exception:
-            logger.debug(
-                "Could not load thread state while reconciling cost and token state",
-                exc_info=True,
-            )
-            return
-
-        cost_val = state_values.get("_session_cost_usd")
-        if isinstance(cost_val, (int, float)) and math.isfinite(cost_val) and cost_val >= 0:
-            self._session_cost_usd = float(cost_val)
-            if self._status_bar:
-                self._status_bar.set_cost(self._session_cost_usd)
-
-        total_tokens = state_values.get("_session_total_tokens")
-        if isinstance(total_tokens, int) and total_tokens >= 0:
-            self._cumulative_session_tokens = total_tokens
-
-        context_tokens = state_values.get("_context_tokens")
-        if isinstance(context_tokens, int) and context_tokens >= 0:
-            self._context_tokens = context_tokens
-            if self._status_bar:
-                display_tokens = self._cumulative_session_tokens or self._context_tokens
-                if display_tokens > 0:
-                    self._status_bar.set_tokens(display_tokens, context_tokens=self._context_tokens)
+        await _goals_ctrl(self).sync_session_cost_from_checkpoint()
 
     async def _run_goal_criteria_request(
         self,
         request: dict[str, Any],
     ) -> None:
-        """Submit one typed criteria request through the normal agent stream.
-
-        """
-        if not self._adapter or not self._adapter.connected:
-            await self._mount_message(
-                ErrorMessage(
-                    "Goal criteria generation requires a connected server."
-                )
-            )
-            return
-        self._agent_running = True
-        if self._chat_input:
-            # Disable input while criteria run.
-            pass
-        self._agent_worker = self.run_worker(
-            self._run_agent_task(
-                "",
-                graph_input={
-                    "messages": [],
-                    "goal_criteria_request": request,
-                },
-            ),
-            exclusive=False,
-        )
+        await _goals_ctrl(self).run_goal_criteria_request(request)
 
     async def _accept_goal_rubric(
         self,
         rubric: str,
     ) -> bool:
-        """Apply accepted criteria: persist to checkpoint and start work.
-
-
-        Returns:
-            Whether the proposal was accepted.
-        """
-        from opscloud.commands.power.goal import GoalHandler, get_goal_state
-
-        goal_state = get_goal_state(self)
-        objective = goal_state.pending_objective
-        if not objective:
-            await self._mount_message(
-                SystemMessage("No pending goal to accept.")
-            )
-            return False
-        rubric = rubric.strip()
-        if not rubric:
-            await self._mount_message(
-                SystemMessage("Cannot accept empty goal criteria.")
-            )
-            return False
-
-        kind = goal_state.pending_kind or "create"
-        is_amendment = kind == "amend"
-
-        if is_amendment and (not goal_state.objective or goal_state.status == "complete"):
-            await self._mount_message(
-                SystemMessage(
-                    "The goal is no longer active. Start a new goal with "
-                    "`/goal <objective>`."
-                )
-            )
-            return False
-
-        # ── Persist accepted state ───────────────────────
-        goal_state.objective = objective
-        goal_state.rubric = rubric
-        goal_state.next_rubric = None
-        if not is_amendment or goal_state.status == "blocked":
-            goal_state.status = "active"
-            goal_state.status_note = None
-        goal_state.pending_objective = None
-        goal_state.pending_rubric = None
-        goal_state.pending_kind = None
-        GoalHandler._sync_status_rubric(self, goal_state)
-
-        from langchain_core.messages import SystemMessage as LCSystemMessage
-
-        notice = LCSystemMessage(content=f"Goal {'amended' if is_amendment else 'accepted'}.")
-        persisted = await self._persist_goal_rubric_state(notice=notice)
-
-        # ── User feedback message ────────────────────────
-        if is_amendment:
-            await self._mount_message(
-                SystemMessage("Goal amended." + ("" if persisted else
-                    " (could not be saved to thread)"))
-            )
-        else:
-            await self._mount_message(
-                SystemMessage(
-                    "Goal accepted. It will stay active for this thread until paused, "
-                    "completed, blocked, or cleared.\nUse /goal show to inspect it or "
-                    "/goal clear to remove it."
-                )
-            )
-            if not persisted:
-                await self._mount_message(
-                    ErrorMessage(
-                        "Goal accepted for this session, but it could not be saved "
-                        "to the thread."
-                    )
-                )
-
-        # ── Continuation: start working toward the goal ──
-        if goal_state.status == "paused":
-            return True
-        if not self._agent_running:
-            await self._continue_goal_work(
-                "amended" if is_amendment else "created",
-                objective=objective,
-                persisted=persisted,
-            )
-        return True
+        return await _goals_ctrl(self).accept_goal_rubric(rubric)
 
     async def _continue_goal_work(
         self,
@@ -2485,18 +1418,13 @@ class OpsCloudApp(App):
         objective: str | None = None,
         persisted: bool = True,
     ) -> None:
-        """Send one hidden command that resumes work after a goal transition.
-
-        """
-        from opscloud.middleware.goal_state_notice import build_goal_continuation
-
-        continuation = build_goal_continuation(
-            transition,  # type: ignore[arg-type]
-            unsaved_objective=None if persisted else objective,
+        await _goals_ctrl(self).continue_goal_work(
+            transition,
+            objective=objective,
+            persisted=persisted,
         )
-        await self._send_to_agent(cast("str", continuation.content))
 
-    # ── Shell Command Execution ──────────────────────────
+    # ── Shell Command Execution (ShellController) ────────
 
     async def _handle_shell_command(
         self,
@@ -2504,23 +1432,7 @@ class OpsCloudApp(App):
         *,
         incognito: bool = False,
     ) -> None:
-        """Handle a shell command (``!`` prefix).
-
-        Mounts the user message and spawns a worker so the event loop
-        stays free for key events (Esc/Ctrl+C).
-
-        Args:
-            command: The shell command to execute.
-            incognito: Whether command/output should remain local-only.
-        """
-        if not incognito:
-            await self._mount_message(UserMessage(f"!{command}"))
-        self._shell_running = True
-
-        self._shell_worker = self.run_worker(
-            self._run_shell_task(command, incognito=incognito),
-            exclusive=False,
-        )
+        await _shell_ctrl(self).handle_shell_command(command, incognito=incognito)
 
     async def _run_shell_task(
         self,
@@ -2528,86 +1440,11 @@ class OpsCloudApp(App):
         *,
         incognito: bool = False,
     ) -> None:
-        """Run a shell command in a background worker.
-
-        Args:
-            command: The shell command to execute.
-            incognito: Whether command/output should remain local-only.
-        """
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=(sys.platform != "win32"),
-            )
-            self._shell_process = proc
-
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=_SHELL_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                await self._kill_shell_process()
-                await self._mount_message(
-                    ErrorMessage(f"Command timed out ({_SHELL_TIMEOUT_SECONDS}s limit)")
-                )
-                return
-            except asyncio.CancelledError:
-                await self._kill_shell_process()
-                raise
-
-            output = (stdout_bytes or b"").decode(errors="replace").strip()
-            stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
-            if stderr_text:
-                output += f"\n[stderr]\n{stderr_text}"
-
-            if output:
-                if incognito:
-                    await self._mount_message(
-                        SystemMessage(f"```text\n{output}\n```")
-                    )
-                else:
-                    await self._mount_message(
-                        AssistantMessage(f"```text\n{output}\n```")
-                    )
-            else:
-                await self._mount_message(
-                    SystemMessage("Command completed (no output)")
-                )
-
-            if proc.returncode and proc.returncode != 0:
-                await self._mount_message(
-                    ErrorMessage(f"Exit code: {proc.returncode}")
-                )
-
-            if not incognito:
-                self._buffer_shell_for_model_context(command, output, proc.returncode)
-
-        except asyncio.CancelledError:
-            logger.debug("Shell task cancelled")
-        except Exception as e:
-            logger.exception("Shell command failed: %s", e)
-            await self._mount_message(ErrorMessage(f"Shell error: {e!r}"))
-        finally:
-            self._shell_running = False
-            self._shell_process = None
-            self._shell_worker = None
-            # Drain queue after shell completes
-            await self._process_next_from_queue()
+        await _shell_ctrl(self).run_shell_task(command, incognito=incognito)
 
     async def _kill_shell_process(self) -> None:
-        """Terminate the active shell process."""
-        proc = self._shell_process
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except (TimeoutError, ProcessLookupError):
-            with suppress(ProcessLookupError):
-                proc.kill()
+        await _shell_ctrl(self).kill_shell_process()
+
 
     # ── Queue Processing ─────────────────────────────────
 
@@ -2828,40 +1665,10 @@ class OpsCloudApp(App):
                 new_text = "\n\n".join(texts)
                 self._chat_input.text = f"{existing}\n\n{new_text}" if existing else new_text
 
-    # ── /restart Implementation ──────────────────────────
+    # ── /restart, /reload, /install & /update (ServerLifecycleController) ──
 
     async def _handle_restart_command(self, command: str, *, echo: bool = False) -> None:
-        """Drive the `/restart` slash command.
-
-        Superset of `/reload`: re-reads .env/environment, clears configuration
-        caches, then respawns the app-owned LangGraph server subprocess.
-        """
-        reload_task = self._reload_task
-        defer_restart = (
-            self._reloading and reload_task is not None and not reload_task.done()
-        )
-        if defer_restart:
-            self._restart_requested_during_reload = True
-
-        if echo:
-            await self._mount_message(UserMessage(command))
-
-        if defer_restart:
-            await self._mount_message(
-                SystemMessage("Reload already in progress; server restart requested.")
-            )
-            return
-
-        restart_task = self._restart_respawn_task
-        if restart_task is not None and not restart_task.done():
-            await self._mount_message(
-                SystemMessage(
-                    "A server restart is already in progress. Queued prompts "
-                    "will be sent once it finishes."
-                )
-            )
-            return
-        self._schedule_restart_command()
+        await _server_ctrl(self).handle_restart_command(command, echo=echo)
 
     def _schedule_restart_command(
         self,
@@ -2870,38 +1677,17 @@ class OpsCloudApp(App):
         propagate_errors: bool = False,
         mutation_lock_held: bool = False,
     ) -> asyncio.Task[bool]:
-        """Run config refresh and server respawn off the Textual message pump."""
-        active = self._restart_respawn_task
-        if active is not None and not active.done():
-            return cast("asyncio.Task[bool]", active)
-
-        task = asyncio.create_task(
-            self._run_restart_command_detached(
-                preserve_queue=preserve_queue,
-                propagate_errors=propagate_errors,
-                mutation_lock_held=mutation_lock_held,
-            ),
-            name="restart",
+        return _server_ctrl(self).schedule_restart_command(
+            preserve_queue=preserve_queue,
+            propagate_errors=propagate_errors,
+            mutation_lock_held=mutation_lock_held,
         )
-        self._restart_respawn_task = task
-        self._track_server_restart_task(task)
-        task.add_done_callback(self._finish_restart)
-        return task
 
     def _track_server_restart_task(self, task: asyncio.Task[Any]) -> None:
-        self._server_restart_tasks.add(task)
-        task.add_done_callback(self._server_restart_tasks.discard)
+        _server_ctrl(self).track_server_restart_task(task)
 
     def _finish_restart(self, task: asyncio.Task[Any]) -> None:
-        """Resume prompts whose server-ready drain raced restart completion."""
-        if task is not self._restart_respawn_task:
-            return
-        if self._pending_messages and not self._agent_running and not self._exit:
-            drain = asyncio.create_task(
-                self._process_next_from_queue(),
-                name="drain-after-restart",
-            )
-            drain.add_done_callback(lambda t: None)
+        _server_ctrl(self).finish_restart(task)
 
     async def _run_restart_command_detached(
         self,
@@ -2910,28 +1696,11 @@ class OpsCloudApp(App):
         propagate_errors: bool = False,
         mutation_lock_held: bool = False,
     ) -> bool:
-        """Serialize and safely report a detached /restart continuation."""
-        try:
-            if mutation_lock_held:
-                return await self._run_restart_command(
-                    preserve_queue=preserve_queue,
-                    propagate_errors=propagate_errors,
-                )
-            async with self._environment_mutation_lock:
-                return await self._run_restart_command(
-                    preserve_queue=preserve_queue,
-                    propagate_errors=propagate_errors,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if propagate_errors:
-                raise
-            logger.exception("Manual /restart failed unexpectedly")
-            await self._mount_message(
-                ErrorMessage(f"Restart failed: {type(exc).__name__}: {exc}")
-            )
-            return False
+        return await _server_ctrl(self).run_restart_command_detached(
+            preserve_queue=preserve_queue,
+            propagate_errors=propagate_errors,
+            mutation_lock_held=mutation_lock_held,
+        )
 
     async def _run_restart_command(
         self,
@@ -2939,175 +1708,22 @@ class OpsCloudApp(App):
         preserve_queue: bool = False,
         propagate_errors: bool = False,
     ) -> bool:
-        """Validate and schedule a restart."""
-        if self._connecting and self._reconnecting:
-            await self._mount_message(
-                SystemMessage(
-                    "A server restart is already in progress. Queued prompts "
-                    "will be sent once it finishes."
-                )
-            )
-            return False
-
-        # Sever in-flight work bound to the dying subprocess
-        preserved = None
-        if self._agent_running and self._agent_worker:
-            preserved = list(self._pending_messages) if preserve_queue else None
-            self._agent_worker.cancel()
-            self._agent_running = False
-        elif not preserve_queue:
-            self._discard_queue()
-
-        if preserved is not None:
-            self._pending_messages.extendleft(reversed(preserved))
-            self._sync_status_queued()
-
-        if not await self._reload_configuration_for_restart():
-            await self._restore_queue_to_input(
-                "Configuration reload failed; queued prompts were returned to "
-                "the input. Re-submit them or run `/restart` again after fixing "
-                "the configuration.",
-                empty_notice="Configuration reload failed. Fix the configuration, then run `/restart` again.",
-            )
-            return False
-
-        if self._server_kwargs is None:
-            await self._restore_queue_to_input(
-                "Cannot restart: this app is connected to a remote LangGraph "
-                "server (no owned subprocess). Configuration was reloaded; "
-                "queued prompts were returned to the input. Re-submit them to "
-                "send on the current session, or relaunch opscloud to fully restart.",
-                empty_notice=(
-                    "Cannot restart: this app is connected to a remote LangGraph "
-                    "server (no owned subprocess). Configuration was reloaded; "
-                    "relaunch opscloud to fully restart."
-                ),
-            )
-            return False
-
-        if self._connecting or self._server_proc is None:
-            if self._server_startup_deferred:
-                notice = (
-                    "Server startup is waiting for a model. Configuration was "
-                    "reloaded; queued prompts were returned to the input. Set "
-                    "credentials with `/auth`, reload the environment with "
-                    "`/reload`, or pick a model with `/model` to start the "
-                    "server."
-                )
-                empty_notice = (
-                    "Server startup is waiting for a model. Configuration was "
-                    "reloaded. Set credentials with `/auth`, reload the "
-                    "environment with `/reload`, or pick a model with `/model` "
-                    "to start the server."
-                )
-            elif self._connecting:
-                notice = (
-                    "The server is still starting. Configuration was reloaded "
-                    "and will apply once it finishes connecting; queued prompts "
-                    "were returned to the input. Re-submit them to send on the "
-                    "current session, or run `/restart` again afterward."
-                )
-                empty_notice = (
-                    "The server is still starting. Configuration was reloaded "
-                    "and will apply once it finishes connecting; run `/restart` "
-                    "again afterward."
-                )
-            elif self._server_startup_error is not None:
-                notice = (
-                    "Cannot restart yet because the server did not finish "
-                    "starting. Configuration was reloaded; queued prompts were "
-                    "returned to the input. Update credentials with `/auth` if "
-                    "needed, then pick a model with `/model` to try again. You "
-                    "can also relaunch opscloud.\n\n"
-                    f"Last error: {self._server_startup_error}"
-                )
-                empty_notice = (
-                    "Cannot restart yet because the server did not finish "
-                    "starting. Configuration was reloaded. Update credentials "
-                    "with `/auth` if needed, then pick a model with `/model` to "
-                    "try again. You can also relaunch opscloud.\n\n"
-                    f"Last error: {self._server_startup_error}"
-                )
-            else:
-                notice = (
-                    "Cannot restart yet because the server is not running. "
-                    "Configuration was reloaded; queued prompts were returned "
-                    "to the input. Relaunch opscloud to start again."
-                )
-                empty_notice = (
-                    "Cannot restart yet because the server is not running. "
-                    "Configuration was reloaded. Relaunch opscloud to start again."
-                )
-            await self._restore_queue_to_input(notice, empty_notice=empty_notice)
-            return False
-
-        self._connecting = True
-        self._reconnecting = True
-        self._sync_status_connection()
-        return await self._run_restart_respawn(propagate_errors=propagate_errors)
+        return await _server_ctrl(self).run_restart_command(
+            preserve_queue=preserve_queue,
+            propagate_errors=propagate_errors,
+        )
 
     async def _reload_configuration_for_restart(self) -> bool:
-        """Refresh configuration and caches for restart."""
-        try:
-            if hasattr(self._settings, "reload_from_environment"):
-                await asyncio.to_thread(self._settings.reload_from_environment)
-            from opscloud.model.config import clear_caches
-            clear_caches()
-            return True
-        except Exception as exc:
-            logger.warning("Configuration reload for restart error: %s", exc)
-            return False
+        return await _server_ctrl(self).reload_configuration_for_restart()
 
     async def _run_restart_respawn(self, *, propagate_errors: bool = False) -> bool:
-        """Respawn the server for `/restart`, detached from the message pump."""
-        restarting = None
-        restarted = False
-        failure: Exception | None = None
-        try:
-            restarting = await self._mount_transient_app_message("Restarting server...")
-            restarted = await self._restart_server_manual()
-        except Exception as exc:
-            if propagate_errors:
-                failure = exc
-            else:
-                logger.exception("Manual /restart of server raised unexpectedly")
-                await self._mount_message(
-                    ErrorMessage(f"Restart failed: {type(exc).__name__}: {exc}")
-                )
-        finally:
-            if not restarted:
-                self._connecting = False
-                self._reconnecting = False
-                self._sync_status_connection()
-            if restarting is not None:
-                try:
-                    await restarting.remove()
-                except Exception:
-                    pass
-
-        if restarted:
-            await self._mount_message(SystemMessage("Restart complete."))
-        else:
-            await self._restore_queue_to_input(
-                "Restart did not complete; queued prompts were returned to the "
-                "input. Re-submit them to send on the current session.",
-                empty_notice="Restart did not complete. Run `/restart` to try again.",
-            )
-        if failure is not None:
-            raise failure
-        return restarted
+        return await _server_ctrl(self).run_restart_respawn(propagate_errors=propagate_errors)
 
     async def _restart_server_manual(self) -> bool:
-        """Respawn the app-owned LangGraph server for a user-initiated restart."""
-        return (await self._restart_server_manual_result()).restarted
+        return await _server_ctrl(self).restart_server_manual()
 
     async def _restart_server_manual_result(self) -> _ServerRespawnResult:
-        """Respawn the app-owned server for a user-initiated restart."""
-        return await self._respawn_server(
-            log_message="User-initiated server restart failed",
-            mcp_failure_log="MCP metadata preload after user-initiated restart failed",
-            mcp_failure_toast="MCP tool metadata could not be refreshed. Use /mcp to check.",
-        )
+        return await _server_ctrl(self).restart_server_manual_result()
 
     async def _respawn_server(
         self,
@@ -3117,499 +1733,40 @@ class OpsCloudApp(App):
         mcp_failure_toast: str = "MCP metadata could not be refreshed",
         restart_timeout: float = 60.0,
     ) -> _ServerRespawnResult:
-        """Stop the app-owned server subprocess and rebuild the agent."""
-        server_proc = self._server_proc
-        if server_proc is None or self._exit:
-            return _ServerRespawnResult(restarted=False)
-
-        try:
-            self._connecting = True
-            self._reconnecting = True
-            self._sync_status_connection()
-
-            if hasattr(server_proc, "restart"):
-                await server_proc.restart(timeout=restart_timeout)
-            else:
-                await asyncio.to_thread(server_proc.stop)
-                await asyncio.to_thread(server_proc.start)
-
-            if self._exit:
-                try:
-                    server_proc.stop()
-                except Exception:
-                    pass
-                return _ServerRespawnResult(restarted=False)
-
-            from opscloud.mcp.preload import preload_mcp_server_info
-            from opscloud.ui.remote_client import RemoteAgent
-
-            mcp_info = None
-            mcp_error = None
-            mcp_status: _McpRefreshStatus = "unavailable"
-            preload_kwargs = dict(getattr(self, "_mcp_preload_kwargs", {}) or {})
-
-            if preload_kwargs.get("no_mcp"):
-                mcp_status = "disabled"
-            else:
-                try:
-                    mcp_info = await preload_mcp_server_info(**preload_kwargs)
-                    mcp_status = "fresh" if mcp_info is not None else "unavailable"
-                except Exception as exc:
-                    logger.exception(mcp_failure_log)
-                    mcp_error = f"{type(exc).__name__}: {exc}"
-                    self.notify(f"{mcp_failure_toast} ({mcp_error})", severity="warning")
-
-            ready_mcp_info = mcp_info if mcp_status != "unavailable" else self._mcp_server_info
-
-            if getattr(server_proc, "is_in_process", False) is True:
-                self._client = server_proc.create_client()
-            else:
-                self._client = RemoteAgent(url=server_proc.url, graph_name="agent")
-            if self._adapter:
-                self._adapter.set_client(self._client)
-
-            self.post_message(
-                self.ServerReady(
-                    client=self._client,
-                    server_proc=server_proc,
-                    mcp_server_info=ready_mcp_info,
-                )
-            )
-            self._reconnecting = False
-            return _ServerRespawnResult(
-                restarted=True,
-                mcp_server_info=mcp_info,
-                mcp_status=mcp_status,
-                mcp_error=mcp_error,
-            )
-        except Exception as exc:
-            self._connecting = False
-            self._reconnecting = False
-            self._sync_status_connection()
-            logger.exception(log_message)
-            self.post_message(self.ServerStartFailed(error=exc))
-            return _ServerRespawnResult(restarted=False)
-
-    # ── /reload Implementation ───────────────────────────
+        return await _server_ctrl(self).respawn_server(
+            log_message=log_message,
+            mcp_failure_log=mcp_failure_log,
+            mcp_failure_toast=mcp_failure_toast,
+            restart_timeout=restart_timeout,
+        )
 
     def _take_reload_snapshot(self) -> dict[str, Any]:
-        """Capture runtime snapshot of reloadable items for change detection."""
-        try:
-            from opscloud.config.cloud_profiles import get_active_aws_profile, get_active_aws_region
-            from opscloud.config.toml_config import load_agent_pool, load_default_agent, load_default_model
-
-            prof = get_active_aws_profile()
-            reg = get_active_aws_region() or (getattr(self._settings, "aws_region", None) if self._settings else None)
-            pool = load_agent_pool()
-            def_model = load_default_model()
-            def_agent = load_default_agent()
-            theme_name = getattr(self, "theme", None)
-            return {
-                "aws_profile": prof,
-                "aws_region": reg,
-                "agent_pool": pool.copy() if pool else None,
-                "default_model": def_model,
-                "default_agent": def_agent,
-                "theme": theme_name,
-            }
-        except Exception:
-            logger.exception("Failed to capture reload snapshot")
-            return {}
+        return _server_ctrl(self).take_reload_snapshot()
 
     def _schedule_reload(self) -> asyncio.Task[None]:
-        """Run `/reload` off the Textual message pump."""
-        reload_task = self._reload_task
-        if self._reloading and reload_task is not None and not reload_task.done():
-            self.notify("Reload already in progress.", severity="information")
-            return reload_task
-
-        self._reloading = True
-        task = asyncio.create_task(self._run_reload_sequence(), name="reload")
-        task.add_done_callback(self._finish_reload)
-        self._reload_task = task
-        return task
+        return _server_ctrl(self).schedule_reload()
 
     def _finish_reload(self, task: asyncio.Task[None]) -> None:
-        """Release the reload guard and resume prompts queued during reload."""
-        if task is not self._reload_task:
-            return
-        self._reloading = False
-        if self._pending_messages and not self._agent_running and not self._exit:
-            self.call_after_refresh(
-                lambda: asyncio.create_task(self._process_next_from_queue())
-            )
+        _server_ctrl(self).finish_reload(task)
 
     async def _run_reload_sequence(self) -> None:
-        """Run reload work, then honor restart requests it did not satisfy."""
-        try:
-            await self._run_reload()
-        except asyncio.CancelledError:
-            self._restart_requested_during_reload = False
-            raise
-
-        if self._exit:
-            self._restart_requested_during_reload = False
-            return
-        if self._restart_requested_during_reload:
-            self._restart_requested_during_reload = False
-            self._schedule_restart_command(preserve_queue=True)
+        await _server_ctrl(self).run_reload_sequence()
 
     async def _run_reload(self) -> None:
-        """Refresh config, themes, skills, plugins, and hooks, then report."""
-        async with self._environment_mutation_lock:
-            await self._run_reload_unlocked()
+        await _server_ctrl(self).run_reload()
 
     async def _run_reload_unlocked(self) -> None:
-        """Run `/reload` while the environment mutation lock is held."""
-        from opscloud.config.toml_config import format_agent_pool_summary
-        from opscloud.plugins.adapters.mcp import plugin_mcp_configs
-        from opscloud.plugins.discovery import discover_plugins
-
-        try:
-            old_snapshot = dict(self._last_reload_snapshot) if self._last_reload_snapshot else self._take_reload_snapshot()
-            old_skill_names = {
-                str(s.get("name", "")) for s in (self._discovered_skills or []) if s.get("name")
-            }
-            old_mcp_server_info = self._mcp_server_info
-
-            # 1. Reload configuration & .env
-            try:
-                changes = await asyncio.to_thread(self._settings.reload_from_environment)
-                from opscloud.model.config import clear_caches
-                clear_caches()
-                from opscloud.model.pool import clear_pool_caches
-                clear_pool_caches()
-                from opscloud.config.cloud_profiles import invalidate_aws_profile_cache
-                invalidate_aws_profile_cache()
-
-                if self._settings is not None:
-                    prof = getattr(self._settings, "aws_profile", None)
-                    if isinstance(prof, str) and prof:
-                        os.environ["OPSCLOUD_SERVER_AWS_PROFILE"] = prof
-                    reg = getattr(self._settings, "aws_region", None)
-                    if isinstance(reg, str) and reg:
-                        os.environ["OPSCLOUD_SERVER_AWS_REGION"] = reg
-
-                    if self._server_kwargs is not None:
-                        if isinstance(prof, str) and prof:
-                            self._server_kwargs["aws_profile"] = prof
-                        if isinstance(reg, str) and reg:
-                            self._server_kwargs["aws_region"] = reg
-
-                    if self._server_proc is not None:
-                        try:
-                            from dataclasses import is_dataclass, replace
-                            cur_cfg = getattr(self._server_proc, "config", None)
-                            updates: dict[str, Any] = {}
-                            if isinstance(prof, str) and prof:
-                                updates["aws_profile"] = prof
-                            if isinstance(reg, str) and reg:
-                                updates["aws_region"] = reg
-                            if updates and cur_cfg is not None and is_dataclass(cur_cfg):
-                                self._server_proc.config = replace(cast(Any, cur_cfg), **updates)
-                        except Exception:
-                            logger.debug("Could not update server_proc.config with reloaded settings", exc_info=True)
-
-                    self._sync_status_cloud()
-            except (OSError, ValueError, Exception):
-                logger.exception("Failed to reload configuration")
-                await self._mount_message(
-                    SystemMessage(
-                        "Failed to reload configuration. Check your .env "
-                        "file and environment variables for syntax errors, "
-                        "then try again."
-                    )
-                )
-                return
-
-            # Diff snapshot for AWS and pool changes
-            new_snapshot = self._take_reload_snapshot()
-            self._last_reload_snapshot = new_snapshot
-
-            if old_snapshot.get("aws_profile") != new_snapshot.get("aws_profile"):
-                c_str = f"aws_profile: {old_snapshot.get('aws_profile')} -> {new_snapshot.get('aws_profile')}"
-                if not any(c.startswith("aws_profile:") for c in changes):
-                    changes.append(c_str)
-
-            if old_snapshot.get("aws_region") != new_snapshot.get("aws_region"):
-                c_str = f"aws_region: {old_snapshot.get('aws_region')} -> {new_snapshot.get('aws_region')}"
-                if not any(c.startswith("aws_region:") for c in changes):
-                    changes.append(c_str)
-
-            if old_snapshot.get("agent_pool") != new_snapshot.get("agent_pool"):
-                old_desc = format_agent_pool_summary(old_snapshot.get("agent_pool"))
-                new_desc = format_agent_pool_summary(new_snapshot.get("agent_pool"))
-                c_str = f"agent_pool: {old_desc} -> {new_desc}"
-                if not any(c.startswith("agent_pool:") for c in changes):
-                    changes.append(c_str)
-
-            if old_snapshot.get("default_model") != new_snapshot.get("default_model"):
-                c_str = f"default_model: {old_snapshot.get('default_model')} -> {new_snapshot.get('default_model')}"
-                if not any(c.startswith("default_model:") for c in changes):
-                    changes.append(c_str)
-
-            if old_snapshot.get("default_agent") != new_snapshot.get("default_agent"):
-                c_str = f"default_agent: {old_snapshot.get('default_agent')} -> {new_snapshot.get('default_agent')}"
-                if not any(c.startswith("default_agent:") for c in changes):
-                    changes.append(c_str)
-
-            # 2. Reload themes
-            theme_reload_ok = True
-            try:
-                from opscloud.ui import theme
-                theme.reload_registry()
-                theme.register_app_themes(self)
-            except Exception:
-                theme_reload_ok = False
-                logger.warning("Failed to reload themes", exc_info=True)
-
-            # 3. Re-discover skills & custom commands
-            try:
-                from opscloud.commands.custom.loader import clear_custom_command_cache
-
-                clear_custom_command_cache()
-                if hasattr(self, "_command_router") and self._command_router:
-                    self._command_router.reload_custom_commands()
-            except Exception:
-                logger.debug("Custom command reload skipped", exc_info=True)
-
-            self._discovered_skills = await asyncio.to_thread(self.get_discovered_skills)
-            new_skill_names = {
-                str(s.get("name", "")) for s in (self._discovered_skills or []) if s.get("name")
-            }
-            added_skills = sorted(new_skill_names - old_skill_names)
-            removed_skills = sorted(old_skill_names - new_skill_names)
-
-            if hasattr(self, "_chat_input") and self._chat_input:
-                from opscloud.ui.command_registry import (
-                    build_agent_commands,
-                    build_custom_commands,
-                    build_skill_commands,
-                    get_all_entries,
-                )
-
-                skill_commands = build_skill_commands(self._discovered_skills)
-                plugin_agents = self.get_discovered_plugin_agents()
-                self._discovered_plugin_agents = plugin_agents
-                skill_commands.extend(build_agent_commands(plugin_agents or []))
-                skill_commands.extend(build_custom_commands())
-                self._chat_input.update_slash_commands(get_all_entries(skill_commands))
-
-            # 4. Compose initial report lines
-            report_lines = ["### Configuration Reloaded", ""]
-            if changes:
-                report_lines.append("**Configuration reloaded. Changes:**")
-                report_lines.extend(f"  - `{change}`" for change in changes)
-            else:
-                report_lines.append("• **Configuration reloaded. No changes detected.**")
-
-            active_prof = new_snapshot.get("aws_profile") or (getattr(self._settings, "aws_profile", None) if self._settings else None) or "default"
-            active_reg = new_snapshot.get("aws_region") or (getattr(self._settings, "aws_region", None) if self._settings else None) or "us-east-1"
-            report_lines.append(f"• **AWS configuration:** profile `{active_prof}` ({active_reg})")
-
-            active_pool = new_snapshot.get("agent_pool")
-            if active_pool:
-                fast = active_pool.get("fast", "-")
-                std = active_pool.get("standard", "-")
-                pow_m = active_pool.get("powerful", "-")
-                prov = active_pool.get("provider", "multi")
-                report_lines.append(
-                    f"• **Agent model pool:** fast=`{fast}`, standard=`{std}`, powerful=`{pow_m}` (provider: {prov})"
-                )
-            else:
-                report_lines.append("• **Agent model pool:** default dynamic routing")
-
-            report_lines.append("• **Model config caches cleared.**")
-            if theme_reload_ok:
-                report_lines.append("• **Theme registry reloaded.**")
-            else:
-                report_lines.append("• **Theme registry reload failed.**")
-
-
-            if added_skills or removed_skills:
-                report_lines.append("• **Skills updated:**")
-                if added_skills:
-                    report_lines.append(f"  - **Added:** " + ", ".join(f"`{s}`" for s in added_skills))
-                if removed_skills:
-                    report_lines.append(f"  - **Removed:** " + ", ".join(f"`{s}`" for s in removed_skills))
-
-            # 5. Discover plugins
-            try:
-                plugin_result = await asyncio.to_thread(discover_plugins)
-                plugins = plugin_result.plugins
-            except Exception:
-                logger.exception("Failed to discover plugins during /reload")
-                plugins = ()
-                report_lines.append("• ⚠ **Couldn't read plugin state; run /reload to be safe.**")
-
-            plugin_count = len(plugins)
-            mcp_configs = plugin_mcp_configs(plugins)
-            mcp_count = sum(
-                len(servers)
-                for config in mcp_configs
-                if isinstance((servers := config.get("mcpServers", config)), dict)
-            )
-            plugin_skill_count = sum(1 for name in new_skill_names if ":" in name)
-            hook_count = sum(len(getattr(p.manifest, "hooks", ()) or ()) for p in plugins)
-            separator = " · "
-            report_lines.append(
-                f"• **Plugins: {plugin_count} plugin"
-                f"{'s' if plugin_count != 1 else ''}{separator}"
-                f"{plugin_skill_count} skill"
-                f"{'s' if plugin_skill_count != 1 else ''}{separator}"
-                f"{mcp_count} plugin MCP server"
-                f"{'s' if mcp_count != 1 else ''}{separator}"
-                f"{hook_count} hook{'s' if hook_count != 1 else ''}**"
-            )
-
-            # 6. Restart owned server for plugin MCP
-            if self._server_proc is not None:
-                preserved = list(self._pending_messages)
-                if self._agent_running and self._agent_worker:
-                    self._agent_worker.cancel()
-                    self._agent_running = False
-                else:
-                    self._discard_queue()
-
-                try:
-                    restart_result = await self._restart_server_manual_result()
-                finally:
-                    self._restart_requested_during_reload = False
-                    if preserved:
-                        self._pending_messages.extendleft(reversed(preserved))
-                        self._sync_status_queued()
-
-                if restart_result.restarted:
-                    report_lines.append("• **Agent server restarted for plugin MCP.**")
-                    if restart_result.mcp_status == "disabled":
-                        report_lines.append(
-                            "  _MCP is disabled for this session (--no-mcp); no servers were loaded._"
-                        )
-                    else:
-                        report_lines.append(
-                            _format_mcp_server_changes(
-                                old_mcp_server_info,
-                                restart_result.mcp_server_info,
-                                restart_result.mcp_error,
-                            )
-                        )
-                else:
-                    report_lines.append(
-                        "• ⚠ **Agent server was not restarted; plugin MCP may be stale.**"
-                    )
-            elif self._server_kwargs is None:
-                report_lines.append(
-                    "• **MCP servers unchanged; this session uses a remote "
-                    "server and cannot reload MCP config.**"
-                )
-
-            report = "\n".join(report_lines)
-            from opscloud.ui.widgets.messages import CommandOutputMessage
-            await self._mount_message(CommandOutputMessage(report, command="/reload"))
-        except Exception as exc:
-            logger.exception("Detached /reload failed unexpectedly")
-            await self._mount_message(
-                ErrorMessage(f"Reload failed: {type(exc).__name__}: {exc}")
-            )
+        await _server_ctrl(self).run_reload_unlocked()
 
     async def _invoke_reload(self, *, command: str | None = None) -> None:
-        """Perform hot-reload of config, themes, skills, and plugins."""
-        if command is not None:
-            await self._mount_message(UserMessage(command))
-        self._schedule_reload()
+        await _server_ctrl(self).invoke_reload(command=command)
 
     async def _handle_install_command(self, command: str) -> None:
-        """Execute in-app package installation and auto-reload."""
-        await self._mount_message(UserMessage(command))
-        parts = command.strip().split()
-        if len(parts) < 2:
-            await self._mount_message(
-                SystemMessage(
-                    "Usage: /install <extra> [--force]\n"
-                    "       /install <package> --package [--force]\n\n"
-                    "Example: /install quickjs\n"
-                    "         /install daytona"
-                )
-            )
-            return
-
-        target = parts[1]
-        is_pkg = "--package" in parts[1:]
-        force = "--force" in parts[1:]
-
-        await self._mount_message(SystemMessage(f"Installing `{target}`..."))
-
-        import shutil
-        installer = "uv" if shutil.which("uv") else "pip"
-        if installer == "uv" and not is_pkg:
-            cmd_args = ["uv", "tool", "install", "--reinstall", "-U", f"opscloud[{target}]"]
-        elif installer == "uv" and is_pkg:
-            cmd_args = ["uv", "pip", "install", target]
-        else:
-            cmd_args = ["pip", "install", target]
-        if force:
-            cmd_args.append("--force")
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                await self._mount_message(
-                    SystemMessage(f"Successfully installed `{target}`. Triggering reload...")
-                )
-                await self._invoke_reload()
-            else:
-                err_text = stderr.decode().strip() or stdout.decode().strip()
-                await self._mount_message(ErrorMessage(f"Failed to install `{target}`:\n{err_text}"))
-        except Exception as exc:
-            await self._mount_message(ErrorMessage(f"Error running installer for `{target}`: {exc}"))
+        await _server_ctrl(self).handle_install_command(command)
 
     async def _handle_update_command(self, command: str = "/update") -> None:
-        """Check for and apply OpsCloud software updates."""
-        await self._mount_message(UserMessage(command))
-        parts = command.strip().split()
-        allowed = {"--prerelease", "--deps"}
-        unknown = [opt for opt in parts[1:] if opt not in allowed]
-        if unknown:
-            await self._mount_message(
-                SystemMessage(
-                    f"Unknown option(s) for /update: {' '.join(unknown)}. Usage: /update [--deps] [--prerelease]"
-                )
-            )
-            return
+        await _server_ctrl(self).handle_update_command(command)
 
-        prerelease = "--prerelease" in parts[1:]
-        try:
-            from opscloud import __version__ as cli_version
-        except ImportError:
-            cli_version = "unknown"
-
-        await self._mount_message(SystemMessage(f"Checking updates for OpsCloud (current: v{cli_version})..."))
-        from opscloud.commands.power.runtime import _check_pypi_version, _perform_upgrade
-
-        latest = await asyncio.to_thread(_check_pypi_version, prerelease=prerelease)
-        if latest is None:
-            await self._mount_message(
-                SystemMessage(f"Could not determine latest version. Currently on v{cli_version}.")
-            )
-            return
-
-        if latest == cli_version:
-            await self._mount_message(
-                SystemMessage(f"OpsCloud v{cli_version} is on the latest version.")
-            )
-            return
-
-        await self._mount_message(SystemMessage(f"Updating OpsCloud v{cli_version} → v{latest}..."))
-        success, output = await asyncio.to_thread(_perform_upgrade, target_version=latest, prerelease=prerelease)
-        if success:
-            await self._mount_message(SystemMessage(f"Updated OpsCloud to v{latest}. Run `/restart` to apply."))
-        else:
-            await self._mount_message(ErrorMessage(f"Failed to update OpsCloud:\n{output}"))
 
     # ── Phase 2 Helper Methods ────────────────────────────
 
@@ -3641,646 +1798,50 @@ class OpsCloudApp(App):
         state_values: dict[str, Any],
         raw_messages: list[Any] | None = None,
     ) -> dict[str, Any]:
-        """Extract goal and rubric metadata from raw checkpoint channel values.
-
-        """
-        def _as_str(value: object) -> str | None:
-            return value if isinstance(value, str) else None
-
-        def _as_nonblank_str(value: object) -> str | None:
-            return value if isinstance(value, str) and value.strip() else None
-
-        goal_obj = _as_str(state_values.get("_goal_objective"))
-        goal_status = _as_str(state_values.get("_goal_status"))
-
-        # Fallback: extract objective and status from get_goal tool outputs if missing in state_values
-        if not goal_obj and raw_messages:
-            for m in raw_messages:
-                name = getattr(m, "name", None)
-                mtype = getattr(m, "type", None)
-                if name == "get_goal" or mtype == "tool":
-                    c = getattr(m, "content", "")
-                    if isinstance(c, str) and '"objective"' in c:
-                        try:
-                            import json
-                            parsed = json.loads(c)
-                            if isinstance(parsed, dict):
-                                obj = parsed.get("objective")
-                                stat = parsed.get("status")
-                                if isinstance(obj, str) and obj.strip():
-                                    goal_obj = obj.strip()
-                                if isinstance(stat, str) and stat.strip():
-                                    goal_status = stat.strip()
-                                break
-                        except Exception:
-                            pass
-
-        return {
-            "rubric": _as_str(state_values.get("rubric")),
-            "sticky_rubric": _as_str(state_values.get("_sticky_rubric")),
-            "sticky_rubric_recorded": "_sticky_rubric" in state_values,
-            "goal_objective": goal_obj or _as_str(state_values.get("_pending_goal_objective")),
-            "goal_status": goal_status or ("active" if goal_obj else None),
-            "goal_rubric": _as_str(state_values.get("_goal_rubric")),
-            "goal_status_note": _as_str(state_values.get("_goal_status_note")),
-            "pending_goal_completion_note": _as_str(state_values.get("_pending_goal_completion_note")),
-            "rubric_status": _as_str(state_values.get("_rubric_status")),
-            "rubric_grading_run_id": _as_nonblank_str(state_values.get("_current_grading_run_id")),
-            "pending_goal_objective": _as_str(state_values.get("_pending_goal_objective")),
-            "pending_goal_rubric": _as_str(state_values.get("_pending_goal_rubric")),
-            "pending_goal_kind": _as_str(state_values.get("_pending_goal_kind")),
-            "pending_goal_request_id": _as_nonblank_str(state_values.get("_pending_goal_request_id")),
-        }
+        return _goals_ctrl(self).goal_rubric_payload_from_state(state_values, raw_messages)
 
     def _sync_status_rubric(self) -> None:
-        """Sync active goal and rubric fields to local GoalState and GoalStatusPanel.
-
-        """
-        from opscloud.commands.power.goal import get_goal_state
-        goal_state = get_goal_state(self)
-        goal_state.objective = self._active_goal
-        goal_state.status = self._goal_status or ("active" if self._active_goal else None)
-        goal_state.rubric = self._active_rubric
-        goal_state.status_note = self._goal_status_note
-        goal_state.pending_objective = self._pending_goal_objective
-        goal_state.pending_rubric = self._pending_goal_rubric
-        goal_state.pending_kind = self._pending_goal_kind
-
-        try:
-            from opscloud.ui.widgets.goal_status import GoalStatusPanel
-            panel = self.query_one(GoalStatusPanel)
-            panel.set_goal(
-                self._active_goal or self._pending_goal_objective,
-                self._goal_status or ("active" if self._active_goal else None),
-                self._goal_status_note or self._pending_goal_completion_note,
-            )
-        except Exception:
-            pass
-
-        try:
-            from opscloud.commands.power.goal import GoalHandler
-            GoalHandler._sync_status_rubric(self, goal_state)
-        except Exception:
-            pass
+        _goals_ctrl(self).sync_status_rubric()
 
     def _restore_goal_rubric_state(self, payload: dict[str, Any]) -> None:
-        """Restore active goal and rubric state from thread payload.
-
-        """
-        self._active_goal = payload.get("goal_objective")
-        self._goal_status = payload.get("goal_status")
-        self._goal_status_note = payload.get("goal_status_note")
-        self._pending_goal_completion_note = payload.get("pending_goal_completion_note")
-        if payload.get("goal_rubric"):
-            self._active_rubric = payload.get("goal_rubric")
-        elif payload.get("sticky_rubric_recorded"):
-            self._active_rubric = payload.get("sticky_rubric")
-        else:
-            self._active_rubric = payload.get("rubric")
-        self._pending_goal_objective = payload.get("pending_goal_objective")
-        self._pending_goal_rubric = payload.get("pending_goal_rubric")
-        self._pending_goal_kind = payload.get("pending_goal_kind")
-        self._pending_goal_request_id = payload.get("pending_goal_request_id")
-        self._sync_status_rubric()
+        _goals_ctrl(self).restore_goal_rubric_state(payload)
 
     async def _load_thread_history(self, thread_id: str) -> None:
-        """Fetch and mount stored message history for a thread."""
-        import re
-        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-        from opscloud.middleware.goal_state_notice import is_internal_message
-        from opscloud.ui.widgets.messages import (
-            AssistantMessage,
-            MessageList,
-            SkillMessage,
-            ToolCallMessage,
-            UserMessage,
-        )
-
-        self._reset_thread_usage(0.0, 0)
-        state_values = await self._get_thread_state_values(thread_id)
-        raw_messages = state_values.get("messages", [])
-        payload = self._goal_rubric_payload_from_state(state_values, raw_messages)
-        self._restore_goal_rubric_state(payload)
-        if not raw_messages:
-            return
-
-        if any(isinstance(m, dict) for m in raw_messages):
-            from langchain_core.messages.utils import convert_to_messages
-            raw_messages = convert_to_messages(raw_messages)
-
-        pending_tools: dict[str, dict] = {}
-
-        try:
-            messages_container = self.query_one("#messages", MessageList)
-        except NoMatches:
-            return
-
-        restored_goal_prompt = False
-
-        for idx, msg in enumerate(raw_messages):
-            msg_type = getattr(msg, "type", type(msg).__name__.lower().replace("message", ""))
-            content_raw = getattr(msg, "content", None)
-            is_internal = is_internal_message(msg)
-            msg_name = getattr(msg, "name", None) or ""
-
-            logger.info(
-                "TUI: _load_thread_history msg[%d/%d] type=%s cls=%s name=%s is_internal=%s content=%r",
-                idx,
-                len(raw_messages),
-                msg_type,
-                type(msg).__name__,
-                msg_name,
-                is_internal,
-                str(content_raw)[:80] if content_raw else "",
-            )
-
-            # Gate 1: skip named sub-graph messages
-            if msg_name in {"rubric_grader", "goal_criteria"}:
-                continue
-
-            # Gate 2: skip LangChain system messages
-            if msg_type == "system":
-                continue
-
-            # Normalise content → plain string
-            if isinstance(content_raw, list):
-                parts = []
-                for block in content_raw:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        parts.append(block)
-                text = "".join(parts).strip()
-            elif content_raw is not None:
-                text = str(content_raw).strip()
-            else:
-                text = ""
-
-            if isinstance(msg, HumanMessage) or msg_type == "human":
-                if text.startswith("[SYSTEM]") or is_internal:
-                    if not restored_goal_prompt and idx <= 3:
-                        goal_obj = payload.get("goal_objective") or state_values.get("_goal_objective")
-                        if goal_obj and isinstance(goal_obj, str) and goal_obj.strip():
-                            text = f"/goal {goal_obj.strip()}"
-                            restored_goal_prompt = True
-                            logger.info("TUI: Restored goal objective prompt for msg[%d]: %r", idx, text)
-                        else:
-                            logger.info("TUI: Skipping internal human msg[%d] (no goal objective found)", idx)
-                            continue
-                    else:
-                        logger.info("TUI: Skipping internal human msg[%d]", idx)
-                        continue
-                elif is_internal:
-                    continue
-
-                if not text:
-                    continue
-
-                # Skip grader evaluation prompts leaked from sub-graph writes
-                if text.startswith("This is grader iteration "):
-                    continue
-
-                # Skip system prompt echoes
-                if text.startswith("System Prompt"):
-                    continue
-
-                # ── Extract user intent from goal <operation> XML ─────
-                if text.startswith("<operation>"):
-                    if text.startswith("<operation>draft</operation>"):
-                        match = re.search(r"<goal>\s*(.*?)\s*</goal>", text, re.DOTALL)
-                        if match:
-                            text = f"/goal {match.group(1).strip()}"
-                        else:
-                            continue  # Unextractable draft — skip
-                    elif text.startswith("<operation>amend</operation>"):
-                        match = re.search(r"<user_feedback>\s*(.*?)\s*</user_feedback>", text, re.DOTALL)
-                        if match:
-                            text = f"/goal amend {match.group(1).strip()}"
-                        else:
-                            text = "/goal amend"
-                    else:
-                        continue  # Unknown operation type — skip
-
-                # ── Rehydrate skill invocations as SkillMessage ────────
-                add_kwargs = getattr(msg, "additional_kwargs", None) or {}
-                skill_meta = add_kwargs.get("__skill") if isinstance(add_kwargs, dict) else None
-                if isinstance(skill_meta, dict):
-                    s_name = str(skill_meta.get("name") or skill_meta.get("slash_command", "").lstrip("/"))
-                    s_desc = str(skill_meta.get("description") or "")
-                    s_source = str(skill_meta.get("source") or "built-in")
-                    s_args = str(skill_meta.get("args") or "")
-                    s_body = str(skill_meta.get("body") or "")
-                    if not s_body:
-                        scope_match = re.search(
-                            r"<SKILL>.*?Here are its contents:\n(.*?)</SKILL>",
-                            text,
-                            re.DOTALL,
-                        )
-                        s_body = scope_match.group(1) if scope_match else text
-                    await self._mount_message(
-                        SkillMessage(
-                            skill_name=s_name,
-                            description=s_desc,
-                            source=s_source,
-                            body=s_body,
-                            args=s_args,
-                        )
-                    )
-                    slash_cmd = str(skill_meta.get("slash_command") or f"/{s_name}").strip()
-                    hist_entry = f"{slash_cmd} {s_args}".strip() if s_args else slash_cmd
-                    if self._chat_input is not None and hasattr(self._chat_input, "add_history_entry"):
-                        self._chat_input.add_history_entry(hist_entry, persist=False)
-                    continue
-
-                skill_env_match = re.search(
-                    r"<SKILL>The user has explicitly invoked the \(([^)]+)\) skill\..*?Here are its contents:\n(.*?)</SKILL>",
-                    text,
-                    re.DOTALL,
-                )
-                if skill_env_match:
-                    s_name = skill_env_match.group(1).strip()
-                    s_body = skill_env_match.group(2)
-                    req_match = re.search(r"\*\*User request:\*\*\s*(.+)$", text, re.DOTALL)
-                    s_args = req_match.group(1).strip() if req_match else ""
-                    await self._mount_message(
-                        SkillMessage(
-                            skill_name=s_name,
-                            body=s_body,
-                            args=s_args,
-                        )
-                    )
-                    hist_entry = f"/{s_name} {s_args}".strip() if s_args else f"/{s_name}"
-                    if self._chat_input is not None and hasattr(self._chat_input, "add_history_entry"):
-                        self._chat_input.add_history_entry(hist_entry, persist=False)
-                    continue
-
-                await self._mount_message(UserMessage(text))
-                if self._chat_input is not None and hasattr(self._chat_input, "add_history_entry"):
-                    self._chat_input.add_history_entry(text, persist=False)
-
-            elif isinstance(msg, AIMessage) or msg_type == "ai":
-                # Extract text and thinking from AIMessage
-                from opscloud.ui.textual_adapter import _extract_text_and_thinking
-                ai_text, thinking = _extract_text_and_thinking(
-                    getattr(msg, "content", ""),
-                    getattr(msg, "additional_kwargs", None),
-                    getattr(msg, "response_metadata", None),
-                    msg_obj=msg
-                )
-                if ai_text or thinking:
-                    if thinking:
-                        messages_container.add_thinking_message(thinking)
-                    if ai_text:
-                        assistant_msg = AssistantMessage(ai_text)
-                        await self._mount_message(assistant_msg)
-
-                # Mount tool-call widgets for each tool_call in this AI message.
-                # Guard against malformed entries: SQLite rehydration can produce
-                # lists or other non-dict shapes inside tool_calls.
-                for tc in getattr(msg, "tool_calls", []) or []:
-                    if not isinstance(tc, dict):
-                        logger.debug(
-                            "Skipping malformed tool_call entry (type=%s) "
-                            "during history load for thread %s",
-                            type(tc).__name__, thread_id,
-                        )
-                        continue
-                    tc_id = tc.get("id", "")
-                    name = tc.get("name") or "tool"
-                    args = tc.get("args") or {}
-                    if not isinstance(args, dict):
-                        args = {}
-                    messages_container.add_tool_call(
-                        name=name, call_id=tc_id, args=args, live=False
-                    )
-                    if tc_id:
-                        pending_tools[tc_id] = {"name": name}
-
-            elif isinstance(msg, ToolMessage) or msg_type == "tool":
-                tc_id = getattr(msg, "tool_call_id", "") or ""
-                status = getattr(msg, "status", "success")
-                tool_content = text or ""
-                success = status != "error"
-
-                if tc_id and tc_id in pending_tools:
-                    pending_tools.pop(tc_id)
-                    messages_container.update_tool_result(
-                        call_id=tc_id,
-                        result=tool_content,
-                        success=success,
-                        live=False,
-                    )
-                else:
-                    tool_name = getattr(msg, "name", None) or "tool"
-                    messages_container.update_tool_result(
-                        call_id=tc_id or "",
-                        result=tool_content,
-                        success=success,
-                        name=tool_name,
-                        live=False,
-                    )
-            else:
-                logger.debug(
-                    "Skipping unsupported message type %s during history load",
-                    type(msg).__name__,
-                )
-
-        # Mark unmatched tool calls as rejected (reference L16301-L16303)
-        for tc_id in pending_tools:
-            if tc_id in messages_container._tool_calls:
-                messages_container._tool_calls[tc_id].set_rejected()
-
-        # Restore context tokens and cumulative estimated cost from message history
-        restored_cost = 0.0
-        restored_tokens = 0
-        model_spec = getattr(self, "_model", "") or ""
-        if ":" in model_spec:
-            provider_part, model_part = model_spec.split(":", 1)
-        else:
-            model_part = model_spec
-            provider_part = getattr(getattr(self, "_settings", None), "model_provider", "") or ""
-
-        from opscloud.utils.cost_estimation import estimate_cost
-        for msg in raw_messages:
-            usage_meta = (
-                getattr(msg, "usage_metadata", None)
-                or (getattr(msg, "response_metadata", None) or {}).get("usage")
-                or (getattr(msg, "response_metadata", None) or {}).get("token_usage")
-            )
-            if isinstance(usage_meta, dict):
-                inp = usage_meta.get("input_tokens", 0) or 0
-                out = usage_meta.get("output_tokens", 0) or 0
-                if inp or out:
-                    restored_tokens += inp + out
-                if model_part:
-                    m_name = (getattr(msg, "response_metadata", {}) or {}).get("model_name") or model_part
-                    c = estimate_cost(m_name, provider_part, inp, out)
-                    if c is not None and c > 0:
-                        restored_cost += c
-
-        checkpoint_cost = state_values.get("_session_cost_usd")
-        if isinstance(checkpoint_cost, (int, float)) and math.isfinite(checkpoint_cost) and checkpoint_cost > 0:
-            restored_cost = max(restored_cost, float(checkpoint_cost))
-
-        checkpoint_tokens = state_values.get("_session_total_tokens")
-        if isinstance(checkpoint_tokens, int) and checkpoint_tokens > 0:
-            restored_tokens = max(restored_tokens, checkpoint_tokens)
-
-        context_tokens = state_values.get("_context_tokens")
-        if isinstance(context_tokens, int) and context_tokens > 0:
-            restored_context_tokens = context_tokens
-        else:
-            last_ai_tokens = 0
-            for msg in reversed(raw_messages):
-                if getattr(msg, "type", "") == "ai" or msg.__class__.__name__ == "AIMessage":
-                    u = getattr(msg, "usage_metadata", None) or {}
-                    inp = u.get("input_tokens", 0) or 0
-                    out = u.get("output_tokens", 0) or 0
-                    if inp or out:
-                        last_ai_tokens = inp + out
-                        break
-            restored_context_tokens = last_ai_tokens or restored_tokens
-
-        self._reset_thread_usage(
-            cost_usd=restored_cost,
-            context_tokens=restored_context_tokens,
-            cumulative_tokens=restored_tokens,
-        )
-
-        # Regroup completed historical tool calls into collapsible summaries (reference L7897, L7955)
-        await self._regroup_completed_tools()
-
-        logger.info(
-            "TUI: _load_thread_history completed for thread %s (raw_messages=%d, mounted_widgets=%d, tokens=%d, cost=$%.4f)",
-            thread_id,
-            len(raw_messages),
-            len(messages_container.children),
-            self._context_tokens,
-            self._session_cost_usd,
-        )
-
-        # Scroll to bottom after history loads (reference L16769-L16774)
-        try:
-            messages_container._auto_scroll_locked = True
-            messages_container._scroll_to_end()
-        except Exception:
-            pass
+        await _threads_ctrl(self).load_thread_history(thread_id)
 
     def _close_active_tool_group(self) -> None:
-        """Finalize the open tool group into its collapsed past-tense form.
-
-        """
-        try:
-            from opscloud.ui.widgets.messages import MessageList
-            messages = self.query_one("#messages", MessageList)
-            messages.close_active_tool_group()
-        except Exception:
-            logger.exception("Failed to close active tool group")
+        _threads_ctrl(self).close_active_tool_group()
 
     async def _regroup_completed_tools(self) -> None:
-        """Fold runs of completed tool calls into collapsible group summaries.
-
-        """
-        try:
-            from opscloud.ui.widgets.messages import MessageList
-            messages = self.query_one("#messages", MessageList)
-            await messages.regroup_completed_tools()
-        except Exception:
-            logger.exception("Failed to regroup completed tools")
-
+        await _threads_ctrl(self).regroup_completed_tools()
 
     async def resume_thread(self, thread_id: str, *, is_new: bool = False) -> None:
-        """Resume conversation from specified checkpoint thread ID and restore history."""
-        self._agent_thread_id = thread_id
-        bind_logging_to_thread(thread_id)
-        session_state = getattr(self, "_session_state", None)
-        if session_state:
-            session_state.thread_id = thread_id
-        self._pending_messages.clear()
-        self._queued_widgets.clear()
-        self._reset_ephemeral_mode_states()
-        try:
-            from opscloud.ui.widgets.messages import MessageList
-            messages = self.query_one("#messages", MessageList)
-            messages.clear()
-        except NoMatches:
-            pass
-
-        if is_new:
-            self._restore_goal_rubric_state({})
-            self._reset_thread_usage(0.0, 0)
-        else:
-            await self._load_thread_history(thread_id)
-            if hasattr(self, "_sync_goal_state_from_checkpoint"):
-                await self._sync_goal_state_from_checkpoint(force=True)
-            if hasattr(self, "_sync_agent_session_state_from_checkpoint"):
-                await self._sync_agent_session_state_from_checkpoint()
-
-        label = "Created new thread" if is_new else "Resumed thread"
-        await self._mount_message(
-            SystemMessage(f"{label}: `{thread_id}`")
-        )
+        await _threads_ctrl(self).resume_thread(thread_id, is_new=is_new)
 
     async def fork_thread(self, *, source_thread_id: str | None = None) -> tuple[str, str]:
-        """Fork the active conversation thread into a new branch and switch to it in-place.
-
-        Workflow:
-        - Copies the active thread's checkpoint state and appends a ``<fork_notice>`` message.
-        - Switches ``_agent_thread_id`` to the newly created thread while preserving the
-          mounted TUI chat messages in place.
-        - Records ``_previous_thread_id`` so the user can return via ``/resume <previous_id>``.
-        """
-        from opscloud.middleware.goal_state_notice import build_fork_notice_message
-        from opscloud.state.session import SessionManager
-
-        prev_id = (source_thread_id or self._agent_thread_id or "").strip()
-        if not prev_id:
-            raise ValueError("No active conversation to fork.")
-
-        client = getattr(self, "_client", None) or getattr(self, "_agent", None)
-        if client is not None and callable(getattr(client, "afork_thread", None)):
-            new_thread_id = str(await client.afork_thread(prev_id))
-        else:
-            new_thread_id = await SessionManager.fork_thread(prev_id)
-            if client is not None and callable(getattr(client, "aupdate_state", None)):
-                notice_msg = build_fork_notice_message(
-                    source_thread_id=prev_id,
-                    new_thread_id=new_thread_id,
-                )
-                try:
-                    await client.aupdate_state(
-                        {"configurable": {"thread_id": new_thread_id}},
-                        {"messages": [notice_msg]},
-                    )
-                except Exception:
-                    logger.debug("Could not append <fork_notice> via client.aupdate_state", exc_info=True)
-
-        self._previous_thread_id = prev_id
-        self._agent_thread_id = new_thread_id
-        bind_logging_to_thread(new_thread_id)
-
-        session_state = getattr(self, "_session_state", None)
-        if session_state is not None:
-            try:
-                session_state.previous_thread_id = prev_id
-                session_state.thread_id = new_thread_id
-            except Exception:
-                pass
-
-        for state_attr in ("_goal_state", "_agent_session_state"):
-            st = getattr(self, state_attr, None)
-            if st is not None and hasattr(st, "thread_id"):
-                try:
-                    st.thread_id = new_thread_id
-                except Exception:
-                    pass
-
-        return prev_id, new_thread_id
+        return await _threads_ctrl(self).fork_thread(source_thread_id=source_thread_id)
 
     async def invoke_compact_conversation(self, thread_id: str | None = None, force: bool = True) -> None:
-        """Trigger server-side conversation summarization/compaction."""
-        from opscloud.commands.core.compact import CompactHandler
-        from opscloud.commands._base import CommandContext
-        handler = CompactHandler()
-        ctx = CommandContext(
-            raw_command="/compact",
-            args="",
-            app=self,
-            agent=getattr(self, "_agent_graph", None),
-        )
-        await handler.execute(ctx)
+        await _threads_ctrl(self).invoke_compact_conversation(thread_id=thread_id, force=force)
 
     def toggle_timestamps(self, visible: bool | None = None) -> bool:
-        """Toggle message timestamps visibility across chat messages."""
-        if visible is not None:
-            self._message_timestamps_visible = visible
-        else:
-            self._message_timestamps_visible = not getattr(self, "_message_timestamps_visible", False)
-        try:
-            from opscloud.ui.widgets.messages import MessageList
-            messages = self.query_one("#messages", MessageList)
-            messages.set_timestamps_visible(self._message_timestamps_visible)
-        except Exception:
-            pass
-        return self._message_timestamps_visible
+        return _threads_ctrl(self).toggle_timestamps(visible=visible)
 
     def get_context_tokens(self) -> int:
-        """Get active context tokens for the current turn/session."""
-        adapter_tokens = 0
-        if self._adapter and hasattr(self._adapter, "stats") and self._adapter.stats:
-            adapter_tokens = getattr(self._adapter.stats, "input_tokens", 0) + getattr(self._adapter.stats, "output_tokens", 0)
-        return getattr(self, "_context_tokens", 0) or adapter_tokens
+        return _threads_ctrl(self).get_context_tokens()
 
     async def _get_conversation_token_count(self) -> int | None:
-        """Get approximate token count of conversation message history."""
-        try:
-            msgs = None
-            if hasattr(self, "_get_thread_state_values"):
-                try:
-                    state_values = await self._get_thread_state_values()
-                    msgs = state_values.get("messages")
-                except Exception:
-                    pass
-            if not msgs:
-                msgs = self.get_thread_messages()
-            if not msgs:
-                return None
-            if any(isinstance(m, dict) for m in msgs):
-                from langchain_core.messages.utils import convert_to_messages
-                msgs = convert_to_messages(msgs)
-            from langchain_core.messages.utils import count_tokens_approximately
-            return count_tokens_approximately(msgs)
-        except Exception:
-            return None
+        return await _threads_ctrl(self).get_conversation_token_count()
 
     async def _has_conversation_messages(self) -> bool:
-        """Check if the active session has conversation messages."""
-        try:
-            from opscloud.ui.widgets.messages import UserMessage, AssistantMessage, MessageList
-            container = self.query_one("#messages", MessageList)
-            for child in container.children:
-                if isinstance(child, (UserMessage, AssistantMessage)):
-                    return True
-        except Exception:
-            pass
-
-        try:
-            msgs = self.get_thread_messages()
-            if msgs:
-                return True
-        except Exception:
-            pass
-
-        return False
+        return await _threads_ctrl(self).has_conversation_messages()
 
     async def get_conversation_token_count(self) -> int | None:
-        """Get approximate token count of conversation message history."""
         return await self._get_conversation_token_count()
 
     def get_thread_messages(self) -> list:
-        """Fetch current thread messages from UI widgets or adapter."""
-        msgs = []
-        try:
-            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-            from opscloud.ui.widgets.messages import UserMessage, AssistantMessage, ToolCallMessage, MessageList
-            container = self.query_one("#messages", MessageList)
-            for child in container.children:
-                if isinstance(child, UserMessage):
-                    txt = getattr(child, "_raw_content", "") or ""
-                    if txt:
-                        msgs.append(HumanMessage(content=txt))
-                elif isinstance(child, AssistantMessage):
-                    txt = getattr(child, "content_text", None) or "".join(getattr(child, "_fragments", []))
-                    if txt:
-                        msgs.append(AIMessage(content=txt))
-                elif isinstance(child, ToolCallMessage):
-                    res = getattr(child, "_result", "") or ""
-                    call_id = getattr(child, "_call_id", "") or "call_1"
-                    if res:
-                        msgs.append(ToolMessage(content=str(res), tool_call_id=call_id))
-        except Exception:
-            pass
-        return msgs
+        return _threads_ctrl(self).get_thread_messages()
+
 
     def get_active_tools(self) -> list[dict[str, str]]:
         """Get list of active core tools with names and descriptions."""
@@ -4582,110 +2143,9 @@ class OpsCloudApp(App):
         self,
         action_requests: Any,
         assistant_id: str | None = None,
-    ) -> asyncio.Future:
-        """Request user approval inline in the messages area.
-
-        Mounts ApprovalMenu in the messages area (inline with chat).
-        ChatInput stays visible - user can still see it.
-
-        If another approval is already pending, queue this one.
-
-        Auto-approves shell commands that are in the configured allow-list.
-
-        Args:
-            action_requests: List of action request dicts to approve
-            assistant_id: The assistant ID for display purposes
-
-        Returns:
-            A Future that resolves to the user's decision dict.
-        """
-        loop = asyncio.get_running_loop()
-        result_future: asyncio.Future = loop.create_future()
-
-        is_auto_fallback = any(
-            isinstance(request.get("description"), str)
-            and request["description"].startswith("Auto human fallback ")
-            for request in action_requests or []
-            if isinstance(request, dict)
-        )
-        shell_allow_list = getattr(self, "_shell_allow_list", None)
-        if shell_allow_list and action_requests and not is_auto_fallback:
-            from opscloud.security.shell_safety import is_shell_command_allowed
-            all_auto_approved = True
-            approved_commands = []
-
-            for req in action_requests:
-                if isinstance(req, dict) and req.get("name") in {"execute", "run_command", "bash", "shell"}:
-                    command = req.get("args", {}).get("command", "") or req.get("args", {}).get("CommandLine", "")
-                    if is_shell_command_allowed(command, shell_allow_list):
-                        approved_commands.append(command)
-                    else:
-                        all_auto_approved = False
-                        break
-                else:
-                    all_auto_approved = False
-                    break
-
-            if all_auto_approved and approved_commands:
-                result_future.set_result({"type": "approve"})
-                try:
-                    from opscloud.ui.widgets.messages import SystemMessage
-                    messages = self.query_one("#messages", MessageList)
-                    for command in approved_commands:
-                        auto_msg = SystemMessage(f"✓ Auto-approved shell command (allow-list): {command}")
-                        await messages.mount(auto_msg)
-                except Exception:
-                    pass
-                return result_future
-
-        # If there's already a pending approval, wait for it to complete first
-        if self._pending_approval_widget is not None:
-            while self._pending_approval_widget is not None:
-                await asyncio.sleep(0.05)
-
-        self._pause_loading_spinner_for_approval()
-        result_future.add_done_callback(self._resume_loading_spinner_after_approval)
-
-        from opscloud.ui.widgets.approval import ApprovalMenu
-
-        unique_id = f"approval-menu-{uuid.uuid4().hex[:8]}"
-        menu = ApprovalMenu(
-            action_requests,
-            assistant_id or self._assistant_id,
-            id=unique_id,
-            auto_mode_eligible=not getattr(self, "_sandbox_active", False),
-        )
-        menu.set_future(result_future)
-
-        self._pending_approval_widget = menu
-
-        if self._is_user_typing():
-            from textual.widgets import Static
-            placeholder = Static(
-                "Waiting for typing to finish...",
-                classes="approval-placeholder",
-            )
-            self._approval_placeholder = placeholder
-            try:
-                messages = self.query_one("#messages", MessageList)
-                res = messages.mount_inline_prompt(placeholder) if hasattr(messages, "mount_inline_prompt") else messages.mount(placeholder)
-                if inspect.isawaitable(res):
-                    await res
-                self.call_after_refresh(placeholder.scroll_visible)
-            except Exception:
-                logger.exception("Failed to mount approval placeholder")
-                self._approval_placeholder = None
-                await self._mount_approval_widget(menu, result_future)
-                return result_future
-
-            self.run_worker(
-                self._deferred_show_approval(placeholder, menu, result_future),
-                exclusive=False,
-            )
-        else:
-            await self._mount_approval_widget(menu, result_future)
-
-        return result_future
+    ) -> asyncio.Future[Any]:
+        """Delegate HITL tool approval request to `PromptController`."""
+        return await self._prompts.request_approval(action_requests, assistant_id)
 
     async def _mount_approval_widget(
         self,
@@ -4693,21 +2153,7 @@ class OpsCloudApp(App):
         result_future: asyncio.Future[dict[str, str]],
     ) -> None:
         """Mount the approval menu widget inline in the messages area."""
-        try:
-            messages = self.query_one("#messages", MessageList)
-            res = messages.mount_inline_prompt(menu) if hasattr(messages, "mount_inline_prompt") else messages.mount(menu)
-            if inspect.isawaitable(res):
-                await res
-            self.call_after_refresh(menu.scroll_visible)
-            self.call_after_refresh(menu.focus)
-        except Exception as e:
-            logger.exception(
-                "Failed to mount approval menu (id=%s) in messages container",
-                menu.id,
-            )
-            self._pending_approval_widget = None
-            if not result_future.done():
-                result_future.set_exception(e)
+        await self._prompts.mount_approval_widget(menu, result_future)
 
     async def _deferred_show_approval(
         self,
@@ -4716,84 +2162,16 @@ class OpsCloudApp(App):
         result_future: asyncio.Future[dict[str, str]],
     ) -> None:
         """Wait until user is idle, then swap placeholder for real menu."""
-        deadline = time.monotonic() + 3.0
-        while self._is_user_typing():
-            if time.monotonic() > deadline:
-                logger.warning("Timed out waiting for user to stop typing; showing approval now")
-                break
-            await asyncio.sleep(0.2)
-
-        if not getattr(placeholder, "is_attached", False):
-            logger.warning("Approval placeholder detached before menu shown (id=%s)", menu.id)
-            self._approval_placeholder = None
-            self._pending_approval_widget = None
-            if not result_future.done():
-                result_future.cancel()
-            return
-
-        self._approval_placeholder = None
-        try:
-            await placeholder.remove()
-        except Exception:
-            logger.warning("Failed to remove approval placeholder during swap", exc_info=True)
-        await self._mount_approval_widget(menu, result_future)
+        await self._prompts.deferred_show_approval(placeholder, menu, result_future)
 
     @on(ApprovalMenu.Decided)
     async def _on_approval_menu_decided(self, event: ApprovalMenu.Decided) -> None:
-        if self._approval_placeholder is not None:
-            if getattr(self._approval_placeholder, "is_attached", False):
-                try:
-                    await self._approval_placeholder.remove()
-                except Exception:
-                    pass
-            self._approval_placeholder = None
-
-        if self._pending_approval_widget is not None:
-            try:
-                await self._pending_approval_widget.remove()
-            except Exception:
-                pass
-            self._pending_approval_widget = None
-        elif isinstance(event.control, ApprovalMenu):
-            try:
-                await event.control.remove()
-            except Exception:
-                pass
-
-        decision = event.decision
-        dec_type = decision.get("type")
-
-        if dec_type in {"smart_approve_all", "auto_approve_all"}:
-            from opscloud.approval_mode import ApprovalMode
-            await self._set_approval_mode(ApprovalMode.SMART)
-
-        if self._adapter and event.call_id:
-            self._adapter.submit_approval(event.call_id, event.approved)
-
-        if not event.approved and hasattr(self, "_permission_store") and event.call_id:
-            self._permission_store.track_denied(
-                tool_name=event.tool_name,
-                call_id=event.call_id,
-                comment=event.comment,
-            )
-
-        self._focus_chat_input_after_refresh()
+        await self._prompts.on_approval_menu_decided(event)
 
     @on(TextualAdapter.InterruptRaised)
     async def _on_interrupt_raised(self, event: TextualAdapter.InterruptRaised) -> None:
         """Legacy event handler for InterruptRaised."""
-        if self._auto_approve and self._adapter:
-            self._adapter.submit_approval(event.call_id, True)
-            return
-
-        future = await self._request_approval(
-            [{"name": event.tool_name, "call_id": event.call_id, "args": event.args}],
-            self._assistant_id,
-        )
-        decision = await future
-        if self._adapter:
-            approved = decision.get("type") in {"approve", "auto_approve_all", "smart_approve_all"}
-            self._adapter.submit_approval(event.call_id, approved)
+        await self._prompts.on_interrupt_raised(event)
 
     # ── Ask User Interrupt Handling ──────────────────────
 
@@ -4801,79 +2179,26 @@ class OpsCloudApp(App):
         self,
         questions: list[Any],
     ) -> asyncio.Future[Any]:
-        """Mount the interactive AskUserMenu widget and return a Future awaiting response."""
-        loop = asyncio.get_running_loop()
-        result_future: asyncio.Future[Any] = loop.create_future()
-
-        # Clean up any stale ask_user widget
-        if self._pending_ask_user_widget is not None:
-            try:
-                self._pending_ask_user_widget.remove()
-            except Exception:
-                pass
-            self._pending_ask_user_widget = None
-
-        unique_id = f"ask-user-{uuid.uuid4().hex[:8]}"
-        menu = AskUserMenu(questions, id=unique_id)
-        menu.set_future(result_future)
-        self._pending_ask_user_widget = menu
-
-        # Mount widget into messages container (inline with chat)
-        try:
-            messages = self.query_one("#messages", MessageList)
-            res = (
-                messages.mount_inline_prompt(menu)
-                if hasattr(messages, "mount_inline_prompt")
-                else messages.mount(menu)
-            )
-            if inspect.isawaitable(res):
-                await res
-            self.call_after_refresh(menu.scroll_visible)
-            self.call_after_refresh(menu.focus_active)
-        except Exception as exc:
-            logger.exception("Failed to mount AskUserMenu widget: %s", exc)
-            self._pending_ask_user_widget = None
-            if not result_future.done():
-                result_future.set_result({"type": "cancelled"})
-            return result_future
-
-        return result_future
+        """Delegate interactive `AskUserMenu` prompt to `PromptController`."""
+        return await self._prompts.request_ask_user(questions)
 
     @on(AskUserMenu.Answered)
     async def _on_ask_user_menu_answered(self, event: AskUserMenu.Answered) -> None:
         """Handle ask_user menu answers - remove widget and refocus input."""
-        await self._finish_ask_user_prompt(context="answered")
+        await self._prompts.finish_ask_user_prompt(context="answered")
 
     @on(AskUserMenu.Cancelled)
     async def _on_ask_user_menu_cancelled(self, event: AskUserMenu.Cancelled) -> None:
         """Handle ask_user menu cancellation - remove widget and refocus input."""
-        await self._finish_ask_user_prompt(context="cancelled")
+        await self._prompts.finish_ask_user_prompt(context="cancelled")
 
     async def _finish_ask_user_prompt(self, *, context: str = "finished") -> None:
         """Remove the AskUserMenu widget and return focus to chat input."""
-        if self._pending_ask_user_widget is not None:
-            try:
-                await self._pending_ask_user_widget.remove()
-            except Exception:
-                pass
-            self._pending_ask_user_widget = None
-        self._focus_chat_input_after_refresh()
+        await self._prompts.finish_ask_user_prompt(context=context)
 
     async def _cancel_pending_ask_user(self, *, context: str = "cleanup") -> None:
         """Cancel and remove any mounted pending ask_user prompt."""
-        if self._pending_ask_user_widget is not None:
-            widget = self._pending_ask_user_widget
-            self._pending_ask_user_widget = None
-            try:
-                widget.action_cancel()
-            except Exception:
-                pass
-            if getattr(widget, "is_mounted", False):
-                try:
-                    await widget.remove()
-                except Exception:
-                    pass
-            self._focus_chat_input_after_refresh()
+        await self._prompts.cancel_pending_ask_user(context=context)
 
     def _is_input_focused(self) -> bool:
         if not hasattr(self, "_chat_input") or not self._chat_input:
@@ -4883,64 +2208,9 @@ class OpsCloudApp(App):
             return False
         return focused.id == "chat-input" or focused in self._chat_input.walk_children()
 
-    def action_approval_up(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_move_up()
-
-    def action_approval_down(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_move_down()
-
-    def action_approval_select(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_select()
-
-    def action_approval_yes(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_select_approve()
-
-    def action_approval_position(self, position: int) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_select_position(position)
-
-    def action_approval_smart(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            if hasattr(widget, "action_select_smart"):
-                widget.action_select_smart()
-            else:
-                widget.action_select_auto()
-
-    def action_approval_auto(self) -> None:
-        self.action_approval_smart()
-
-    def action_approval_no(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_select_reject()
-
-    def action_approval_escape(self) -> None:
-        widget = self._pending_approval_widget
-        if widget is not None:
-            widget.action_select_reject()
-
     @on(ApprovalDecided)
     def _on_approval_decided(self, event: ApprovalDecided) -> None:
-        if self._adapter:
-            self._adapter.submit_approval(event.call_id, event.approved)
-        if not event.approved and hasattr(self, "_permission_store"):
-            self._permission_store.track_denied(
-                tool_name=event.tool_name,
-                call_id=event.call_id,
-                comment=event.comment,
-            )
-        if self._chat_input:
-            self.call_after_refresh(self._chat_input.focus)
+        self._prompts.on_approval_decided(event)
 
     def _get_subagent_panel(self) -> SubagentPanel | None:
         """Return the subagent fan-out panel, or None if not yet mounted."""
@@ -5152,14 +2422,8 @@ class OpsCloudApp(App):
             self._cancel_worker(self._shell_worker)
             return
 
-        # 5. If approval menu is active, reject it
-        if self._pending_approval_widget is not None:
-            self._pending_approval_widget.action_select_reject()
-            return
-
-        # 6. If ask_user menu is active, cancel it
-        if self._pending_ask_user_widget is not None:
-            self._pending_ask_user_widget.action_cancel()
+        # 5 & 6. If approval or ask_user prompt is active, reject/cancel it
+        if self._prompts.interrupt_active_prompt():
             return
 
         # 7. If queued messages exist, pop the last one (LIFO)
@@ -5193,13 +2457,7 @@ class OpsCloudApp(App):
             self._quit_pending = False
             return
 
-        if self._pending_approval_widget is not None:
-            self._pending_approval_widget.action_select_reject()
-            self._quit_pending = False
-            return
-
-        if self._pending_ask_user_widget is not None:
-            self._pending_ask_user_widget.action_cancel()
+        if self._prompts.interrupt_active_prompt():
             self._quit_pending = False
             return
 
@@ -5240,271 +2498,31 @@ class OpsCloudApp(App):
             pass
 
     async def action_toggle_auto_approve(self) -> None:
-        """Cycle approval mode on Shift+Tab (Manual -> Auto -> Smart -> Manual)."""
-        from opscloud.approval_mode import (
-            ApprovalMode,
-            next_approval_mode,
-        )
-
-        auto_eligible = not getattr(self, "_sandbox_active", False)
-        target = next_approval_mode(
-            getattr(self, "_approval_mode", "manual"),
-            auto_eligible=auto_eligible,
-            smart_eligible=True,
-        )
-        if target is None:
-            self.notify("Approval mode cycling is unavailable.", severity="warning", timeout=3)
-            return
-
-        await self._set_approval_mode(target)
+        await _modals_ctrl(self).action_toggle_auto_approve()
 
     async def _write_live_approval_mode(self, mode: ApprovalMode | None = None) -> bool:
-        """Persist approval mode to the remote Store for the active session thread."""
-        agent_obj = getattr(self, "_client", None) or getattr(self, "_agent", None)
-        thread_id = getattr(self, "_agent_thread_id", None)
-        if agent_obj is None or thread_id is None:
-            return False
-        from opscloud.approval_mode import awrite_approval_mode
-
-        target = mode or getattr(self, "_approval_mode", ApprovalMode.MANUAL)
-        try:
-            live_key = await awrite_approval_mode(
-                agent_obj,
-                thread_id,
-                mode=target,
-            )
-            return live_key is not None
-        except Exception:
-            logger.warning("Failed to write live approval-mode state to store", exc_info=True)
-            return False
+        return await _modals_ctrl(self).write_live_approval_mode(mode)
 
     async def _set_approval_mode(self, target: ApprovalMode) -> bool:
-        from opscloud.approval_mode import ApprovalMode
-
-        agent_obj = getattr(self, "_client", None) or getattr(self, "_agent", None)
-        should_persist = (
-            agent_obj is not None
-            and getattr(self, "_agent_thread_id", None) is not None
-        )
-        if should_persist and not await self._write_live_approval_mode(target):
-            if target in (ApprovalMode.AUTO, ApprovalMode.SMART):
-                self.notify(f"{target.value.capitalize()} could not be persisted; remaining in Manual.", severity="warning")
-                return False
-
-        prev_mode = getattr(self, "_approval_mode", ApprovalMode.MANUAL)
-        self._approval_mode = target
-        self._auto_approve = False
-        self._update_auto_mode_status_bar(target.value)
-
-        if self._adapter:
-            self._adapter._auto_approve = self._auto_approve
-
-        # When entering Smart mode, preserve the current manual model if not already smart-routed
-        if target is ApprovalMode.SMART:
-            if not getattr(self, "_smart_routed_active", False) and getattr(self, "_model", None):
-                self._manual_model = self._model
-        # When returning to Manual (or Auto) mode after Smart mode, restore the default model
-        elif target in (ApprovalMode.MANUAL, ApprovalMode.AUTO):
-            if prev_mode is ApprovalMode.SMART or getattr(self, "_smart_routed_active", False):
-                await self._restore_manual_default_model()
-
-        if target is ApprovalMode.AUTO:
-            self.notify("Switched to Auto mode (Classic LLM).", severity="information", timeout=3)
-            self._notify_auto_mode_enabled_once()
-        elif target is ApprovalMode.SMART:
-            self.notify("Switched to Smart mode (Jev System 1 Protected).", severity="information", timeout=3)
-        elif target is ApprovalMode.MANUAL:
-            self.notify("Switched to Manual approval mode.", severity="information", timeout=3)
-        return True
+        return await _modals_ctrl(self).set_approval_mode(target)
 
     def _resolve_default_model_spec(self) -> str | None:
-        """Resolve the model specification to revert to when exiting smart mode.
-
-        Resolution precedence:
-        1. Explicitly configured default model in config.toml ([models].default).
-        2. Saved manual model from before entering/routing smart mode (self._manual_model).
-        3. Fallback default model from config.toml ([models].recent via load_default_model).
-        4. Auto-detected credential-based default model via _get_default_model_spec().
-        """
-        from opscloud.config.toml_config import read_config_toml, load_default_model
-
-        # 1. Check explicit [models].default first
-        try:
-            data = read_config_toml()
-            explicit_default = data.get("models", {}).get("default")
-            if isinstance(explicit_default, str) and explicit_default.strip():
-                return explicit_default.strip()
-        except Exception:
-            pass
-
-        # 2. Check saved manual model if available and not dynamic
-        manual_spec = getattr(self, "_manual_model", None)
-        if manual_spec and manual_spec not in ("auto", "dynamic"):
-            return manual_spec
-
-        # 3. Check load_default_model() (which falls back to [models].recent)
-        try:
-            recent_default = load_default_model()
-            if recent_default and recent_default not in ("auto", "dynamic"):
-                return recent_default
-        except Exception:
-            pass
-
-        # 4. Fallback to factory default model spec
-        try:
-            from opscloud.model.factory import _get_default_model_spec
-            settings_obj = getattr(self, "settings", None)
-            saved_name = getattr(settings_obj, "model_name", None) if settings_obj else None
-            if settings_obj and getattr(self, "_smart_routed_active", False):
-                settings_obj.model_name = None
-            try:
-                return _get_default_model_spec()
-            finally:
-                if settings_obj and settings_obj.model_name is None and saved_name:
-                    settings_obj.model_name = saved_name
-        except Exception:
-            return None
+        return _modals_ctrl(self).resolve_default_model_spec()
 
     async def _restore_manual_default_model(self) -> bool:
-        """Restore active model and status bar to default model when exiting smart mode."""
-        default_spec = self._resolve_default_model_spec()
-        if not default_spec:
-            self._smart_routed_active = False
-            return False
-
-        from opscloud.model.config import apply_stored_credentials, resolve_model_context_limit
-        from opscloud.config.toml_config import load_effort_for_model
-        from opscloud.model.reasoning import default_effort_for_model
-        import os
-
-        provider = default_spec.split(":", 1)[0] if ":" in default_spec else ""
-        if provider:
-            apply_stored_credentials(provider)
-
-        os.environ["OPSCLOUD_SERVER_MODEL"] = default_spec
-        os.environ["OPSCLOUD_MODEL_NAME"] = default_spec
-        os.environ["OPSCODE_SERVER_MODEL"] = default_spec
-        os.environ["OPSCODE_MODEL_NAME"] = default_spec
-
-        self._model = default_spec
-        self._manual_model = default_spec
-        self._smart_routed_active = False
-
-        from opscloud.config.settings import get_settings
-        settings_obj = get_settings()
-        self._settings = settings_obj
-
-        if settings_obj is not None:
-            settings_obj.model = default_spec
-            settings_obj.model_name = default_spec
-            if provider:
-                settings_obj.model_provider = provider
-
-        # Resolve effort
-        eff_val = load_effort_for_model(default_spec) or default_effort_for_model(default_spec) or ""
-        eff_display: str = eff_val if eff_val else ""
-        self._reasoning_effort = eff_val or None
-        if settings_obj is not None:
-            settings_obj.reasoning_effort = eff_val or None
-
-        if eff_val:
-            os.environ["OPSCLOUD_REASONING_EFFORT"] = eff_val
-            os.environ["OPSCODE_REASONING_EFFORT"] = eff_val
-        else:
-            os.environ.pop("OPSCLOUD_REASONING_EFFORT", None)
-            os.environ.pop("OPSCODE_REASONING_EFFORT", None)
-
-        # Context limit
-        ctx_limit = resolve_model_context_limit(default_spec)
-        if ctx_limit and settings_obj is not None:
-            settings_obj.model_context_limit = ctx_limit
-
-        # Update status bar & banner
-        try:
-            status_bar = getattr(self, "_status_bar", None) or self.query_one("#status-bar", StatusBar)
-            _prov, _mdl = _split_model_spec(default_spec)
-            status_bar.set_model(provider=_prov, model=_mdl, effort=eff_display)
-            if ctx_limit:
-                status_bar.set_context_limit(ctx_limit)
-        except Exception:
-            pass
-
-        try:
-            self._sync_banner_model(default_spec, eff_display)
-        except Exception:
-            pass
-
-        server_kwargs = getattr(self, "_server_kwargs", None)
-        if isinstance(server_kwargs, dict):
-            server_kwargs["model_name"] = default_spec
-
-        return True
+        return await _modals_ctrl(self).restore_manual_default_model()
 
     def _notify_auto_mode_enabled_once(self) -> None:
-        from opscloud.approval_mode import ApprovalMode, has_auto_mode_notice, save_auto_mode_notice
-        from opscloud.ui.widgets.auto_mode_notice import AutoModeNoticeScreen
-
-        if has_auto_mode_notice() or getattr(self, "_auto_mode_notice_pending", False):
-            return
-
-        def handle_result(accepted: bool | None) -> None:
-            self._auto_mode_notice_pending = False
-            if accepted is True:
-                save_auto_mode_notice()
-                return
-            asyncio.create_task(self._set_approval_mode(ApprovalMode.MANUAL))
-
-        try:
-            self.push_screen(AutoModeNoticeScreen(), handle_result)
-            self._auto_mode_notice_pending = True
-        except Exception:
-            logger.warning("Could not show Auto first-enable notice", exc_info=True)
+        _modals_ctrl(self).notify_auto_mode_enabled_once()
 
     def action_toggle_tool_output(self) -> None:
-        """Toggle the most recent collapsible transcript unit (SkillMessage, ToolCallMessage, etc.)."""
-        from opscloud.ui.widgets.messages import MessageList, SkillMessage, ToolCallMessage
-        try:
-            messages = self.query_one("#messages", MessageList)
-        except NoMatches:
-            return
-        for child in reversed(list(messages.children)):
-            toggle_details_fn = getattr(child, "toggle_details", None)
-            if callable(toggle_details_fn):
-                toggle_details_fn()
-                return
-            if isinstance(child, SkillMessage) and child._stripped_body.strip():
-                child.toggle_body()
-                return
-            if isinstance(child, ToolCallMessage):
-                toggle_output_fn = getattr(child, "toggle_output", None)
-                if callable(toggle_output_fn):
-                    toggle_output_fn()
-                    return
+        _modals_ctrl(self).action_toggle_tool_output()
 
     def action_toggle_debug_console(self) -> None:
-        """Toggle the Debug Console overlay via keybind or the `/debug` command."""
-        from opscloud.ui.widgets.debug_console import DebugConsoleScreen
-
-        if isinstance(self.screen, DebugConsoleScreen):
-            self.pop_screen()
-            if self._chat_input:
-                self._chat_input.focus_input()
-            return
-        self._open_debug_console()
+        _modals_ctrl(self).action_toggle_debug_console()
 
     async def action_open_editor(self) -> None:
-        """Open the focused editable surface in $VISUAL/$EDITOR."""
-        chat_input = getattr(self, "_chat_input", None)
-        if not chat_input or not getattr(chat_input, "_text_area", None):
-            return
-
-        await self._open_text_area_in_editor(
-            chat_input._text_area,
-            chat_input._text_area.text or "",
-            allow_empty=False,
-            raise_editor_errors=False,
-            restore_focus=chat_input.focus_input,
-        )
+        await _modals_ctrl(self).action_open_editor()
 
     async def _open_text_area_in_editor(
         self,
@@ -5516,372 +2534,60 @@ class OpsCloudApp(App):
         restore_focus: Callable[[], object],
         reset_after_edit: Callable[[], None] | None = None,
     ) -> None:
-        """Edit text externally, then restore originating field's focus."""
-        from opscloud.editor import ExternalEditorError, open_in_editor
-
-        try:
-            with self.suspend():
-                edited = open_in_editor(
-                    current_text,
-                    allow_empty=allow_empty,
-                    raise_on_error=raise_editor_errors,
-                )
-        except ExternalEditorError:
-            logger.warning("External editor failed", exc_info=True)
-            self.notify(
-                "External editor failed. Check $VISUAL/$EDITOR.",
-                severity="error",
-                timeout=5,
-            )
-        else:
-            if edited is not None:
-                text_area.text = edited
-                if reset_after_edit is not None:
-                    reset_after_edit()
-                lines = edited.split("\n")
-                text_area.move_cursor((len(lines) - 1, len(lines[-1])))
-        finally:
-            restore_focus()
+        await _modals_ctrl(self).open_text_area_in_editor(
+            text_area,
+            current_text,
+            allow_empty=allow_empty,
+            raise_editor_errors=raise_editor_errors,
+            restore_focus=restore_focus,
+            reset_after_edit=reset_after_edit,
+        )
 
     def action_open_notifications(self) -> None:
-        """Open or toggle the notification center overlay via Ctrl+N."""
-        self._open_notification_center()
+        _modals_ctrl(self).action_open_notifications()
 
     def _open_notification_center(self) -> None:
-        """Toggle the NotificationCenter panel overlay."""
-        from opscloud.ui.widgets.notification_center import NotificationCenter
-
-        try:
-            nc = self.query(NotificationCenter)
-            if nc:
-                nc.first().remove()
-            else:
-                self.mount(NotificationCenter())
-        except Exception:
-            logger.warning("Failed to toggle NotificationCenter", exc_info=True)
+        _modals_ctrl(self).open_notification_center()
 
     def _buffer_shell_for_model_context(
         self, command: str, output: str, returncode: int | None
     ) -> None:
-        """Buffer a non-incognito `!` command/output for the next user send."""
-        from langchain_core.messages import HumanMessage
-
-        code = returncode if returncode is not None else "unknown"
-        body = output or "(no output)"
-        content = (
-            "<user_shell_command>\n"
-            "<command>\n"
-            f"{command}\n"
-            "</command>\n"
-            "<result>\n"
-            f"Exit code: {code}\n"
-            "Output:\n"
-            f"{body}\n"
-            "</result>\n"
-            "</user_shell_command>"
-        )
-        self._pending_shell_messages.append(HumanMessage(content=content))
+        _shell_ctrl(self).buffer_shell_for_model_context(command, output, returncode)
 
     async def _flush_pending_shell_messages(self) -> None:
-        """Write buffered `!` command/output into thread state, then clear it."""
-        if not self._pending_shell_messages:
-            return
-        thread_id = getattr(self, "_agent_thread_id", None) or getattr(
-            getattr(self, "_session_state", None), "thread_id", None
-        )
-        agent_obj = getattr(self, "_agent", None)
-        if not agent_obj or not thread_id:
-            return
-
-        messages = self._pending_shell_messages
-        self._pending_shell_messages = []
-        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-        try:
-            await agent_obj.aupdate_state(config, {"messages": messages})
-        except Exception:
-            logger.warning(
-                "Failed to flush pending shell messages to model context", exc_info=True
-            )
+        await _shell_ctrl(self).flush_pending_shell_messages()
 
     def _open_debug_console(self) -> None:
-        """Push the read-only Debug Console modal."""
-        from opscloud.ui.widgets.debug_console import DebugConsoleScreen
-
-        def handle_result(_: None) -> None:
-            if self._chat_input:
-                self._chat_input.focus_input()
-
-        def persist_clear(cursor: int) -> None:
-            self._debug_console_cleared_upto = cursor
-
-        self.push_screen(
-            DebugConsoleScreen(
-                self._build_debug_snapshot(),
-                snapshot_provider=self._build_debug_snapshot,
-                cleared_upto=self._debug_console_cleared_upto,
-                on_clear=persist_clear,
-                click_to_copy=self._debug_console_click_to_copy,
-                on_click_to_copy_change=self._persist_debug_console_click_to_copy,
-            ),
-            handle_result,
-        )
+        _modals_ctrl(self).open_debug_console()
 
     def _persist_debug_console_click_to_copy(self, enabled: bool) -> None:
-        self._debug_console_click_to_copy = enabled
+        _modals_ctrl(self).persist_debug_console_click_to_copy(enabled)
 
     def _build_debug_snapshot(self) -> list[Any]:
-        """Capture a session/runtime snapshot for the debug console header."""
-        from opscloud._debug import installed_debug_log_path
-        from opscloud.config.env_vars import DEBUG, is_env_truthy
-        from opscloud._version import __version__
-        from opscloud.ui.widgets.debug_console import SnapshotField
-        from pathlib import Path
+        return _modals_ctrl(self).build_debug_snapshot()
 
-        def _safe(
-            label: str, fn: Callable[[], str], *, copyable: bool = False
-        ) -> SnapshotField:
-            try:
-                return SnapshotField(label=label, value=fn(), copyable=copyable)
-            except Exception as exc:
-                logger.warning("Debug snapshot field %r failed", label, exc_info=True)
-                return SnapshotField(
-                    label=label, value=f"(unavailable: {type(exc).__name__})"
-                )
-
-        def _mcp() -> str:
-            servers = self._mcp_server_info or []
-            if not servers:
-                return "none"
-            return ", ".join(f"{s.name} ({s.status})" for s in servers)
-
-        def _log_path() -> str:
-            path = installed_debug_log_path()
-            if path:
-                return str(path)
-            if is_env_truthy(DEBUG):
-                return "in-memory only (file logging requested but unavailable)"
-            return "in-memory only"
-
-        return [
-            _safe("Version", lambda: __version__, copyable=True),
-            _safe("Thread", lambda: getattr(self, "_agent_thread_id", "(none)") or "(none)", copyable=True),
-            _safe("CWD", lambda: str(Path.cwd()), copyable=True),
-            _safe("MCP servers", _mcp),
-            _safe("Debug log", _log_path),
-        ]
-
-    # ── Theme Selector Integration ────────────────────────
+    # ── Theme, Thread & Cloud Selector Integration ───────
 
     async def _show_theme_selector(self) -> None:
-        """Show interactive theme selector modal screen."""
-        def handle_result(result: str | None) -> None:
-            if result is not None and result in get_registry():
-                self.theme = result
-                save_theme_preference(result)
-                show_toast(self, f"Switched theme to `{result}`", severity="information")
-            if self._chat_input:
-                self._chat_input.focus_input()
-
-
-        screen = ThemeSelectorScreen(current_theme=self.theme)
-        self.push_screen(screen, handle_result)
+        await _modals_ctrl(self).show_theme_selector()
 
     async def _switch_theme(self, name: str) -> None:
-        """Switch theme directly by name or alias."""
-        registry = get_registry()
-        target = name.strip()
-
-        matched = None
-        if target in registry:
-            matched = target
-        else:
-            for key, entry in registry.items():
-                if key.lower() == target.lower() or entry.label.lower() == target.lower():
-                    matched = key
-                    break
-
-        if matched:
-            self.theme = matched
-            save_theme_preference(matched)
-            await self._mount_message(
-                SystemMessage(f"Switched to `{matched}` theme")
-            )
-        else:
-            avail = ", ".join(f"`{k}`" for k in list(registry.keys())[:8])
-            await self._mount_message(
-                ErrorMessage(f"Unknown theme `{name}`. Available themes include: {avail}...")
-            )
-
-    # ── Thread Selector Integration ───────────────────────
+        await _modals_ctrl(self).switch_theme(name)
 
     async def _show_thread_selector(self) -> None:
-        """Open the interactive thread selector modal screen."""
-        from opscloud.ui.widgets.thread_selector import ThreadSelectorScreen
-
-        from pathlib import Path
-        from opscloud.state.session import SessionManager
-
-        threads = []
-        sm = None
-        session_state = getattr(self, "_session_state", None)
-        if session_state and hasattr(session_state, "session_manager"):
-            sm = session_state.session_manager
-        else:
-            from opscloud.state.session import get_db_path
-            db_path = get_db_path()
-            if db_path.exists():
-                sm = SessionManager(db_path)
-
-        if sm is not None:
-            try:
-                raw_threads = await sm.list_threads(limit=50)
-                threads = [
-                    {
-                        "thread_id": t.get("thread_id"),
-                        "created_at": t.get("created_at"),
-                        "updated_at": t.get("updated_at"),
-                        "message_count": t.get("message_count", 0),
-                        "initial_prompt": t.get("initial_prompt", ""),
-                    }
-                    for t in raw_threads
-                ]
-            except Exception as exc:
-                logger.debug("Failed fetching threads for selector: %s", exc)
-
-        screen = ThreadSelectorScreen(
-            threads=threads,
-            current_thread_id=self._agent_thread_id,
-        )
-
-        def _on_thread_selected(selected_id: str | None) -> None:
-            if selected_id == "__new__":
-                import uuid
-                new_id = str(uuid.uuid4())
-                self.run_worker(self.resume_thread(new_id, is_new=True))
-            elif selected_id:
-                self.run_worker(self.resume_thread(selected_id, is_new=False))
-
-        self.push_screen(screen, _on_thread_selected)
+        await _threads_ctrl(self).show_thread_selector()
 
     async def get_recent_threads(self, limit: int = 20) -> list:
-        """Get list of recent threads from session manager."""
-        from pathlib import Path
-        from opscloud.state.session import SessionManager
-
-        sm = None
-        session_state = getattr(self, "_session_state", None)
-        if session_state and hasattr(session_state, "session_manager"):
-            sm = session_state.session_manager
-        else:
-            from opscloud.state.session import get_db_path
-            db_path = get_db_path()
-            if db_path.exists():
-                sm = SessionManager(db_path)
-
-        if sm is not None:
-            try:
-                return await sm.list_threads(limit=limit)
-            except Exception:
-                pass
-        return []
-
-
-    # ── Cloud Profile Selector Integration ─────────────────
+        return await _threads_ctrl(self).get_recent_threads(limit=limit)
 
     def _sync_status_cloud(self) -> None:
-        """Propagate current AWS cloud profile and region to status bar and banner."""
-        from opscloud.config.cloud_profiles import get_active_aws_profile, get_active_aws_region
-
-        try:
-            profile = get_active_aws_profile()
-            region = get_active_aws_region() or ""
-        except Exception:
-            return
-
-        # Update status bar
-        try:
-            status_bar = self._status_bar or self.query_one("#status-bar", StatusBar)
-            status_bar.set_cloud(profile=profile, region=region)
-        except Exception:
-            pass
-
-        # Update welcome banner if present
-        try:
-            banner = self.query_one(WelcomeBanner)
-            banner.update_cloud(profile=profile, region=region)
-        except Exception:
-            pass
+        _modals_ctrl(self).sync_status_cloud()
 
     async def _show_cloud_selector(self) -> None:
-        """Open the interactive cloud profile picker modal."""
-        from opscloud.config.cloud_profiles import get_active_aws_profile
-        from opscloud.ui.widgets.cloud_selector import CloudProfileSelectorScreen
-
-        current_profile = get_active_aws_profile()
-        screen = CloudProfileSelectorScreen(current_profile=current_profile)
-
-        def _on_cloud_selected(result: tuple[str, str | None] | None) -> None:
-            if result:
-                profile, region = result
-                self.run_worker(
-                    self._switch_cloud_profile(profile, region=region),
-                    exclusive=False,
-                    group="cloud-switch",
-                )
-            elif getattr(screen, "_mutated", False):
-                self._schedule_reload()
-
-        self.push_screen(screen, _on_cloud_selected)
+        await _modals_ctrl(self).show_cloud_selector()
 
     async def _switch_cloud_profile(self, profile: str, region: str | None = None) -> None:
-        """Switch the active AWS profile and persist across sessions."""
-        from opscloud.config.cloud_profiles import get_active_aws_region, set_active_aws_profile
-        from opscloud.ui.widgets.messages import SystemMessage
-
-        set_active_aws_profile(profile, region=region, persist=True)
-
-        effective_region = region or get_active_aws_region() or ""
-
-        settings_obj = getattr(self, "_settings", None)
-        if settings_obj is not None:
-            settings_obj.aws_profile = profile
-            if effective_region:
-                settings_obj.aws_region = effective_region
-            settings_obj.export_to_environment()
-
-        os.environ["OPSCLOUD_SERVER_AWS_PROFILE"] = profile
-        if effective_region:
-            os.environ["OPSCLOUD_SERVER_AWS_REGION"] = effective_region
-
-        if self._server_kwargs is not None:
-            self._server_kwargs["aws_profile"] = profile
-            if effective_region:
-                self._server_kwargs["aws_region"] = effective_region
-
-        if self._server_proc is not None:
-            try:
-                from dataclasses import is_dataclass, replace
-                cur_cfg = getattr(self._server_proc, "config", None)
-                updates: dict[str, Any] = {"aws_profile": profile}
-                if effective_region:
-                    updates["aws_region"] = effective_region
-                if cur_cfg is not None and is_dataclass(cur_cfg):
-                    self._server_proc.config = replace(cast(Any, cur_cfg), **updates)
-            except Exception:
-                logger.debug("Could not update server process config with active cloud profile", exc_info=True)
-
-
-        # Update status bar & welcome banner
-        self._sync_status_cloud()
-
-        region_info = f" ({effective_region})" if effective_region else ""
-        await self._mount_message(
-            SystemMessage(
-                f"Switched active AWS profile to **`{profile}`**{region_info} "
-                "(saved to `config.toml` — active across all sessions)."
-            )
-        )
-        self._schedule_reload()
+        await _modals_ctrl(self).switch_cloud_profile(profile, region=region)
 
     # ── Screen Stack Safety ───────────────────────────────
 
@@ -5901,659 +2607,64 @@ class OpsCloudApp(App):
             return AwaitComplete(_noop()).call_next(self)
         return super().pop_screen()
 
-    # ── Model Selector Integration ────────────────────────
+    # ── Model, Effort, Pool, Agent, Plugin & Skill Selectors (ModalController) ──
 
     async def _show_model_selector(self) -> None:
-        """Open the interactive model picker modal."""
-        from opscloud.ui.widgets.model_selector import ModelSelectorScreen
-        from opscloud.model.config import resolve_model_spec
-
-        for s in getattr(self, "_screen_stack", []):
-            if isinstance(s, ModelSelectorScreen):
-                logger.debug("ModelSelectorScreen already open on screen stack, skipping")
-                return
-
-        current_provider, current_model = None, None
-        if self._model:
-            try:
-                current_provider, current_model = resolve_model_spec(self._model)
-            except Exception:
-                current_model = self._model
-        
-        settings_obj = getattr(self, "settings", None)
-        current_effort = getattr(self, "_reasoning_effort", None) or (getattr(settings_obj, "reasoning_effort", None) if settings_obj else None)
-
-        screen = ModelSelectorScreen(
-            current_model=current_model,
-            current_provider=current_provider,
-            current_effort=current_effort,
-        )
-
-        _handled = False
-
-        def _on_model_selected(result: tuple[str, str, str | None] | tuple[str, str] | None) -> None:
-            """Callback when the model selector is dismissed."""
-            nonlocal _handled
-            if _handled or result is None:
-                return
-            _handled = True
-            spec = result[0]
-            effort = result[2] if len(result) > 2 else None
-            extra = screen.pending_install_extra
-            if extra:
-                # Run in a worker so modal screens pushed during installation
-                # remain interactive (call_later would block the message pump).
-                self.run_worker(
-                    self._install_extra_then_switch(extra, spec, effort=effort),
-                    exclusive=False,
-                    group="model-install-switch",
-                )
-            else:
-                self.run_worker(
-                    self._switch_model(spec, effort=effort),
-                    exclusive=False,
-                    group="model-switch",
-                )
-
-        self.push_screen(screen, _on_model_selected)
+        await _modals_ctrl(self).show_model_selector()
 
     async def _install_extra_then_switch(self, extra: str, spec: str, effort: str | None = None) -> None:
-        """Install provider package extra, then check auth and switch model.
-
-        Stops on install failure rather than falling through to auth/switch.
-        After successful install, prompts for credentials if needed before
-        performing the model switch.
-        """
-        await self._mount_message(
-            SystemMessage(f"Installing '{extra}' integration package...")
-        )
-
-        pkg_name = f"langchain-{extra}"
-        install_ok = False
-        try:
-            def _run_install():
-                import shutil
-                import subprocess
-                import sys
-
-                # Try pip first
-                pip_res = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", pkg_name],
-                    capture_output=True,
-                    text=True,
-                )
-                if pip_res.returncode == 0:
-                    return pip_res
-
-                # pip failed (possibly not installed) — fall back to uv
-                uv_bin = shutil.which("uv")
-                if uv_bin:
-                    return subprocess.run(
-                        [uv_bin, "pip", "install", pkg_name],
-                        capture_output=True,
-                        text=True,
-                    )
-
-                # Neither pip nor uv succeeded
-                return pip_res
-
-            res = await asyncio.to_thread(_run_install)
-            if res.returncode == 0:
-                install_ok = True
-                await self._mount_message(
-                    SystemMessage(f"Successfully installed '{extra}' integration package.")
-                )
-            else:
-                logger.warning("install %s failed with code %d: %s", pkg_name, res.returncode, res.stderr)
-                await self._mount_message(
-                    ErrorMessage(f"Failed to install '{extra}'. Check logs for details.")
-                )
-        except Exception as e:
-            logger.warning("Failed to install package extra %s: %s", extra, e)
-            await self._mount_message(
-                ErrorMessage(f"Failed to install '{extra}': {e}")
-            )
-
-        if not install_ok:
-            return
-
-        # Package installed — now check if credentials are needed before switching.
-        auth_ok = await self._prompt_model_auth_if_needed(spec)
-        if not auth_ok:
-            # User cancelled auth. Let them know the extra is installed so they
-            # can switch later once a key is set.
-            await self._mount_message(
-                SystemMessage(
-                    f"Installed '{extra}'. Switch to {spec} anytime with "
-                    "`/model` — you'll be prompted for credentials."
-                )
-            )
-            return
-
-        await self._finalize_model_switch(spec, effort=effort)
+        await _modals_ctrl(self).install_extra_then_switch(extra, spec, effort=effort)
 
     async def _prompt_model_auth_if_needed(self, spec: str) -> bool:
-        """Prompt for missing credentials before switching to a model.
-
-        Returns True when switching can continue, False when the user did not
-        save required credentials.
-        """
-        from opscloud.model.config import (
-            get_credential_env_var,
-            get_provider_auth_status,
-        )
-        from opscloud.ui.widgets.auth import AuthPromptScreen, AuthResult
-
-        provider = spec.split(":", 1)[0] if ":" in spec else "openai"
-        status = get_provider_auth_status(provider)
-        if status.as_legacy_bool():
-            return True
-
-        env_var = status.env_var or get_credential_env_var(provider) or f"{provider.upper()}_API_KEY"
-
-        # Use an asyncio.Future to wait for the modal result in this worker
-        # without blocking the App message pump.
-        loop = asyncio.get_running_loop()
-        auth_future: asyncio.Future[AuthResult | None] = loop.create_future()
-
-        def _on_auth_done(result: AuthResult | None) -> None:
-            if not auth_future.done():
-                loop.call_soon_threadsafe(auth_future.set_result, result)
-
-        self.app.push_screen(
-            AuthPromptScreen(
-                provider,
-                env_var,
-                reason=f"Required to use {spec}",
-            ),
-            _on_auth_done,
-        )
-
-        result = await auth_future
-        return result is AuthResult.SAVED
+        return await _modals_ctrl(self).prompt_model_auth_if_needed(spec)
 
     async def _switch_model(self, spec: str, effort: str | None = None) -> None:
-        """Switch the active model, checking auth if needed.
-
-        Package installation is NOT checked here — callers are responsible for
-        ensuring the provider package is installed before calling this method
-        (either via the model selector's install flow, or because the package
-        was already present).
-        """
-        if ":" in spec:
-            provider = spec.split(":", 1)[0]
-        else:
-            from opscloud.model.factory import detect_provider
-            provider = detect_provider(spec) or "openai"
-
-        # Check auth before switching
-        auth_ok = await self._prompt_model_auth_if_needed(spec)
-        if not auth_ok:
-            return
-
-        await self._finalize_model_switch(spec)
+        await _modals_ctrl(self).switch_model(spec, effort=effort)
 
     async def _finalize_model_switch(self, spec: str, effort: str | None = None) -> None:
-        """Perform the actual model switch and persist to recents.
-
-        This is the final step after package installation and auth checks have
-        passed. Sets the model, updates the status bar, and persists to recents.
-        """
-        from opscloud.model.config import save_recent_model, apply_stored_credentials
-
-        if spec in ("auto", "dynamic"):
-            import os
-            os.environ["OPSCLOUD_SERVER_MODEL"] = spec
-            os.environ["OPSCLOUD_MODEL_NAME"] = spec
-            os.environ["OPSCODE_SERVER_MODEL"] = spec
-            os.environ["OPSCODE_MODEL_NAME"] = spec
-            self._model = spec
-            settings_obj = getattr(self, "settings", None)
-            if settings_obj:
-                settings_obj.model = spec
-                settings_obj.model_name = spec
-            try:
-                status_bar = self.query_one("#status-bar", StatusBar)
-                status_bar.set_model(provider="typesafe", model="jev-router", effort="auto")
-            except NoMatches:
-                pass
-            self._sync_banner_model("typesafe:jev-router", "auto")
-            await self._mount_message(
-                SystemMessage("Switched to **Autonomous Tier Routing (TypeSafe Jev System 1)**.")
-            )
-            return
-
-        provider = spec.split(":", 1)[0] if ":" in spec else ""
-        if provider:
-            apply_stored_credentials(provider)
-
-        import os
-        os.environ["OPSCLOUD_SERVER_MODEL"] = spec
-        os.environ["OPSCLOUD_MODEL_NAME"] = spec
-        os.environ["OPSCODE_SERVER_MODEL"] = spec
-        os.environ["OPSCODE_MODEL_NAME"] = spec
-        self._model = spec
-        from opscloud.approval_mode import ApprovalMode
-        if getattr(self, "_approval_mode", ApprovalMode.MANUAL) is not ApprovalMode.SMART:
-            self._manual_model = spec
-        self._smart_routed_active = False
-        settings_obj = getattr(self, "settings", None)
-        if settings_obj:
-            settings_obj.model = spec
-            settings_obj.model_name = spec
-            if provider:
-                settings_obj.model_provider = provider
-        if effort is not None:
-            self._reasoning_effort = effort
-            os.environ["OPSCLOUD_REASONING_EFFORT"] = effort
-            os.environ["OPSCODE_REASONING_EFFORT"] = effort
-            if settings_obj:
-                settings_obj.reasoning_effort = effort
-
-        eff_val = effort or getattr(self, "_reasoning_effort", None)
-        if not eff_val and spec:
-            from opscloud.model.reasoning import default_effort_for_model
-            eff_val = default_effort_for_model(spec) or ""
-        eff_display: str = str(eff_val) if eff_val else ""
-
-        if self._adapter:
-            pass
-        try:
-            status_bar = self.query_one("#status-bar", StatusBar)
-            _prov, _mdl = _split_model_spec(spec)
-            status_bar.set_model(provider=_prov, model=_mdl, effort=eff_display)
-            self._sync_banner_model(spec, eff_display)
-            from opscloud.model.config import resolve_model_context_limit
-
-            _ctx_limit = resolve_model_context_limit(spec)
-            if _ctx_limit:
-                status_bar.set_context_limit(_ctx_limit)
-                settings_obj = getattr(self, "settings", None)
-                if settings_obj:
-                    settings_obj.model_context_limit = _ctx_limit
-        except NoMatches:
-            pass
-
-        # Persist to recent models
-        save_recent_model(spec)
-
-        msg = f"Switched model to `{spec}`"
-        if eff_display:
-            msg += f" (thinking level: `{eff_display}`)"
-        await self._mount_message(
-            SystemMessage(msg)
-        )
-
-        if self._server_startup_deferred:
-            self._server_startup_deferred = False
-            self._connecting = True
-            self._server_kwargs = {
-                "assistant_id": self._assistant_id,
-                "model_name": spec,
-                "auto_approve": self._auto_approve,
-            }
-            try:
-                status_bar = self.query_one("#status-bar", StatusBar)
-                status_bar.set_status("Connecting...")
-            except Exception:
-                pass
-            await self._mount_message(
-                SystemMessage(
-                    f"**Model configured!** Starting agent server for model `{spec}`..."
-                )
-            )
-            self.run_worker(self._start_server_background(), group="server-startup")
-
-    # ── Effort Selector Integration ───────────────────────
+        await _modals_ctrl(self).finalize_model_switch(spec, effort=effort)
 
     async def _show_effort_selector(self) -> None:
-        """Open the interactive reasoning effort picker modal."""
-        from opscloud.model.reasoning import (
-            default_effort_for_model,
-            supported_efforts_for_model,
-        )
-        from opscloud.ui.widgets.effort_selector import EffortSelectorScreen
-
-        model_spec = self._model or "default"
-        efforts = supported_efforts_for_model(model_spec) or ("low", "medium", "high")
-        current_eff = getattr(self, "_reasoning_effort", None) or getattr(getattr(self, "settings", None), "reasoning_effort", None)
-        default_eff = default_effort_for_model(model_spec) or "high"
-
-        screen = EffortSelectorScreen(
-            model_spec=model_spec,
-            efforts=efforts,
-            current_effort=current_eff,
-            default_effort=default_eff,
-        )
-
-        def _on_effort_selected(result: str | None) -> None:
-            if result is not None:
-                self.run_worker(self._set_effort_override(result))
-
-        self.push_screen(screen, _on_effort_selected)
-
-    # ── Pool Selector Integration ─────────────────────────
+        await _modals_ctrl(self).show_effort_selector()
 
     async def _show_pool_selector(self) -> None:
-        """Open the interactive agent model pool configuration modal."""
-        from opscloud.model.config import detect_provider
-        from opscloud.ui.widgets.pool_selector import PoolSelectorScreen
-
-        settings_obj = getattr(self, "settings", None)
-        current_spec = getattr(self, "_model", None) or (getattr(settings_obj, "model", None) if settings_obj else None)
-        provider = detect_provider(current_spec or "") or getattr(settings_obj, "model_provider", None) or "google_genai"
-
-        screen = PoolSelectorScreen(active_provider=provider)
-
-        def _on_pool_selected(result: dict[str, str] | None) -> None:
-            if result is None:
-                return
-
-            from opscloud.model.pool import get_model_pool_manager
-            pool_mgr = get_model_pool_manager()
-            with pool_mgr._lock:
-                pool_mgr._instances.clear()
-
-            if result.get("_cleared"):
-                self.notify("Agent model pool cleared (dynamic discovery restored)", severity="information")
-                self.run_worker(
-                    self._mount_message(
-                        SystemMessage("Agent model pool cleared. Reverted to automatic dynamic discovery.")
-                    )
-                )
-                self._schedule_reload()
-                return
-
-            fast = result.get("fast", "")
-            std = result.get("standard", "")
-            pow_m = result.get("powerful", "")
-
-            # Apply stored credentials for all providers present in the pool
-            from opscloud.model.config import apply_stored_credentials
-            provs = {s.split(":", 1)[0] for s in (fast, std, pow_m) if ":" in s}
-            for p in provs:
-                apply_stored_credentials(p)
-
-            self.notify("Agent model pool saved to config.toml", severity="information")
-            msg = (
-                f"**Agent Model Pool Saved (`config.toml [agent_pool]`):**\n"
-                f"• **Fast (Tier 0):** `{fast}`\n"
-                f"• **Standard (Tier 1):** `{std}`\n"
-                f"• **Powerful (Tier 2):** `{pow_m}`\n"
-                f"In smart mode, Jev dynamically routes requests across these pool models."
-            )
-            self.run_worker(self._mount_message(SystemMessage(msg)))
-            self._schedule_reload()
-
-        self.push_screen(screen, _on_pool_selected)
+        await _modals_ctrl(self).show_pool_selector()
 
     async def _set_effort_override(self, effort: str) -> None:
-        """Apply reasoning effort override and update UI."""
-        import os
-        from opscloud.ui.widgets.messages import SystemMessage
-        from opscloud.ui.widgets.status import StatusBar
-
-        model_spec = self._model or "default"
-
-        if effort.lower() in {"clear", "reset"}:
-            self._reasoning_effort = None
-            os.environ.pop("OPSCODE_REASONING_EFFORT", None)
-            settings_obj = getattr(self, "settings", None)
-            if settings_obj:
-                settings_obj.reasoning_effort = None
-            try:
-                sb = self.query_one("#status-bar", StatusBar)
-                _prov, _mdl = _split_model_spec(model_spec)
-                from opscloud.model.reasoning import default_effort_for_model
-                def_eff = default_effort_for_model(model_spec) or ""
-                sb.set_model(provider=_prov, model=_mdl, effort=def_eff)
-                self._sync_banner_model(model_spec, def_eff)
-            except Exception:
-                pass
-            await self._mount_message(SystemMessage(f"Reasoning effort override cleared for `{model_spec}`."))
-            return
-
-        self._reasoning_effort = effort
-        os.environ["OPSCODE_REASONING_EFFORT"] = effort
-        settings_obj = getattr(self, "settings", None)
-        if settings_obj:
-            settings_obj.reasoning_effort = effort
-
-        try:
-            sb = self.query_one("#status-bar", StatusBar)
-            _prov, _mdl = _split_model_spec(model_spec)
-            sb.set_model(provider=_prov, model=_mdl, effort=effort)
-        except Exception:
-            pass
-        self._sync_banner_model(model_spec, effort)
-
-        await self._mount_message(SystemMessage(f"Reasoning effort for `{model_spec}` set to `{effort}`."))
-
-    # ── Agent Selector Integration ────────────────────────
+        await _modals_ctrl(self).set_effort_override(effort)
 
     async def _show_agent_selector(self) -> None:
-        """Open the interactive agent picker modal with plugin subagents."""
-        from opscloud.commands.power.agents import get_agent_session_state
-        current_state = get_agent_session_state(self)
-        current_agent = current_state.short_name or current_state.agent_id
-
-        plugin_agents = self.get_discovered_plugin_agents()
-        agent_names: list[str] = []
-        for a in plugin_agents:
-            raw_name = a.get("name") or ""
-            short = raw_name.rsplit(":", 1)[-1]
-            if "@" in short:
-                short = short.split("@", 1)[0]
-            if short and short not in agent_names:
-                agent_names.append(short)
-
-        is_plugin_picker = bool(agent_names)
-
-        if not agent_names:
-            from opscloud.agent.config import get_available_agent_names, load_default_agent
-            agent_names = get_available_agent_names()
-            default_agent = load_default_agent()
-        else:
-            default_agent = None
-
-        def _on_agent_selected(result: str | None) -> None:
-            """Callback when the agent selector is dismissed."""
-            if result is not None:
-                if is_plugin_picker:
-                    asyncio.create_task(self._activate_selected_agent(result))
-                elif result != self._assistant_id:
-                    self._switch_agent(result)
-            # Refocus input
-            if self._chat_input:
-                self._chat_input.focus()
-
-        from opscloud.ui.widgets.agent_selector import AgentSelectorScreen
-
-        screen = AgentSelectorScreen(
-            current_agent=current_agent or self._assistant_id,
-            agent_names=agent_names,
-            default_agent=default_agent,
-        )
-        self.push_screen(screen, _on_agent_selected)
+        await _modals_ctrl(self).show_agent_selector()
 
     async def _activate_selected_agent(self, agent_name: str, prompt: str = "") -> None:
-        """Activate a plugin agent persona session."""
-        from opscloud.commands._base import CommandContext
-        from opscloud.commands.power.agents import activate_agent_session
-        from opscloud.ui.widgets.messages import CommandOutputMessage
-
-        ctx = CommandContext(app=self, raw_command=f"/agent:{agent_name}", args=agent_name)
-        res = await activate_agent_session(ctx, agent_name, prompt=prompt)
-        if res.message:
-            await self._mount_message(CommandOutputMessage(res.message, command=f"/agent:{agent_name}"))
+        await _modals_ctrl(self).activate_selected_agent(agent_name, prompt=prompt)
 
     def _switch_agent(self, agent_name: str) -> None:
-        """Switch to a different agent and start a new thread.
-
-        Clears the chat, updates the assistant_id, creates a new thread,
-        and posts a confirmation message.
-
-        Args:
-            agent_name: The agent to switch to.
-        """
-        import uuid
-
-        if agent_name == self._assistant_id:
-            return
-
-        # Guard: don't switch while agent is running
-        if self._agent_running or self._shell_running:
-            self.notify(
-                "Cannot switch agents while a task is running. "
-                "Interrupt or wait for it to finish first.",
-                severity="warning",
-            )
-            return
-
-        # Update identity
-        old_agent = self._assistant_id
-        self._assistant_id = agent_name
-
-        # Clear chat and start new thread
-        self._pending_messages.clear()
-        self._queued_widgets.clear()
-        self._reset_ephemeral_mode_states()
-        self._restore_goal_rubric_state({})
-        self._reset_thread_usage(0.0, 0)
-        try:
-            messages = self.query_one("#messages", MessageList)
-            messages.clear()
-        except NoMatches:
-            pass
-
-        self._agent_thread_id = str(uuid.uuid4())
-        bind_logging_to_thread(self._agent_thread_id)
-
-        # Update adapter if present
-        if self._adapter:
-            self._adapter._assistant_id = agent_name
-
-        # Update status bar
-        try:
-            status_bar = self.query_one("#status-bar", StatusBar)
-            status_bar.set_status("Ready")
-        except NoMatches:
-            pass
-
-        # Post confirmation
-        self.call_later(
-            self._mount_message,
-            SystemMessage(f"Switched to {agent_name}. New thread started."),
-        )
-
-        logger.info("Agent switched: %s → %s", old_agent, agent_name)
-
-    # ── Plugin Manager ───────────────────────────────────
+        _modals_ctrl(self).switch_agent(agent_name)
 
     def _snapshot_plugin_state(self) -> tuple[frozenset[str], dict[str, Any]]:
-        """Snapshot enabled plugin ids and installed plugin metadata for change detection."""
-        from opscloud.plugins.store import (
-            load_all_enabled_plugin_ids,
-            load_installed_plugins,
-            load_marketplace_records,
-        )
-
-        project_root = getattr(self._settings, "project_root", None) if self._settings else None
-        p_root = Path(project_root) if project_root else None
-        enabled = load_all_enabled_plugin_ids(project_root=p_root)
-        installed = {
-            k: (v.scope, v.install_path)
-            for k, v in load_installed_plugins(project_root=p_root).items()
-        }
-        marketplaces = {
-            k: v.source
-            for k, v in load_marketplace_records(project_root=p_root).items()
-        }
-        return enabled, {"installed": installed, "marketplaces": marketplaces}
+        return _modals_ctrl(self).snapshot_plugin_state()
 
     async def _check_plugin_manager_changes(
         self,
         baseline_enabled: frozenset[str],
         baseline_meta: dict[str, Any],
     ) -> bool | None:
-        """Check whether plugin state changed while the manager was open."""
-        try:
-            curr_enabled, curr_meta = await asyncio.to_thread(self._snapshot_plugin_state)
-            return curr_enabled != baseline_enabled or curr_meta != baseline_meta
-        except Exception:
-            logger.exception("Failed to snapshot plugin state while closing manager")
-            return None
+        return await _modals_ctrl(self).check_plugin_manager_changes(baseline_enabled, baseline_meta)
 
     async def _show_plugin_manager(self) -> None:
-        """Push the plugin manager modal screen for /plugins."""
-        from opscloud.plugins.store import load_all_enabled_plugin_ids
-        from opscloud.ui.widgets.plugin_manager import (
-            PluginManagerResult,
-            PluginManagerScreen,
-        )
-
-        try:
-            baseline = await asyncio.to_thread(self._snapshot_plugin_state)
-        except Exception:
-            logger.exception("Failed to snapshot plugin state before opening manager")
-            baseline = None
-
-        async def check_changes() -> bool | None:
-            if baseline is None:
-                return None
-            baseline_enabled, baseline_meta = baseline
-            return await self._check_plugin_manager_changes(baseline_enabled, baseline_meta)
-
-        def on_close(result: PluginManagerResult) -> None:
-            if result in ("reload", "later"):
-                self._schedule_reload()
-            elif result == "check_failed":
-                from opscloud.ui.widgets.messages import SystemMessage
-
-                self.run_worker(
-                    self._mount_message(
-                        SystemMessage("Could not verify plugin changes. Run `/reload` to apply.")
-                    ),
-                    exclusive=False,
-                )
-
-        mcp_info = self.get_mcp_servers() if hasattr(self, "get_mcp_servers") else ()
-        project_root = getattr(self._settings, "project_root", None) if self._settings else None
-        p_root = Path(project_root) if project_root else None
-        loaded_ids = load_all_enabled_plugin_ids(project_root=p_root)
-
-        screen = PluginManagerScreen(
-            mcp_server_info=mcp_info,
-            loaded_plugin_ids=loaded_ids,
-            project_root=p_root,
-            check_reload_required=check_changes,
-        )
-        self.push_screen(screen, on_close)
-
-    # ── Skills Viewer ────────────────────────────────────
+        await _modals_ctrl(self).show_plugin_manager()
 
     def _open_skills_viewer(self) -> None:
-        """Push the interactive skills viewer modal screen."""
-        from opscloud.ui.widgets.skills_viewer import SkillsViewerScreen
+        _modals_ctrl(self).open_skills_viewer()
 
-        skills = self.get_discovered_skills()
-        self.push_screen(SkillsViewerScreen(skills=skills))
-
-    # ── Goal Review ──────────────────────────────────────
+    # ── Goal Review & Worker Focus ───────────────────────
 
     def _focus_chat_input_after_refresh(self) -> None:
-        """Restore chat input focus after an inline prompt is removed or turn completes.
-
-        """
-        if self._chat_input:
-            self.call_after_refresh(self._chat_input.focus_input)
-            self.set_timer(0.05, self._chat_input.focus_input)
+        self._prompts.focus_chat_input_after_refresh()
 
     @on(Worker.StateChanged)
     def _on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        """Surface worker state changes and restore focus when agent tasks finish.
-
-        """
         from textual.worker import WorkerState
 
         worker = event.worker
@@ -6567,274 +2678,34 @@ class OpsCloudApp(App):
             self._focus_chat_input_after_refresh()
 
     async def _cancel_pending_goal_review(self, *, context: str = "cleanup") -> None:
-        """Cancel and remove any mounted pending goal review prompt.
-
-        """
-        logger.debug("Cancelling pending goal review (context=%s)", context)
-        widget = self._pending_goal_review_widget
-        future = self._pending_goal_review_future
-        self._pending_goal_review_widget = None
-        self._pending_goal_review_future = None
-
-        if widget is not None:
-            try:
-                widget.action_cancel()
-            except Exception:
-                pass
-        if future is not None and not future.done():
-            future.cancel()
-        if widget is not None and getattr(widget, "is_mounted", False):
-            try:
-                widget.remove()
-            except Exception:
-                pass
-        self._focus_chat_input_after_refresh()
+        await self._prompts.cancel_pending_goal_review(context=context)
 
     def _open_goal_review(self, objective: str, rubric: str, amendment: bool = False) -> None:
-        """Mount the inline goal review widget into messages for user review of criteria.
-
-        """
-        from opscloud.ui.widgets.goal_review import GoalReviewMenu
-
-        try:
-            messages = self.query_one("#messages", MessageList)
-        except NoMatches:
-            logger.warning("Cannot mount goal review menu: #messages container not found")
-            return
-
-        if self._pending_goal_review_widget is not None:
-            try:
-                self._pending_goal_review_widget.remove()
-            except Exception:
-                pass
-
-        unique_id = f"goal-review-menu-{uuid.uuid4().hex[:8]}"
-        logger.debug("Mounting GoalReviewMenu id=%s for objective=%r", unique_id, objective[:40])
-        menu = GoalReviewMenu(
-            objective,
-            rubric,
-            amendment=amendment,
-            id=unique_id,
-        )
-        self._pending_goal_review_widget = menu
-        self.run_worker(messages.mount_inline_prompt(menu))
+        self._prompts.open_goal_review(objective, rubric, amendment=amendment)
 
     @on(GoalReviewMenu.Decided)
     async def _on_goal_review_decided(self, event: GoalReviewMenu.Decided) -> None:
-        """Handle a goal review decision by processing result and focusing chat input.
-
-        """
-        if self._pending_goal_review_widget is event.widget:
-            self._pending_goal_review_widget = None
-
-        if event.widget:
-            try:
-                event.widget.remove()
-            except Exception:
-                pass
-
-        result = event.result
-        res_type = result.get("type")
-        logger.debug("GoalReviewMenu decision received: %s", res_type)
-
-        from opscloud.commands.power.goal import GoalHandler, get_goal_state
-
-        state = get_goal_state(self)
-        objective = state.pending_objective or state.objective or ""
-        prev_rubric = state.pending_rubric or state.rubric or ""
-
-        if res_type == "accepted":
-            asyncio.ensure_future(self._accept_goal_rubric(prev_rubric))
-        elif res_type == "edited":
-            new_criteria: str = str(result.get("criteria", prev_rubric))
-            asyncio.ensure_future(self._accept_goal_rubric(new_criteria))
-        elif res_type == "rejected":
-            feedback: str = str(result.get("message", ""))
-            state.pending_objective = None
-            state.pending_rubric = None
-            GoalHandler._sync_status_rubric(self, state)
-
-            req = {
-                "kind": "create",
-                "request_id": str(uuid.uuid4()),
-                "objective": objective,
-                "feedback": feedback,
-                "previous_criteria": prev_rubric,
-            }
-            asyncio.ensure_future(self._run_goal_criteria_request(req))
-        elif res_type == "cancelled":
-            state.pending_objective = None
-            state.pending_rubric = None
-            GoalHandler._sync_status_rubric(self, state)
-
-        self._focus_chat_input_after_refresh()
+        await self._prompts.on_goal_review_decided(event)
 
     def _handle_rubric_evaluation_end(self, rubric_msg: dict[str, Any]) -> None:
-        """Handle grader evaluation completion by updating GoalState and status bar.
+        _goals_ctrl(self).handle_rubric_evaluation_end(rubric_msg)
 
-        """
-        from opscloud.commands.power.goal import GoalHandler, get_goal_state
-        state = get_goal_state(self)
-
-        result = str(rubric_msg.get("result", "")).lower()
-        if state.objective:
-            logger.debug("Handling rubric_evaluation_end: result=%s for objective=%r", result, state.objective[:40])
-            if result in ("satisfied", "passed", "complete"):
-                state.status = "complete"
-                if not state.status_note:
-                    state.status_note = "Acceptance criteria satisfied."
-            elif result in ("unsatisfied", "failed", "blocked"):
-                state.status = "blocked"
-
-        if state.next_rubric:
-            state.next_rubric = None
-
-        GoalHandler._sync_status_rubric(self, state)
-        self._focus_chat_input_after_refresh()
-
-    # ── Agent Persona Session (/agent) ───────────────────
-    #
-    # Plugin subagents run in an isolated session agent inside the server graph;
-    # the TUI submits typed requests and mirrors AgentSessionState.
+    # ── Agent Persona Session (/agent) & Skill Command ───
 
     def _reset_ephemeral_mode_states(self) -> None:
-        """Reset TUI mirrors for active plugin agent sessions and workflows."""
-        try:
-            from opscloud.commands.power.agents import (
-                get_agent_session_state,
-                sync_agent_session_status_label,
-            )
-
-            ag_state = get_agent_session_state(self)
-            ag_state.clear()
-            sync_agent_session_status_label(self, ag_state)
-        except Exception:
-            pass
+        _modals_ctrl(self).reset_ephemeral_mode_states()
 
     async def _sync_agent_session_state_from_checkpoint(self) -> None:
-        """Mirror the thread's ``_active_agent_id`` channel into ``AgentSessionState``."""
-        from opscloud.commands.power.agents import (
-            _clean_short_name,
-            _discover_plugin_agents,
-            get_agent_session_state,
-            resolve_plugin_agent,
-            sync_agent_session_status_label,
-        )
-
-        state = get_agent_session_state(self)
-        values = await self._get_thread_state_values()
-        if not values:
-            state.clear()
-            sync_agent_session_status_label(self, state)
-            return
-
-        active_id = values.get("_active_agent_id")
-        if isinstance(active_id, str) and active_id.strip():
-            full_name = active_id.strip()
-            spec = resolve_plugin_agent(full_name, _discover_plugin_agents(self))
-            state.agent_id = str(spec.get("name") or full_name) if spec else full_name
-            state.short_name = _clean_short_name(state.agent_id)
-            state.plugin_id = str(spec.get("plugin_id") or "") if spec else ""
-            state.description = (
-                str(spec.get("description") or "").splitlines()[0]
-                if spec and spec.get("description")
-                else ""
-            )
-            state.attached = True
-            state.thread_id = self._agent_thread_id
-            state.needs_server_reset = False
-        else:
-            state.clear()
-        sync_agent_session_status_label(self, state)
+        await _modals_ctrl(self).sync_agent_session_state_from_checkpoint()
 
     async def _run_agent_session_request(self, request: dict[str, Any]) -> None:
-        """Submit one typed agent session request through the normal agent stream."""
-        if not self._adapter or not self._adapter.connected:
-            await self._mount_message(ErrorMessage("Agent sessions require a connected server."))
-            return
-        from opscloud.commands.power.agents import get_agent_session_state
-
-        state = get_agent_session_state(self)
-        state.thread_id = self._agent_thread_id
-        kind = request.get("kind")
-
-        # Pure activation without a prompt: AgentSessionState is already updated in memory;
-        # bypass running an empty server graph turn to prevent app locking and queuing lag.
-        if kind == "start" and not request.get("prompt"):
-            return
-
-        if kind == "clear":
-            spinner = "Detaching agent"
-        else:
-            name = state.short_name or "Agent"
-            spinner = f"Thinking ({name})"
-        self._agent_turn_started = False
-        self._agent_running = True
-        await self._set_spinner(spinner)
-        prompt_text = str(request.get("message") or request.get("prompt") or "")
-        self._agent_worker = self.run_worker(
-            self._run_agent_task(
-                prompt_text,
-                graph_input={
-                    "messages": [],
-                    "agent_session_request": request,
-                },
-            ),
-            exclusive=False,
-        )
+        await _modals_ctrl(self).run_agent_session_request(request)
 
     async def _maybe_continue_agent_session(self, message: str) -> bool:
-        """Route plain chat input to an active, attached plugin agent session.
-
-        Returns:
-            Whether the message was consumed by the active agent.
-        """
-        from opscloud.commands.power.agents import get_agent_session_state
-        from opscloud.input import parse_file_mentions
-        from opscloud.ui.textual_adapter import _read_mentioned_file
-
-        state = get_agent_session_state(self)
-        if state.thread_id not in {None, self._agent_thread_id}:
-            state.clear()
-            return False
-        if not state.accepts_replies:
-            return False
-
-        prompt_text, mentioned_files = parse_file_mentions(message)
-        max_embed_bytes = 256 * 1024
-        if mentioned_files:
-            context_parts = [prompt_text, "\n\n## Referenced Files\n"]
-            for file_path in mentioned_files:
-                try:
-                    part = _read_mentioned_file(file_path, max_embed_bytes)
-                    context_parts.append(part)
-                except Exception as e:
-                    context_parts.append(f"\n### {file_path.name}\n[Error reading file: {e}]")
-            final_content = "\n".join(context_parts)
-        else:
-            final_content = prompt_text
-
-        reset_flag = bool(getattr(state, "needs_server_reset", False))
-        state.needs_server_reset = False
-        req: dict[str, Any] = {
-            "kind": "continue",
-            "request_id": str(uuid.uuid4()),
-            "agent_name": state.agent_id,
-            "message": final_content,
-        }
-        if reset_flag:
-            req["reset"] = True
-        await self._run_agent_session_request(req)
-        return True
-
-    # ── Skill Command ────────────────────────────────────
+        return await _modals_ctrl(self).maybe_continue_agent_session(message)
 
     async def _handle_skill_command(self, command: str) -> None:
-        """Handle a /skill:<name> command by invoking the skill directly."""
-        from opscloud.skills.invocation import parse_skill_command
-
-        skill_name, args = parse_skill_command(command)
-        await self._invoke_skill(skill_name, args, command=command)
+        await _modals_ctrl(self).handle_skill_command(command)
 
     async def _invoke_skill(
         self,
@@ -6843,74 +2714,7 @@ class OpsCloudApp(App):
         *,
         command: str | None = None,
     ) -> None:
-        """Load a skill, render its widget, and send its prompt to the agent.
-
-        """
-        from opscloud.skills.invocation import (
-            build_skill_invocation_envelope,
-            match_discovered_skill,
-        )
-        from opscloud.skills.loader import load_skill_content
-        from opscloud.ui.widgets.messages import AppMessage, ErrorMessage, SkillMessage, UserMessage
-
-        normalized_name = skill_name.strip().lower()
-
-        async def _mount_error(message: str) -> None:
-            if command is not None:
-                await self._mount_message(UserMessage(command))
-            await self._mount_message(AppMessage(message))
-
-        if not normalized_name:
-            if command is not None:
-                await self._mount_message(UserMessage(command))
-                await self._mount_message(AppMessage("Usage: /<skill-name> [args]"))
-            else:
-                await self._mount_message(AppMessage("Skill name is required."))
-            return
-
-        skills = self._discovered_skills or self.get_discovered_skills()
-        cached = match_discovered_skill(skills, normalized_name)
-        if cached is None and self._discovered_skills:
-            # Fall back to fresh discovery on cache miss
-            skills = self.get_discovered_skills()
-            self._discovered_skills = skills
-            cached = match_discovered_skill(skills, normalized_name)
-
-        if cached is None:
-            logger.warning("Skill not found: %r", normalized_name)
-            await _mount_error(f"Skill not found: {normalized_name}")
-            return
-
-        skill_path = str(cached.get("path", ""))
-        try:
-            content = load_skill_content(skill_path)
-        except Exception as exc:
-            logger.warning("Error reading skill %r: %s", normalized_name, exc)
-            await _mount_error(f"Error loading skill: {normalized_name}. {exc}")
-            return
-
-        if not content or not content.strip():
-            await _mount_error(
-                f"Skill '{normalized_name}' has an empty SKILL.md file. "
-                "Add instructions to the file before invoking."
-            )
-            return
-
-        envelope = build_skill_invocation_envelope(cached, content, args)
-
-        await self._mount_message(
-            SkillMessage(
-                skill_name=str(cached.get("name", "")),
-                description=str(cached.get("description", "")),
-                source=str(cached.get("source", "built-in")),
-                body=content,
-                args=args,
-            )
-        )
-        await self._send_to_agent(
-            envelope.prompt,
-            message_kwargs=envelope.message_kwargs,
-        )
+        await _modals_ctrl(self).invoke_skill(skill_name, args, command=command)
 
     # ── Exit ─────────────────────────────────────────────
 

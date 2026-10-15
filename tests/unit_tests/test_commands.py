@@ -122,12 +122,14 @@ async def test_config_command_execution():
     ctx_path = CommandContext(app=None, raw_command="/config path", args="path", settings=test_settings)
     res_path = await handler.execute(ctx_path)
     assert res_path.success is True
+    assert res_path.message is not None
     assert "config.toml" in res_path.message
 
     # 2. /config show (text fallback)
     ctx_show = CommandContext(app=None, raw_command="/config show", args="show", settings=test_settings)
     res_show = await handler.execute(ctx_show)
     assert res_show.success is True
+    assert res_show.message is not None
     assert "Current Configuration" in res_show.message
     assert "aws.region" in res_show.message
 
@@ -493,6 +495,7 @@ async def test_context_command_no_emojis_and_complete_metrics():
 
     assert result.success is True
     msg = result.message
+    assert msg is not None
 
     # Verify NO emojis in message
     emojis = ["📊", "🧩", "☁️", "🤖", "⚡", "✨", "🔥"]
@@ -541,6 +544,7 @@ async def test_multi_provider_pool_command_set_and_status():
     )
     res_set = await handler.execute(ctx_set)
     assert res_set.success is True
+    assert res_set.message is not None
     assert "Agent Model Pool Updated" in res_set.message
 
     saved = load_agent_pool()
@@ -554,6 +558,7 @@ async def test_multi_provider_pool_command_set_and_status():
     ctx_status = CommandContext(app=None, raw_command="/pool status", args="status")
     res_status = await handler.execute(ctx_status)
     assert res_status.success is True
+    assert res_status.message is not None
     assert "Multi-Provider" in res_status.message
     assert "openai:gpt-4o-mini" in res_status.message
     assert "google_genai:gemini-2.5-flash" in res_status.message
@@ -600,7 +605,7 @@ async def test_pool_selector_screen_multi_provider_ui():
 
         # Fast model selector options are now OpenAI models
         s_fast = screen.query_one("#select-fast", Select)
-        assert any("openai" in opt[1] for opt in s_fast._options)
+        assert any("openai" in str(opt[1]) for opt in s_fast._options)
         s_fast.value = "openai:gpt-4o-mini"
 
         # 3. Change Powerful provider to anthropic
@@ -608,12 +613,12 @@ async def test_pool_selector_screen_multi_provider_ui():
         await pilot.pause()
 
         s_pow = screen.query_one("#select-powerful", Select)
-        assert any("anthropic" in opt[1] for opt in s_pow._options)
+        assert any("anthropic" in str(opt[1]) for opt in s_pow._options)
         s_pow.value = "anthropic:claude-sonnet-4-5"
 
         # 4. Standard remains google_genai
         s_std = screen.query_one("#select-standard", Select)
-        assert any("google_genai" in opt[1] for opt in s_std._options)
+        assert any("google_genai" in str(opt[1]) for opt in s_std._options)
         s_std.value = "google_genai:gemini-2.5-flash"
 
         # 5. Save multi-provider pool

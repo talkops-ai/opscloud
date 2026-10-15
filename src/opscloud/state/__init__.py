@@ -55,6 +55,18 @@ from opscloud.state.service_context import (
     make_operation_record,
     make_service_record,
 )
+from opscloud.state import conversation_title as conversation_title
+from opscloud.state.conversation_title import (
+    CONVERSATION_TITLE_SYSTEM_PROMPT,
+    clean_prompt_for_title,
+    generate_conversation_title,
+    get_thread_display_label,
+    maybe_generate_conversation_title,
+    postprocess_conversation_title,
+    resolve_conversation_title_model,
+    schedule_conversation_title_generation,
+    truncate_summary_preview,
+)
 from opscloud.state.session import (
     SessionManager,
     ThreadInfo,
@@ -66,9 +78,11 @@ from opscloud.state.session import (
     get_checkpointer,
     get_db_path,
     get_most_recent,
+    get_thread_title,
     list_threads,
     prewarm_thread_message_counts,
     set_db_path,
+    set_thread_title,
     thread_exists,
 )
 from opscloud.state.state_migration import migrate_legacy_state
@@ -124,21 +138,32 @@ __all__ = [
     "validate_rubric",
     # Resume State
     "ResumeState",
-    # Session Persistence & Checkpointing
+    # Conversation Title Generation & Session Persistence
+    "CONVERSATION_TITLE_SYSTEM_PROMPT",
     "SessionManager",
     "ThreadInfo",
+    "clean_prompt_for_title",
     "delete_thread",
     "find_similar_threads",
     "format_relative_timestamp",
     "format_timestamp",
+    "generate_conversation_title",
     "generate_thread_id",
     "get_checkpointer",
     "get_db_path",
     "get_most_recent",
+    "get_thread_display_label",
+    "get_thread_title",
     "list_threads",
+    "maybe_generate_conversation_title",
+    "postprocess_conversation_title",
     "prewarm_thread_message_counts",
+    "resolve_conversation_title_model",
+    "schedule_conversation_title_generation",
     "set_db_path",
+    "set_thread_title",
     "thread_exists",
+    "truncate_summary_preview",
     # Migration
     "migrate_legacy_state",
 ]

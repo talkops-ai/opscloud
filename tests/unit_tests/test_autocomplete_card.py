@@ -112,9 +112,19 @@ def test_label_width_ignores_hints_when_descriptions_would_starve():
     assert completion_label_width(rows, hints, kind="command", width=48) == len("workflow")
 
 
-def test_label_width_caps_commands_at_22():
-    rows = [("/" + "x" * 40, "desc")]
-    assert completion_label_width(rows, kind="command", width=200) == 22
+def test_label_width_caps_commands_at_48():
+    rows = [("/" + "x" * 60, "desc")]
+    assert completion_label_width(rows, kind="command", width=200) == 48
+
+
+def test_label_width_fits_plugin_skill_names_without_truncation():
+    rows = [
+        ("/chrome-devtools-plugin:memory-leak-debugging", "Diagnoses memory leaks"),
+        ("/aws-core:signing-in-to-aws", "Guides AWS sign-in"),
+    ]
+    assert completion_label_width(rows, kind="command", width=120) == len(
+        "chrome-devtools-plugin:memory-leak-debugging"
+    )
 
 
 def test_label_width_lets_files_use_free_space():
@@ -297,3 +307,132 @@ async def test_rows_are_one_line_at_narrow_width():
             rendered = option.render()
             assert isinstance(rendered, Content)
             assert cell_len(rendered.plain) <= option.size.width
+
+
+# ── @ file & directory live autocomplete ─────────────────
+
+
+class _RecordingCompletionView:
+    """Minimal CompletionView double for testing FuzzyFileController."""
+
+    def __init__(self) -> None:
+        self.suggestions: list[tuple[str, str]] = []
+        self.selected_index: int = 0
+        self.text: str = ""
+        self.cursor: int = 0
+
+    def render_completion_suggestions(
+        self, suggestions: list[tuple[str, str]], selected_index: int
+    ) -> None:
+        self.suggestions = list(suggestions)
+        self.selected_index = selected_index
+
+    def clear_completion_suggestions(self) -> None:
+        self.suggestions = []
+        self.selected_index = 0
+
+    def replace_completion_range(self, start: int, end: int, replacement: str) -> None:
+        insertion = replacement if replacement.endswith("/") else f"{replacement} "
+        self.text = f"{self.text[:start]}{insertion}{self.text[end:]}"
+        self.cursor = start + len(insertion)
+
+
+@pytest.mark.asyncio
+async def test_at_mention_picks_up_newly_created_files_and_dirs(tmp_path):
+    """Files and directories created after startup/warm_cache immediately appear on @."""
+    from opscloud.ui.widgets.autocomplete import FuzzyFileController
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "existing.py").write_text("x = 1\n")
+    (tmp_path / "README.md").write_text("# readme\n")
+
+    view = _RecordingCompletionView()
+    controller = FuzzyFileController(view, cwd=tmp_path)
+    await controller.warm_cache(force=True)
+
+    # Initial @ query shows existing directory and file
+    controller.on_text_changed("@", 1)
+    labels = [label for label, _ in view.suggestions]
+    assert "@src/" in labels
+    assert "@README.md" in labels
+    assert ("@src/", "Directory") in view.suggestions
+
+    # Now create a brand-new file and brand-new empty directory AFTER warm_cache
+    (tmp_path / "just_created.py").write_text("print('hi')\n")
+    (tmp_path / "new_folder").mkdir()
+    (tmp_path / "src" / "nested_new.ts").write_text("export {}\n")
+
+    # Querying @ or @just_created immediately finds the newly created entries
+    controller.on_text_changed("@just_created", len("@just_created"))
+    assert view.suggestions[0] == ("@just_created.py", "py")
+
+    controller.on_text_changed("@new_folder", len("@new_folder"))
+    assert view.suggestions[0] == ("@new_folder/", "Directory")
+
+    controller.on_text_changed("@nested_new", len("@nested_new"))
+    assert view.suggestions[0] == ("@src/nested_new.ts", "ts")
+
+
+def test_selecting_directory_drills_down_without_closing_popup(tmp_path):
+    """Selecting a directory (@src/) replaces without trailing space and drills into src/."""
+    from textual.events import Key
+    from opscloud.ui.widgets.autocomplete import CompletionResult, FuzzyFileController
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "opscloud").mkdir()
+    (src_dir / "main.py").write_text("pass\n")
+
+    view = _RecordingCompletionView()
+    view.text = "@"
+    view.cursor = 1
+    controller = FuzzyFileController(view, cwd=tmp_path)
+
+    controller.on_text_changed(view.text, view.cursor)
+    assert view.suggestions[0] == ("@src/", "Directory")
+
+    # Press Tab on @src/ -> should insert "@src/" (no space) and immediately show contents of src/
+    res = controller.on_key(Key("tab", "\t"), view.text, view.cursor)
+    assert res == CompletionResult.HANDLED
+    assert view.text == "@src/"
+    assert view.cursor == len("@src/")
+    assert ("@src/opscloud/", "Directory") in view.suggestions
+    assert ("@src/main.py", "py") in view.suggestions
+
+
+def test_directory_row_styling(unicode_glyphs):
+    """Top-level directory is not dimmed; nested directory dims parent path only."""
+    top_dir = format_completion_row(
+        "@src/",
+        "Directory",
+        query="",
+        label_width=16,
+        width=60,
+        selected=False,
+        kind="file",
+    )
+    assert top_dir.plain.startswith("  src/")
+    assert "src/" not in _styled(top_dir)  # not dimmed
+
+    nested_dir = format_completion_row(
+        "@src/opscloud/",
+        "Directory",
+        query="",
+        label_width=16,
+        width=60,
+        selected=False,
+        kind="file",
+    )
+    styled = _styled(nested_dir)
+    assert styled["src/"] == "dim"
+    assert "opscloud/" not in styled
+
+
+def test_email_does_not_trigger_at_completion():
+    """An @ preceded by non-whitespace (e.g. email address) does not trigger file completion."""
+    from opscloud.ui.widgets.autocomplete import FuzzyFileController
+
+    assert FuzzyFileController.can_handle("user@example.com", len("user@example.com")) is False
+    assert FuzzyFileController.can_handle("check @src/app.py", len("check @src/app.py")) is True
+    assert FuzzyFileController.can_handle("@", 1) is True
+

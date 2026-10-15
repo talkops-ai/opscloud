@@ -141,7 +141,8 @@ class SNSWebhookAdapter(WebhookProviderAdapter):
         reason = str(alarm.get("NewStateReason") or alarm.get("AlarmDescription") or "")
         region = str(alarm.get("Region") or "")
         account_id = str(alarm.get("AWSAccountId") or "")
-        trigger = alarm.get("Trigger") if isinstance(alarm.get("Trigger"), dict) else {}
+        raw_trigger = alarm.get("Trigger")
+        trigger: dict[str, Any] = raw_trigger if isinstance(raw_trigger, dict) else {}
 
         is_resolved = new_state == "OK"
         status = WebhookEventStatus.RESOLVED if is_resolved else WebhookEventStatus.FIRING
@@ -193,7 +194,8 @@ class SNSWebhookAdapter(WebhookProviderAdapter):
         account = str(event.get("account") or "")
         region = str(event.get("region") or "")
         resources = event.get("resources") or []
-        detail = event.get("detail") if isinstance(event.get("detail"), dict) else {"raw": event.get("detail")}
+        raw_detail = event.get("detail")
+        detail: dict[str, Any] = raw_detail if isinstance(raw_detail, dict) else {"raw": raw_detail}
 
         state_val = str(detail.get("state") or detail.get("status") or "").upper()
         is_resolved = state_val in {"OK", "RESOLVED", "CLOSED", "SUCCEEDED"}

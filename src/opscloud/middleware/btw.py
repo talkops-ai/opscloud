@@ -75,18 +75,18 @@ def is_ephemeral_message(message: object) -> bool:
 
 def is_btw_turn(state: Any, runtime: Any = None) -> bool:
     """Determine whether the current graph invocation is an isolated `/btw` side-question turn."""
-    if isinstance(state, Mapping) and state.get("_btw_side_question"):
+    if isinstance(state, Mapping) and state.get("_btw_side_question") is True:
         return True
     if runtime is not None:
         ctx = getattr(runtime, "context", None)
-        if isinstance(ctx, Mapping) and ctx.get("_btw_side_question"):
+        if isinstance(ctx, Mapping) and ctx.get("_btw_side_question") is True:
             return True
-        if getattr(ctx, "_btw_side_question", False):
+        if getattr(ctx, "_btw_side_question", False) is True:
             return True
         cfg = getattr(runtime, "config", None)
         if isinstance(cfg, Mapping):
             configurable = cfg.get("configurable")
-            if isinstance(configurable, Mapping) and configurable.get("_btw_side_question"):
+            if isinstance(configurable, Mapping) and configurable.get("_btw_side_question") is True:
                 return True
     if isinstance(state, Mapping):
         messages = state.get("messages")

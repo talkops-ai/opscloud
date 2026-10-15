@@ -26,11 +26,18 @@ def clean_environment(monkeypatch, tmp_path):
     monkeypatch.setattr("opscloud.config.paths.DATA_DIR", test_data_dir)
     monkeypatch.setattr("opscloud.config.paths.CONFIG_PATH", test_config_path)
     monkeypatch.setattr("opscloud.config.paths.CONFIG_FILE_PATH", test_config_path)
+    monkeypatch.setattr("opscloud.config.paths.USER_SETTINGS_PATH", test_data_dir / "settings.json")
     monkeypatch.setattr("opscloud.config.paths.STATE_DIR", test_state_dir)
     monkeypatch.setattr("opscloud.config.toml_config.CONFIG_PATH", test_config_path)
     monkeypatch.setattr("opscloud.config.toml_config.STATE_DIR", test_state_dir)
     monkeypatch.setattr("opscloud.config.toml_config._RECENT_MODELS_FILE", test_state_dir / "recent_models.json")
     monkeypatch.setattr("opscloud.config.toml_config._RECENT_PROFILES_FILE", test_state_dir / "recent_cloud_profiles.json")
+    try:
+        from opscloud.config.cli_settings import reset_cli_settings_manager_for_testing
+
+        reset_cli_settings_manager_for_testing()
+    except Exception:
+        pass
 
     # Isolate test logging to prevent test runs from polluting user's active opscloud.log
     test_log_file = test_data_dir / "test.log"
@@ -60,6 +67,12 @@ def clean_environment(monkeypatch, tmp_path):
     os.environ.clear()
     os.environ.update(old_env)
     test_temp_obj.cleanup()
+    try:
+        from opscloud.config.cli_settings import reset_cli_settings_manager_for_testing
+
+        reset_cli_settings_manager_for_testing()
+    except Exception:
+        pass
     try:
         from opscloud.config.settings import reset_settings_for_testing
 

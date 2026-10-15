@@ -97,7 +97,7 @@ def test_private_state_channel_annotations():
         assert channel in hints, f"Missing channel {channel}"
         metadata = getattr(hints[channel], "__metadata__", ())
         assert any(
-            isinstance(m, type) and issubclass(m, PrivateStateAttr) or m is PrivateStateAttr
+            m is PrivateStateAttr or isinstance(m, type(PrivateStateAttr))
             for m in metadata
         ), f"Channel {channel} is missing PrivateStateAttr marker"
 
@@ -110,15 +110,15 @@ def test_service_context_reducers():
     svc2 = make_service_record("svc-2", "auth", "k8s", "deployment", status="degraded")
     merged = _merge_managed_services(None, {"svc-1": svc1})
     assert len(merged) == 1
-    assert merged["svc-1"]["status"] == "healthy"
+    assert merged["svc-1"].get("status") == "healthy"
 
     # Update svc1 health
     update_svc1 = {"status": "updating", "health_summary": "rolling out v2"}
     merged = _merge_managed_services(merged, {"svc-1": update_svc1, "svc-2": svc2})  # type: ignore
     assert len(merged) == 2
-    assert merged["svc-1"]["status"] == "updating"
-    assert merged["svc-1"]["health_summary"] == "rolling out v2"
-    assert merged["svc-2"]["name"] == "auth"
+    assert merged["svc-1"].get("status") == "updating"
+    assert merged["svc-1"].get("health_summary") == "rolling out v2"
+    assert merged["svc-2"].get("name") == "auth"
 
     # Operations log append
     op1 = make_operation_record("op-1", "svc-1", "restart", details="rolling restart triggered")
@@ -196,10 +196,12 @@ def test_merge_cloud_context_reducer():
     }
     merged = _merge_cloud_context(initial, update)
     assert merged is not None
-    assert merged["aws"]["region"] == "us-east-1"
-    assert merged["aws"]["profile"] == "default"
-    assert merged["aws"]["account_id"] == "123456789012"
-    assert merged["is_production"] is True
+    aws_merged = merged.get("aws")
+    assert aws_merged is not None
+    assert aws_merged.get("region") == "us-east-1"
+    assert aws_merged.get("profile") == "default"
+    assert aws_merged.get("account_id") == "123456789012"
+    assert merged.get("is_production") is True
 
 
 def test_merge_cloud_resources_reducer():

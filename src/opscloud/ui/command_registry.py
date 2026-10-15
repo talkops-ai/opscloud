@@ -639,7 +639,8 @@ def _skill_command_entry(skill: dict[str, Any] | Any) -> CommandEntry:
     if isinstance(skill, dict):
         name = str(skill.get("name", ""))
         desc = str(skill.get("description", ""))
-        frontmatter = skill.get("frontmatter") if isinstance(skill.get("frontmatter"), dict) else {}
+        raw_fm = skill.get("frontmatter")
+        frontmatter: dict[str, Any] = raw_fm if isinstance(raw_fm, dict) else {}
     else:
         name = getattr(skill, "name", "")
         desc = getattr(skill, "description", "")
@@ -677,7 +678,8 @@ def build_skill_commands(skills: list[Any]) -> list[CommandEntry]:
     for skill in skills:
         if isinstance(skill, dict):
             name = str(skill.get("name", ""))
-            fm = skill.get("frontmatter") if isinstance(skill.get("frontmatter"), dict) else {}
+            raw_fm = skill.get("frontmatter")
+            fm: dict[str, Any] = raw_fm if isinstance(raw_fm, dict) else {}
         else:
             name = getattr(skill, "name", "")
             raw_fm = getattr(skill, "frontmatter", None)

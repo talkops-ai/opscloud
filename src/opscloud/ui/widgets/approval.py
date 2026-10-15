@@ -688,6 +688,59 @@ class ApprovalMenu(Container):
         if toggled:
             self._update_options()
 
+    def handle_scoped_key(self, key: str) -> bool:
+        """Dispatch a keystroke within the ApprovalMenu keybinding scope.
+
+        Returns True when the key is consumed by the active approval menu.
+        When the free-text reject reason input is active, only Escape is
+        intercepted so printable keys flow to the reason input box.
+        """
+        if self._reason_input_active:
+            if key == "escape":
+                self.action_select_reject()
+                return True
+            return False
+
+        if key in ("up", "k"):
+            self.action_move_up()
+            return True
+        if key in ("down", "j"):
+            self.action_move_down()
+            return True
+        if key == "enter":
+            self.action_select()
+            return True
+        if key == "y":
+            self.action_select_approve()
+            return True
+        if key in ("s", "a", "shift+tab"):
+            self.action_select_smart()
+            return True
+        if key in ("n", "escape"):
+            self.action_select_reject()
+            return True
+        if key == "1":
+            self.action_select_position(0)
+            return True
+        if key == "2":
+            self.action_select_position(1)
+            return True
+        if key == "3":
+            self.action_select_position(2)
+            return True
+        if key == "e":
+            self.action_toggle_expand()
+            return True
+        if key == "f":
+            self.action_toggle_full_diff()
+            return True
+        if key == "tab":
+            self.action_reject_with_reason()
+            return True
+        # Swallow stray keystrokes while the menu options are active so they
+        # never leak into the underlying chat input.
+        return True
+
     @on(events.Click, ".approval-option")
     def _on_option_clicked(self, event: events.Click) -> None:
         """Handle clicks on specific approval option widgets."""

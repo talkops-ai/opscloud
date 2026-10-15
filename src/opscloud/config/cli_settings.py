@@ -24,7 +24,7 @@ Provides persistent configuration and workspace trust management:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import contextlib
 import copy
 from dataclasses import dataclass, field
@@ -901,6 +901,13 @@ class CliSettingsManager:
                 self.settings = default_cli_settings()
                 self._base_settings = None
             self._initialized = True
+            return self.settings
+
+    def get_settings(self) -> CliSetting:
+        """Return the active in-memory CLI settings (initializing from disk if needed)."""
+        with self._lock:
+            if not self._initialized:
+                return self.init_cli_settings()
             return self.settings
 
     def read_cli_settings(self) -> CliSetting:

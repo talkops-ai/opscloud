@@ -105,6 +105,9 @@ from opscloud.ui.widgets.goal_status import (
 from opscloud.ui.widgets.infra_panel import (
     InfraStatePanel,
 )
+from opscloud.ui.widgets.input_dock import (
+    InputDock,
+)
 from opscloud.ui.widgets.install_confirm import (
     InstallProviderConfirmScreen,
 )
@@ -136,6 +139,7 @@ from opscloud.ui.widgets.messages import (
     ThinkingMessage,
     ToolCallMessage,
     ToolGroupSummary,
+    TurnSummary,
     UserMessage,
     summarize_live_tool_group,
     summarize_tool_group,

@@ -55,8 +55,12 @@ def test_normalize_mcp_arguments_preserves_required_empty_strings():
 
 
 def test_normalize_mcp_arguments_non_dict_passthrough():
-    assert normalize_mcp_arguments("not-a-dict") == "not-a-dict"
-    assert normalize_mcp_arguments([1, 2, 3]) == [1, 2, 3]
+    from typing import Any
+
+    non_dict_str: Any = "not-a-dict"
+    non_dict_list: Any = [1, 2, 3]
+    assert normalize_mcp_arguments(non_dict_str) == "not-a-dict"
+    assert normalize_mcp_arguments(non_dict_list) == [1, 2, 3]
 
 
 def test_is_mcp_call_detection():
@@ -76,6 +80,8 @@ def test_is_mcp_call_detection():
 
 
 def test_wrap_tool_call_normalizes_mcp_arguments():
+    from typing import Any
+
     mw = MCPToolMiddleware()
 
     tool_mock = MagicMock()
@@ -89,14 +95,15 @@ def test_wrap_tool_call_normalizes_mcp_arguments():
     }
     tool_mock.args_schema = args_schema_mock
 
+    none_runtime: Any = None
     request = ToolCallRequest(
         tool=tool_mock,
         tool_call={"name": "git:checkout", "args": {"repo": "opscloud", "branch": ""}, "id": "call_123"},
         state={},
-        runtime=None,
+        runtime=none_runtime,
     )
 
-    def dummy_handler(req):
+    def dummy_handler(req: Any) -> Any:
         return req.tool_call["args"]
 
     result = mw.wrap_tool_call(request, dummy_handler)
@@ -104,17 +111,20 @@ def test_wrap_tool_call_normalizes_mcp_arguments():
 
 
 def test_wrap_tool_call_handles_auth_error():
+    from typing import Any
+
     mw = MCPToolMiddleware()
 
     tool_mock = MagicMock()
+    none_runtime: Any = None
     request = ToolCallRequest(
         tool=tool_mock,
         tool_call={"name": "aws:describe_instances", "args": {}, "id": "call_auth_fail"},
         state={},
-        runtime=None,
+        runtime=none_runtime,
     )
 
-    def failing_handler(req):
+    def failing_handler(req: Any) -> Any:
         raise RuntimeError("AWS STS Error: The security token included in the request is expired")
 
     res = mw.wrap_tool_call(request, failing_handler)
@@ -126,17 +136,20 @@ def test_wrap_tool_call_handles_auth_error():
 
 
 def test_wrap_tool_call_reraises_non_auth_error():
+    from typing import Any
+
     mw = MCPToolMiddleware()
 
     tool_mock = MagicMock()
+    none_runtime: Any = None
     request = ToolCallRequest(
         tool=tool_mock,
         tool_call={"name": "aws:describe_instances", "args": {}, "id": "call_fail"},
         state={},
-        runtime=None,
+        runtime=none_runtime,
     )
 
-    def failing_handler(req):
+    def failing_handler(req: Any) -> Any:
         raise KeyError("Invalid key lookup")
 
     with pytest.raises(KeyError):
@@ -145,17 +158,20 @@ def test_wrap_tool_call_reraises_non_auth_error():
 
 @pytest.mark.asyncio
 async def test_awrap_tool_call_handles_auth_error():
+    from typing import Any
+
     mw = MCPToolMiddleware()
 
     tool_mock = MagicMock()
+    none_runtime: Any = None
     request = ToolCallRequest(
         tool=tool_mock,
         tool_call={"name": "k8s:get_pods", "args": {}, "id": "call_k8s_auth"},
         state={},
-        runtime=None,
+        runtime=none_runtime,
     )
 
-    async def async_failing_handler(req):
+    async def async_failing_handler(req: Any) -> Any:
         raise PermissionError("Access denied: unauthorized token for cluster api")
 
     res = await mw.awrap_tool_call(request, async_failing_handler)

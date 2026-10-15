@@ -11,7 +11,7 @@ from opscloud.webhooks.models import (
     WebhookEventStatus,
     WebhookSeverity,
 )
-from opscloud.webhooks.providers.base import WebhookProviderAdapter
+from opscloud.webhooks.providers.base import WebhookProviderAdapter, as_dict
 
 
 class GitHubWebhookAdapter(WebhookProviderAdapter):
@@ -34,9 +34,9 @@ class GitHubWebhookAdapter(WebhookProviderAdapter):
         delivery_id = lower_headers.get("x-github-delivery", "")
         action = str(data.get("action") or "").strip().lower()
 
-        repo_obj = data.get("repository") if isinstance(data.get("repository"), dict) else {}
+        repo_obj = as_dict(data.get("repository"))
         repo_name = str(repo_obj.get("full_name") or repo_obj.get("name") or "unknown/repo")
-        sender_obj = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+        sender_obj = as_dict(data.get("sender"))
         sender = str(sender_obj.get("login") or "github")
 
         # 1. Ping handshake
@@ -59,11 +59,7 @@ class GitHubWebhookAdapter(WebhookProviderAdapter):
 
         # 2. GitHub Actions workflow_run or check_run
         if gh_event in {"workflow_run", "check_run", "check_suite"}:
-            run_obj = (
-                data.get(gh_event)
-                if isinstance(data.get(gh_event), dict)
-                else {}
-            )
+            run_obj = as_dict(data.get(gh_event))
             run_id = str(run_obj.get("id") or "run")
             name = str(run_obj.get("name") or run_obj.get("head_branch") or gh_event)
             conclusion = str(run_obj.get("conclusion") or "").lower()
@@ -108,8 +104,8 @@ class GitHubWebhookAdapter(WebhookProviderAdapter):
 
         # 3. Deployment status failure
         if gh_event == "deployment_status":
-            dep_status = data.get("deployment_status") if isinstance(data.get("deployment_status"), dict) else {}
-            deployment = data.get("deployment") if isinstance(data.get("deployment"), dict) else {}
+            dep_status = as_dict(data.get("deployment_status"))
+            deployment = as_dict(data.get("deployment"))
             state = str(dep_status.get("state") or "").lower()
             env_name = str(dep_status.get("environment") or deployment.get("environment") or "production")
             desc = str(dep_status.get("description") or "")
@@ -142,7 +138,7 @@ class GitHubWebhookAdapter(WebhookProviderAdapter):
         if isinstance(issue_obj, dict) and issue_obj:
             issue_num = issue_obj.get("number") or "0"
             title = str(issue_obj.get("title") or f"Issue #{issue_num}")
-            comment_obj = data.get("comment") if isinstance(data.get("comment"), dict) else {}
+            comment_obj = as_dict(data.get("comment"))
             body_text = str(comment_obj.get("body") or issue_obj.get("body") or "")
             html_url = comment_obj.get("html_url") or issue_obj.get("html_url")
 

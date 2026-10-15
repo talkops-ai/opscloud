@@ -308,3 +308,85 @@ async def test_headless_run_emits_lifecycle_logs(tmp_path, monkeypatch):
     assert "Headless run completed in" in content
 
 
+def test_configure_logging_clears_last_resort_when_sinks_disabled(tmp_path):
+    """Disabling both file and console logging replaces logging.lastResort with NullHandler."""
+    from opscloud.utils.logger import configure_logging
+
+    prev_file = tmp_path / "previous.log"
+    configure_logging(
+        log_dir=tmp_path,
+        log_file=prev_file,
+        level="INFO",
+        log_to_file=True,
+        log_to_console=False,
+    )
+    assert prev_file.exists()
+
+    # Now disable both sinks (as conftest.py does)
+    disabled_file = tmp_path / "disabled.log"
+    configure_logging(
+        log_dir=tmp_path,
+        log_file=disabled_file,
+        level="INFO",
+        log_to_file=False,
+        log_to_console=False,
+    )
+    assert isinstance(logging.lastResort, logging.NullHandler)
+
+    # Emitting an error on asyncio logger must not reopen or append to prev_file
+    before_size = prev_file.stat().st_size
+    logging.getLogger("asyncio").error("Task was destroyed but it is pending!")
+    assert prev_file.stat().st_size == before_size
+
+
+@pytest.mark.asyncio
+async def test_markdown_fence_does_not_leak_pending_scrollbar_tasks():
+    """MarkdownFence show/hide/teardown must not spawn or leak pending ScrollBar tasks."""
+    import gc
+    from textual.app import App, ComposeResult
+    from textual.widgets._markdown import MarkdownFence
+    from opscloud.ui.theme import get_css_variable_defaults
+    from opscloud.ui.widgets.messages import AssistantMessage, MessageList
+
+    asyncio_records: list[logging.LogRecord] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            asyncio_records.append(record)
+
+    asyncio_logger = logging.getLogger("asyncio")
+    capture = _CaptureHandler()
+    asyncio_logger.addHandler(capture)
+
+    class _FenceTestApp(App[None]):
+        def get_css_variables(self) -> dict[str, str]:
+            return {**super().get_css_variables(), **get_css_variable_defaults()}
+
+        def compose(self) -> ComposeResult:
+            yield MessageList(id="ml")
+
+    try:
+        app = _FenceTestApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            ml = app.query_one("#ml", MessageList)
+            ml._mount_child(AssistantMessage("```bash\necho hello\n```"))
+            await pilot.pause(0.2)
+
+            fences = list(app.query(MarkdownFence))
+            assert fences
+            for fence in fences:
+                assert fence._horizontal_scrollbar is None
+
+            ml.clear()
+            await pilot.pause()
+            gc.collect()
+        gc.collect()
+
+        pending_errors = [
+            r.getMessage()
+            for r in asyncio_records
+            if "Task was destroyed but it is pending" in r.getMessage()
+        ]
+        assert pending_errors == []
+    finally:
+        asyncio_logger.removeHandler(capture)

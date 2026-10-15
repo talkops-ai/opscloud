@@ -34,12 +34,14 @@ def run_threads_command(output_format: OutputFormat = "text") -> int:
     table.add_column("Initial Prompt", style="white")
     table.add_column("Updated", style="dim", no_wrap=True)
 
+    from opscloud.state.conversation_title import get_thread_display_label
+
     for t in threads:
         tid = t.get("thread_id", "")
         short_id = tid[:8] if len(tid) > 8 else tid
         cloud = t.get("cloud_badge") or t.get("cloud_provider") or "-"
         msg_count = str(t.get("message_count", 0))
-        prompt = t.get("initial_prompt") or "(No initial prompt)"
+        prompt = get_thread_display_label(t, fallback="(No initial prompt)")
         if len(prompt) > 50:
             prompt = prompt[:47] + "..."
         updated = format_relative_timestamp(t.get("updated_at")) or format_timestamp(t.get("updated_at"))

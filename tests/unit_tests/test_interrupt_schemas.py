@@ -101,7 +101,7 @@ class TestHitlSchemas:
         rev: ReviewConfig = {"action_name": "aws_cli", "allowed_decisions": ["approve", "reject", "edit"]}
         hitl_req: HITLRequest = {"action_requests": [act], "review_configs": [rev]}
         assert len(hitl_req["action_requests"]) == 1
-        assert hitl_req["action_requests"][0]["name"] == "aws_cli"
+        assert hitl_req["action_requests"][0].get("name") == "aws_cli"
 
     def test_hitl_resume_payload_from_raw_approve(self):
         payload = HitlResumePayload.from_raw("approve", count=2)
@@ -243,7 +243,7 @@ class TestAskUserProtocol:
         assert "Q: Target VPC?\nA: vpc-12345" in transcript
         assert 'Q: Select target subnets\nA: ["subnet-a", "subnet-b"]' in transcript
 
-        display = render_ask_user_transcript_for_display(questions, transcript)
+        display = render_ask_user_transcript_for_display([*questions], transcript)
         assert display is not None
         assert "Q: Select target subnets\nA: subnet-a\nsubnet-b" in display
 

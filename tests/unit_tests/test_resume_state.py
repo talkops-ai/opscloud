@@ -28,6 +28,8 @@ def test_extract_context_tokens():
 
 
 def test_resume_state_middleware_after_model():
+    from typing import Any
+
     mw = ResumeStateMiddleware()
     runtime = MagicMock()
 
@@ -36,7 +38,7 @@ def test_resume_state_middleware_after_model():
         content="Hi there",
         usage_metadata={"input_tokens": 200, "output_tokens": 50, "total_tokens": 250},
     )
-    state = {"messages": [msg1, msg2]}
+    state: Any = {"messages": [msg1, msg2]}
 
     update = mw.after_model(state, runtime)
     assert update is not None
@@ -44,15 +46,21 @@ def test_resume_state_middleware_after_model():
 
 
 def test_resume_state_middleware_empty_messages():
+    from typing import Any
+
     mw = ResumeStateMiddleware()
     runtime = MagicMock()
 
-    assert mw.after_model({}, runtime) is None
-    assert mw.after_model({"messages": []}, runtime) is None
+    empty_state: Any = {}
+    empty_msgs_state: Any = {"messages": []}
+    assert mw.after_model(empty_state, runtime) is None
+    assert mw.after_model(empty_msgs_state, runtime) is None
 
 
 @pytest.mark.asyncio
 async def test_resume_state_middleware_aafter_model():
+    from typing import Any
+
     mw = ResumeStateMiddleware()
     runtime = MagicMock()
 
@@ -60,7 +68,7 @@ async def test_resume_state_middleware_aafter_model():
         content="Async message",
         usage_metadata={"input_tokens": 400, "output_tokens": 100, "total_tokens": 500},
     )
-    state = {"messages": [msg]}
+    state: Any = {"messages": [msg]}
 
     update = await mw.aafter_model(state, runtime)
     assert update is not None

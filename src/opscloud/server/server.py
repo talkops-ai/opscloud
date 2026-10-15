@@ -660,6 +660,8 @@ class ServerProcess:
                     group_survived = True
                 except ProcessLookupError:
                     group_survived = False
+                except PermissionError:
+                    group_survived = True
                 except Exception:
                     pass
 
@@ -678,6 +680,10 @@ class ServerProcess:
                             time.sleep(0.05)
                         except ProcessLookupError:
                             break
+                        except PermissionError:
+                            # On macOS/BSD, killpg(pgid, 0) can transiently raise EPERM while
+                            # launchd reaps a reparented zombie descendant; keep polling.
+                            time.sleep(0.05)
                         except Exception:
                             break
 

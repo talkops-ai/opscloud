@@ -104,6 +104,8 @@ def test_build_aws_context(monkeypatch):
 
 
 def test_local_context_middleware_before_agent_sync():
+    from typing import Any
+
     backend_mock = MagicMock()
     exec_res = MagicMock()
     exec_res.output = "## Local Context\n**Current Directory**: `/workspace`"
@@ -113,18 +115,19 @@ def test_local_context_middleware_before_agent_sync():
     runtime_mock = MagicMock()
 
     # Initial run executes script and caches result
-    update = mw.before_agent({}, runtime_mock)
+    empty_state: Any = {}
+    update = mw.before_agent(empty_state, runtime_mock)
     assert update is not None
     assert update["_local_context"] == "## Local Context\n**Current Directory**: `/workspace`"
     assert backend_mock.execute.call_count == 1
 
     # Second run with cached state doesn't execute again
-    state_cached = {"_local_context": update["_local_context"]}
+    state_cached: Any = {"_local_context": update["_local_context"]}
     assert mw.before_agent(state_cached, runtime_mock) is None
     assert backend_mock.execute.call_count == 1
 
     # Summarization event with new cutoff triggers refresh
-    state_summarized = {
+    state_summarized: Any = {
         "_local_context": "old",
         "_summarization_event": {"cutoff_index": 10},
         "_local_context_refreshed_at_cutoff": 5,
@@ -137,6 +140,8 @@ def test_local_context_middleware_before_agent_sync():
 
 @pytest.mark.asyncio
 async def test_local_context_middleware_abefore_agent():
+    from typing import Any
+
     async_backend_mock = MagicMock()
     exec_res = MagicMock()
     exec_res.output = "## Local Context\n**Git**: Current branch `main`"
@@ -145,26 +150,30 @@ async def test_local_context_middleware_abefore_agent():
     mw = LocalContextMiddleware(backend=async_backend_mock)
     runtime_mock = MagicMock()
 
-    update = await mw.abefore_agent({}, runtime_mock)
+    empty_state: Any = {}
+    update = await mw.abefore_agent(empty_state, runtime_mock)
     assert update is not None
     assert "Current branch `main`" in update["_local_context"]
     assert async_backend_mock.aexecute.call_count == 1
 
 
 def test_local_context_middleware_wrap_model_call():
+    from typing import Any
+
     mw = LocalContextMiddleware(tracing_project="test-proj")
 
+    state_dict: Any = {"_local_context": "## Local Context\n**Git**: Current branch `main`"}
     request = ModelRequest(
         model=MagicMock(),
         system_message=SystemMessage(content="You are a Cloud DevOps assistant."),
         messages=[],
-        state={"_local_context": "## Local Context\n**Git**: Current branch `main`"},
+        state=state_dict,
         runtime=None,
     )
 
     passed_request = None
 
-    def handler(req):
+    def handler(req: Any) -> Any:
         nonlocal passed_request
         passed_request = req
         return "ok"

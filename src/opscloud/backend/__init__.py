@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opscloud.backend.registry import (
     BackendRegistry,
@@ -10,6 +10,18 @@ from opscloud.backend.registry import (
     get_backend_registry,
     register_backend,
 )
+
+if TYPE_CHECKING:
+    from opscloud.backend.composite import CompositeBackend, OpsCloudCompositeBackend
+    from opscloud.backend.local import LocalShellBackend
+    from opscloud.backend.sandbox_config import SandboxConfig
+    from opscloud.backend.sandbox_factory import (
+        cleanup_all_sandboxes,
+        cleanup_sandbox,
+        clear_sandbox_cache,
+        create_sandbox_backend,
+        get_sandbox_backend,
+    )
 
 __all__ = [
     "BackendRegistry",

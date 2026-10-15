@@ -167,11 +167,11 @@ class RemoteAgent:
 
     async def astream(
         self,
-        input: dict | Any,
+        input: dict[str, Any] | Any,
+        config: Mapping[str, Any] | None = None,
         *,
-        stream_mode: list[str] | None = None,
+        stream_mode: list[str] | str | None = None,
         subgraphs: bool = False,
-        config: dict[str, Any] | None = None,
         context: Any | None = None,
         durability: str | None = None,
     ) -> AsyncIterator[tuple[tuple[str, ...], str, Any]]:
@@ -468,7 +468,7 @@ class RemoteAgent:
             )
             raise
 
-    async def aensure_thread(self, config: dict[str, Any]) -> None:
+    async def aensure_thread(self, config: Mapping[str, Any] | str | None = None) -> str | None:
         """Ensure the remote thread record exists before reading/mutating state.
 
         After a server restart, a thread may still have checkpointed state on
@@ -477,10 +477,13 @@ class RemoteAgent:
         and ``aupdate_state`` calls work correctly.
         """
         graph = self._get_graph()
-        prepared = _prepare_config(config)
+        if isinstance(config, str) or config is None:
+            prepared = _prepare_config({"configurable": {"thread_id": normalize_thread_id(config)}})
+        else:
+            prepared = _prepare_config(dict(config))
         thread_id = prepared["configurable"].get("thread_id")
         if not thread_id:
-            return
+            return None
 
         metadata = prepared.get("metadata")
         thread_metadata = metadata if isinstance(metadata, dict) else None
@@ -493,6 +496,7 @@ class RemoteAgent:
                 metadata=thread_metadata,
                 graph_id=self._graph_name,
             )
+            return str(thread_id)
         except Exception:
             logger.warning(
                 "Failed to ensure thread %s exists on remote server",
@@ -501,7 +505,7 @@ class RemoteAgent:
             )
             raise
 
-    async def create_thread(self) -> dict[str, Any]:
+    async def create_thread(self) -> dict[str, Any] | str:
         """Create thread using SDK client."""
         client = self._get_graph()._validate_client()
         return await client.threads.create()
@@ -803,9 +807,13 @@ class InProcessAgent(RemoteAgent):
         self._active_tasks.clear()
         self._active_run_id = None
 
-    async def aensure_thread(self, thread_id: str | None = None) -> str:
+    async def aensure_thread(self, config: Mapping[str, Any] | str | None = None) -> str:
         """Ensure a valid UUID thread ID (in-process checkpointer creates threads on write)."""
-        return normalize_thread_id(thread_id)
+        if isinstance(config, Mapping):
+            configurable = config.get("configurable")
+            tid = configurable.get("thread_id") if isinstance(configurable, Mapping) else None
+            return normalize_thread_id(str(tid) if tid else None)
+        return normalize_thread_id(config)
 
     async def create_thread(self) -> str:
         """Generate a fresh UUID thread ID."""

@@ -139,6 +139,7 @@ async def test_agents_handler_lists_plugin_agents() -> None:
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Available Plugin Agents" in result.message
     assert "test-agent" in result.message
 
@@ -160,6 +161,7 @@ async def test_agents_handler_activates_session() -> None:
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Activated agent persona" in result.message
     state = get_agent_session_state(mock_app)
     assert state.is_active is True

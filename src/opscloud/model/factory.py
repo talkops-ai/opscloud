@@ -613,6 +613,11 @@ def create_model(
             kwargs.pop("thinking_level", None)
             kwargs.pop("thinking_budget", None)
             kwargs.pop("include_thoughts", None)
+        with contextlib.suppress(Exception):
+            from google.genai import models as _genai_models
+
+            _genai_models.Models._logged_afc_warning = True
+            _genai_models.AsyncModels._logged_afc_warning = True
 
     config = ModelConfig.load()
     class_path = config.get_class_path(provider) if provider else None

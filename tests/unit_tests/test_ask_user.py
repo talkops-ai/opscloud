@@ -1,5 +1,6 @@
 """Unit tests for AskUserMiddleware, question validation, answer parsing, and cancellation handling."""
 
+from typing import Any, cast
 from unittest.mock import MagicMock
 import pytest
 from langchain.agents.middleware.types import ModelRequest
@@ -12,11 +13,11 @@ from opscloud.middleware.ask_user import (
     _parse_answers,
     _validate_questions,
 )
-from opscloud.schema.interrupts import Question
+from opscloud.schema.interrupts import Choice, Question
 
 
 def test_validate_questions_valid():
-    questions: list[Question] = [
+    questions: Any = [
         {"question": "What is the cluster name?", "type": "text"},
         {
             "question": "Which environment?",
@@ -68,6 +69,7 @@ def test_parse_answers_success():
     cmd = _parse_answers(response, questions, "call_999")
 
     assert isinstance(cmd, Command)
+    assert cmd.update is not None
     messages = cmd.update.get("messages", [])
     assert len(messages) == 1
     assert isinstance(messages[0], ToolMessage)
@@ -83,6 +85,7 @@ def test_parse_answers_cancelled():
     response = {"status": "cancelled"}
     cmd = _parse_answers(response, questions, "call_cancel")
 
+    assert cmd.update is not None
     messages = cmd.update.get("messages", [])
     assert len(messages) == 1
     assert "(cancelled by user)" in messages[0].content
@@ -95,6 +98,7 @@ def test_parse_answers_error():
     response = {"status": "error", "error": "User prompt timed out"}
     cmd = _parse_answers(response, questions, "call_err")
 
+    assert cmd.update is not None
     messages = cmd.update.get("messages", [])
     assert "(error: User prompt timed out)" in messages[0].content
 
@@ -108,6 +112,7 @@ def test_parse_answers_padded():
     response = {"answers": ["Ans1"]}
     cmd = _parse_answers(response, questions, "call_pad")
 
+    assert cmd.update is not None
     messages = cmd.update.get("messages", [])
     assert "Ans1" in messages[0].content
     assert "(no answer)" in messages[0].content
@@ -122,13 +127,13 @@ def test_ask_user_middleware_tools_and_wrapping():
         model=MagicMock(),
         system_message=SystemMessage(content="Base system prompt."),
         messages=[],
-        state={},
+        state=cast("Any", {}),
         runtime=None,
     )
 
     passed_request = None
 
-    def handler(req):
+    def handler(req: Any) -> Any:
         nonlocal passed_request
         passed_request = req
         return "response"
@@ -148,13 +153,13 @@ async def test_ask_user_middleware_awrap_model_call():
         model=MagicMock(),
         system_message=SystemMessage(content="Async base prompt."),
         messages=[],
-        state={},
+        state=cast("Any", {}),
         runtime=None,
     )
 
-    async def async_handler(req):
+    async def async_handler(req: Any) -> Any:
         return req.system_message.content
 
-    content = await mw.awrap_model_call(request, async_handler)
+    content = cast("Any", await mw.awrap_model_call(request, async_handler))
     assert "Async base prompt." in content
     assert ASK_USER_SYSTEM_PROMPT in content

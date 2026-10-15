@@ -127,9 +127,9 @@ async def test_plugin_manager_search_input_updates_view() -> None:
             # Verify only 1 plugin is now shown
             # OptionList should only have 1 plugin option (id starts with detail:aws-platform-engineer)
             plugin_option_ids = [
-                options.get_option_at_index(i).id
+                opt_id
                 for i in range(options.option_count)
-                if options.get_option_at_index(i).id and not options.get_option_at_index(i).id.startswith("spacer:")
+                if (opt_id := options.get_option_at_index(i).id) and not opt_id.startswith("spacer:")
             ]
             assert plugin_option_ids == ["detail:aws-platform-engineer@talkops-devops-plugins"]
 
@@ -140,9 +140,9 @@ async def test_plugin_manager_search_input_updates_view() -> None:
 
             # All 3 plugins return
             plugin_option_ids_all = [
-                options.get_option_at_index(i).id
+                opt_id
                 for i in range(options.option_count)
-                if options.get_option_at_index(i).id and not options.get_option_at_index(i).id.startswith("spacer:")
+                if (opt_id := options.get_option_at_index(i).id) and not opt_id.startswith("spacer:")
             ]
             assert len(plugin_option_ids_all) == 3
 

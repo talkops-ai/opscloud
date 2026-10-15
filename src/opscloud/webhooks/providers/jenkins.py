@@ -12,7 +12,7 @@ from opscloud.webhooks.models import (
     WebhookEventStatus,
     WebhookSeverity,
 )
-from opscloud.webhooks.providers.base import WebhookProviderAdapter
+from opscloud.webhooks.providers.base import WebhookProviderAdapter, as_dict
 
 _ACTIONABLE_BUILD_STATUSES = frozenset(
     {"FAILURE", "FAILED", "UNSTABLE", "ABORTED", "REGRESSION", "ERROR"}
@@ -34,7 +34,7 @@ class JenkinsWebhookAdapter(WebhookProviderAdapter):
     ) -> NormalizedWebhookEvent:
         data = self.decode_json_body(raw_body)
 
-        build_obj: dict[str, Any] = data.get("build") if isinstance(data.get("build"), dict) else data
+        build_obj = as_dict(data.get("build"), fallback=data)
         job_name = str(
             data.get("name")
             or data.get("job_name")
@@ -57,7 +57,7 @@ class JenkinsWebhookAdapter(WebhookProviderAdapter):
             or data.get("url")
         )
 
-        scm_info = build_obj.get("scm") if isinstance(build_obj.get("scm"), dict) else {}
+        scm_info = as_dict(build_obj.get("scm"))
         branch = scm_info.get("branch") or data.get("branch") or data.get("git_branch")
         commit = scm_info.get("commit") or data.get("commit") or data.get("git_commit")
         log_snippet = build_obj.get("log") or data.get("log") or data.get("error") or data.get("message")

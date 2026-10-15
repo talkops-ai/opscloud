@@ -168,6 +168,7 @@ async def test_agent_list_text() -> None:
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "**Available Plugin Agents**" in result.message
     assert "aws-compute" in result.message
     assert "k8s-operator" in result.message
@@ -184,6 +185,7 @@ async def test_agent_status_when_inactive() -> None:
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "No active plugin agent session" in result.message
 
 
@@ -199,6 +201,7 @@ async def test_agent_activation_and_status() -> None:
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Activated agent persona **aws-compute**" in result.message
     assert mock_app._run_agent_session_request.called
     req = mock_app._run_agent_session_request.call_args[0][0]
@@ -208,6 +211,7 @@ async def test_agent_activation_and_status() -> None:
     # Status now shows active agent
     status_ctx = CommandContext(app=mock_app, raw_command="/agent status", args="status")
     status_result = await handler.execute(status_ctx)
+    assert status_result.message is not None
     assert "**Active Agent Persona:** `aws-compute`" in status_result.message
 
 
@@ -227,6 +231,7 @@ async def test_agent_activation_with_initial_prompt() -> None:
     result = await handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Activated agent persona **aws-compute**" in result.message
     assert "check running instances" in result.message
     req = mock_app._run_agent_session_request.call_args[0][0]
@@ -246,6 +251,7 @@ async def test_agent_clear_and_detach() -> None:
     # Detach
     detach_res = await handler.execute(CommandContext(app=mock_app, raw_command="/agent detach", args="detach"))
     assert detach_res.success is True
+    assert detach_res.message is not None
     assert "Detached from `aws-compute`" in detach_res.message
     state = get_agent_session_state(mock_app)
     assert state.is_active is False
@@ -253,12 +259,14 @@ async def test_agent_clear_and_detach() -> None:
     # Attach
     attach_res = await handler.execute(CommandContext(app=mock_app, raw_command="/agent attach", args="attach"))
     assert attach_res.success is True
+    assert attach_res.message is not None
     assert "Attached to `aws-compute`" in attach_res.message
     assert state.is_active is True
 
     # Clear
     clear_res = await handler.execute(CommandContext(app=mock_app, raw_command="/agent clear", args="clear"))
     assert clear_res.success is True
+    assert clear_res.message is not None
     assert "Detached from agent **aws-compute**" in clear_res.message
     assert state.agent_id is None
     clear_req = mock_app._run_agent_session_request.call_args[0][0]
@@ -285,6 +293,7 @@ async def test_agent_invoke_handler_prefix_syntax() -> None:
     result = await invoke_handler.execute(ctx)
 
     assert result.success is True
+    assert result.message is not None
     assert "Activated agent persona **k8s-operator**" in result.message
     req = mock_app._run_agent_session_request.call_args[0][0]
     assert req["agent_name"] == "k8s-operator@talkops-devops-plugins"
@@ -435,7 +444,7 @@ def test_is_agent_session_turn() -> None:
 
 def test_is_agent_session_namespace() -> None:
     assert _is_agent_session_namespace((f"{AGENT_SESSION_NODE_PREFIX}aws-compute",))
-    assert not _is_agent_session_namespace(("WorkflowMiddleware.workflow_agent",))
+    assert not _is_agent_session_namespace(("GoalCriteriaMiddleware.goal_criteria",))
     assert not _is_agent_session_namespace(())
     assert not _is_agent_session_namespace(("deeper", "node"))
 
@@ -483,3 +492,85 @@ def test_agent_autocomplete_prioritization_and_space() -> None:
     ctrl._selected_index = 0
     ctrl._apply_selected_completion(10)
     view.replace_completion_range.assert_called_with(0, 10, "/agent:aws-compute")
+
+
+def test_agent_session_middleware_excludes_heavy_channels_and_resets_on_agent_switch() -> None:
+    fake_reply = {"messages": [HumanMessage(content="new prompt"), AIMessage(content="new reply")]}
+    subagent_b = FakeSubAgent(fake_reply)
+    mw = AgentSessionMiddleware({"agent-a": FakeSubAgent({}), "agent-b": subagent_b})
+
+    state = {
+        "messages": [HumanMessage(content="main prompt")],
+        "_active_agent_id": "agent-a",
+        "_agent_session_messages": [HumanMessage(content="old a1"), AIMessage(content="old a2")],
+        "skills_metadata": [{"name": "skill-1", "content": "x" * 1000}],
+        "_goal_objective": "some goal",
+        "agent_session_request": {"kind": "continue", "agent_name": "agent-b", "message": "new prompt"},
+    }
+    update = mw.before_agent(cast(Any, state), _runtime())
+    assert update is not None
+    assert update["_active_agent_id"] == "agent-b"
+    assert len(subagent_b.calls) == 1
+    sent_state = subagent_b.calls[0]
+    # Heavy channels must not leak into subagent state
+    assert "skills_metadata" not in sent_state
+    assert "_goal_objective" not in sent_state
+    # Because _active_agent_id ('agent-a') != 'agent-b', prior agent's messages must be discarded
+    assert [m.content for m in sent_state["messages"]] == ["new prompt"]
+    assert update["_agent_session_messages"]["reset"] is True
+
+    # Passthrough turn when _active_agent_id is None wipes orphaned _agent_session_messages
+    orphan_cleanup = mw.before_agent(
+        cast(
+            Any,
+            {
+                "messages": [],
+                "_active_agent_id": None,
+                "_agent_session_messages": [HumanMessage(content="orphaned")],
+            },
+        ),
+        _runtime(),
+    )
+    assert orphan_cleanup == {"_agent_session_messages": {"reset": True}}
+
+
+@pytest.mark.asyncio
+async def test_close_subagent_mcp_sessions_on_clear_and_agent_switch() -> None:
+    from opscloud.mcp.session_manager import MCPSessionManager
+    from opscloud.plugins.adapters.mcp import scoped_subagent_mcp_server_name
+
+    finops_id = "aws-finops-agent@talkops-devops-plugins"
+    sec_id = "aws-cloud-security-engineer@talkops-devops-plugins"
+    finops_srv = scoped_subagent_mcp_server_name(finops_id, "billing")
+    sec_srv = scoped_subagent_mcp_server_name(sec_id, "iam")
+    root_srv = "aws-mcp"
+
+    mgr = MCPSessionManager({})
+    closed: list[str] = []
+
+    class _DummyEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def aclose(self) -> None:
+            closed.append(self.name)
+
+    mgr._sessions[finops_srv] = cast(Any, _DummyEntry(finops_srv))
+    mgr._sessions[sec_srv] = cast(Any, _DummyEntry(sec_srv))
+    mgr._sessions[root_srv] = cast(Any, _DummyEntry(root_srv))
+
+    # 1. Agent-specific close matches hashed plugin subagent server name
+    count = await mgr.close_subagent_sessions(finops_id)
+    assert count == 1
+    assert closed == [finops_srv]
+    assert finops_srv not in mgr._sessions
+    assert sec_srv in mgr._sessions
+    assert root_srv in mgr._sessions
+
+    # 2. Unscoped close (used on /agent clear) closes all remaining subagent__* sessions
+    count_all = await mgr.close_subagent_sessions(None)
+    assert count_all == 1
+    assert sec_srv not in mgr._sessions
+    assert root_srv in mgr._sessions
+
+

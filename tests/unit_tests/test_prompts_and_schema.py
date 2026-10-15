@@ -197,7 +197,9 @@ def test_built_in_skills_exist_and_valid():
     assert built_in_dir.is_dir()
 
     expected_skills = [
+        "commit",
         "remember",
+        "simplify",
         "skill-creator",
     ]
 
@@ -241,6 +243,14 @@ def test_get_base_system_prompt_dual_engine_and_tool_discipline():
     # Validate Cloud Foundation & Plugin Marketplace Ecosystem
     assert "Native Cloud Foundation (AWS)" in prompt
     assert "Extensible Plugin Marketplace Ecosystem" in prompt
+
+    # Validate Antigravity CLI Coding Guidelines & Documentation Integrity
+    assert "No Snippet Tunnel Vision" in prompt
+    assert "API Contract Preservation" in prompt
+    assert "No Superficial Symptom Patches" in prompt
+    assert "Documentation Integrity & Comment Hygiene" in prompt
+    assert "Traceback & Log Justification Required" in prompt
+    assert "Slash Commands" in prompt
 
     # Validate Tool-Specific Output Discipline
     assert "Tool Usage & Tool-Specific Output Discipline" in prompt

@@ -115,7 +115,7 @@ packages = ["src/opscloud"]
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src"]
+extraPaths = ["src", "."]
 venvPath = "."
 venv = ".venv"
 

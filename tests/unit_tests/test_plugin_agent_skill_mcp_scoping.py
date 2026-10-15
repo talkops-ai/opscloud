@@ -171,6 +171,7 @@ def test_prepare_subagents_mcp_uses_one_preload_batch() -> None:
         prepared = prepare_subagents_mcp(subagents)
 
     preload.assert_awaited_once()
+    assert preload.await_args is not None
     batched = preload.await_args.args[0]
     assert set(batched) == {
         "subagent__finops__aws",

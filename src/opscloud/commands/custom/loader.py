@@ -4,6 +4,7 @@ usage priority scoring, and content-hash hot-reload.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import fnmatch
 import hashlib
 import json
@@ -213,9 +214,10 @@ def _discover_plugin_command_defs(
     seen_identities: set[str],
 ) -> list[CustomCommandDefinition]:
     """Scan enabled plugins' `commands/` directories for custom commands."""
+    from opscloud.config.paths import PLUGIN_DATA_DIR
+
     results: list[CustomCommandDefinition] = []
     try:
-        from opscloud.config.paths import PLUGIN_DATA_DIR
         from opscloud.plugins.discovery import discover_plugins
 
         plugin_res = discover_plugins(project_root=project_dir)
@@ -416,7 +418,7 @@ def _path_matches_glob(rel_path: str, pattern: str) -> bool:
 
 
 def activate_conditional_commands_for_paths(
-    file_paths: list[str | Path],
+    file_paths: Sequence[str | Path],
     *,
     cwd: Path | None = None,
     project_root: Path | None = None,

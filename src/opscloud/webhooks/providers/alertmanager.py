@@ -11,7 +11,7 @@ from opscloud.webhooks.models import (
     WebhookEventStatus,
     WebhookSeverity,
 )
-from opscloud.webhooks.providers.base import WebhookParseError, WebhookProviderAdapter
+from opscloud.webhooks.providers.base import WebhookParseError, WebhookProviderAdapter, as_dict
 
 
 class AlertmanagerWebhookAdapter(WebhookProviderAdapter):
@@ -37,22 +37,14 @@ class AlertmanagerWebhookAdapter(WebhookProviderAdapter):
         status_raw = str(data.get("status") or "firing").strip().lower()
         is_resolved = status_raw == "resolved"
 
-        common_labels: dict[str, Any] = (
-            data.get("commonLabels") if isinstance(data.get("commonLabels"), dict) else {}
-        )
-        common_annotations: dict[str, Any] = (
-            data.get("commonAnnotations") if isinstance(data.get("commonAnnotations"), dict) else {}
-        )
-        group_labels: dict[str, Any] = (
-            data.get("groupLabels") if isinstance(data.get("groupLabels"), dict) else {}
-        )
+        common_labels = as_dict(data.get("commonLabels"))
+        common_annotations = as_dict(data.get("commonAnnotations"))
+        group_labels = as_dict(data.get("groupLabels"))
 
         # Fall back to first alert's labels/annotations if commonLabels is empty
         first_alert = alerts_list[0] if alerts_list else {}
-        first_labels = first_alert.get("labels") if isinstance(first_alert.get("labels"), dict) else {}
-        first_annotations = (
-            first_alert.get("annotations") if isinstance(first_alert.get("annotations"), dict) else {}
-        )
+        first_labels = as_dict(first_alert.get("labels"))
+        first_annotations = as_dict(first_alert.get("annotations"))
 
         merged_labels = {**first_labels, **common_labels}
         merged_annotations = {**first_annotations, **common_annotations}
@@ -93,8 +85,8 @@ class AlertmanagerWebhookAdapter(WebhookProviderAdapter):
 
         for idx, alert in enumerate(alerts_list[:10], start=1):
             a_status = str(alert.get("status") or status_raw)
-            a_labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
-            a_ann = alert.get("annotations") if isinstance(alert.get("annotations"), dict) else {}
+            a_labels = as_dict(alert.get("labels"))
+            a_ann = as_dict(alert.get("annotations"))
             a_desc = a_ann.get("description") or a_ann.get("summary") or ""
             target = (
                 a_labels.get("pod")

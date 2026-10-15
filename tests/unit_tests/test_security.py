@@ -1,7 +1,8 @@
 """Unit tests for OpsCloud security module: unicode security, shell safety, and approval modes."""
 
-import pytest
+from typing import Any
 from unittest.mock import MagicMock
+import pytest
 from opscloud.approval_mode import ApprovalMode
 from opscloud.security.unicode_security import (
     check_url_safety,
@@ -86,8 +87,11 @@ def test_approval_mode_parsing():
     assert ApprovalMode.from_str("jev") == ApprovalMode.SMART
     assert ApprovalMode.from_str("s") == ApprovalMode.SMART
     assert ApprovalMode.from_str("always") == ApprovalMode.ALWAYS
-    # Deprecated/removed modes fail-closed to MANUAL
-    assert ApprovalMode.from_str("yolo") == ApprovalMode.MANUAL
+    assert ApprovalMode.from_str("yolo") == ApprovalMode.YOLO
+    # Interactive flows pass allow_yolo=False so yolo fails closed to MANUAL
+    assert ApprovalMode.from_str("yolo", allow_yolo=False) == ApprovalMode.MANUAL
+    # Removed/unrecognized modes fail-closed to MANUAL
+    assert ApprovalMode.from_str("autonomous") == ApprovalMode.MANUAL
 
 
 def test_next_approval_mode_cycle():
@@ -349,7 +353,7 @@ async def test_auto_mode_hitl_aafter_model():
     runtime.context = {"approval_mode": "auto"}
     runtime.store = None
 
-    state = {
+    state: Any = {
         "messages": [
             HumanMessage(content="test"),
             AIMessage(content="test reply", tool_calls=[]),

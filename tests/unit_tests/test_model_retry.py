@@ -47,9 +47,13 @@ def test_is_transient_error_status_codes():
 
 
 def test_is_transient_error_control_flow_and_signals():
+    from typing import Any
+
     # Never retry control flow or termination exceptions
-    assert is_transient_error(KeyboardInterrupt()) is False
-    assert is_transient_error(SystemExit()) is False
+    kb_exc: Any = KeyboardInterrupt()
+    sys_exc: Any = SystemExit()
+    assert is_transient_error(kb_exc) is False
+    assert is_transient_error(sys_exc) is False
     assert is_transient_error(GraphBubbleUp()) is False
 
     # String signal detection
@@ -85,6 +89,8 @@ def test_model_retry_middleware_success():
 
 
 def test_model_retry_middleware_retries_and_recovers(monkeypatch):
+    from typing import Any
+
     monkeypatch.setattr("time.sleep", lambda _: None)
 
     mw = CodeModelRetryMiddleware(max_retries=3)
@@ -97,7 +103,7 @@ def test_model_retry_middleware_retries_and_recovers(monkeypatch):
 
     calls = 0
 
-    def failing_then_succeeding_handler(req):
+    def failing_then_succeeding_handler(req: Any) -> Any:
         nonlocal calls
         calls += 1
         if calls < 3:
@@ -142,6 +148,8 @@ def test_model_retry_middleware_non_transient_no_retry():
 
 @pytest.mark.asyncio
 async def test_async_model_retry_middleware(monkeypatch):
+    from typing import Any
+
     async def dummy_sleep(_):
         pass
 
@@ -153,7 +161,7 @@ async def test_async_model_retry_middleware(monkeypatch):
 
     calls = 0
 
-    async def async_handler(req):
+    async def async_handler(req: Any) -> Any:
         nonlocal calls
         calls += 1
         if calls == 1:

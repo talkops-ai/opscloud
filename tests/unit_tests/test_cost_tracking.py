@@ -77,11 +77,13 @@ def test_resolve_message_model():
 
 
 def test_cost_tracking_middleware_nested_before_agent():
+    from typing import Any
+
     mw_main = CostTrackingMiddleware(nested=False)
     mw_nested = CostTrackingMiddleware(nested=True)
 
     runtime_mock = MagicMock()
-    state = {"_session_cost_usd": 1.25}
+    state: Any = {"_session_cost_usd": 1.25}
 
     assert mw_main.before_agent(state, runtime_mock) is None
 
@@ -94,6 +96,8 @@ def test_cost_tracking_middleware_nested_before_agent():
 
 
 def test_cost_tracking_middleware_after_model_charges_message():
+    from typing import Any
+
     mw = CostTrackingMiddleware(nested=False)
 
     emitted_events = []
@@ -108,7 +112,7 @@ def test_cost_tracking_middleware_after_model_charges_message():
         response_metadata={"model_name": "gpt-4o-mini", "model_provider": "openai"},
         usage_metadata={"input_tokens": 500, "output_tokens": 100, "total_tokens": 600},
     )
-    state = {
+    state: Any = {
         "messages": [ai_msg],
         "_session_cost_usd": 0.05,
         "_session_total_tokens": 1000,
@@ -130,6 +134,8 @@ def test_cost_tracking_middleware_after_model_charges_message():
 
 
 def test_cost_tracking_middleware_subagent_cost_transfers():
+    from typing import Any
+
     mw_subagent = CostTrackingMiddleware(nested=True)
 
     runtime_mock = MagicMock()
@@ -142,7 +148,7 @@ def test_cost_tracking_middleware_subagent_cost_transfers():
         response_metadata={"model_name": "gpt-4o-mini", "model_provider": "openai"},
         usage_metadata={"input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200},
     )
-    state = {
+    state: Any = {
         "messages": [sub_msg],
         "_session_cost_usd": 0.02,
         "_session_total_tokens": 300,
@@ -208,6 +214,7 @@ def test_active_session_thread_id_fallback():
 
 
 def test_cost_tracking_middleware_wrap_model_call():
+    from typing import Any
     from opscloud.middleware.cost_tracking import (
         ACTIVE_SESSION_THREAD_ID,
         CostTrackingMiddleware,
@@ -222,7 +229,7 @@ def test_cost_tracking_middleware_wrap_model_call():
 
     seen_thread = None
 
-    def dummy_handler(req):
+    def dummy_handler(req: Any) -> Any:
         nonlocal seen_thread
         seen_thread = ACTIVE_SESSION_THREAD_ID.get()
         return "response"
@@ -237,6 +244,7 @@ def test_cost_tracking_middleware_wrap_model_call():
 
 @pytest.mark.asyncio
 async def test_cost_tracking_middleware_awrap_model_call():
+    from typing import Any
     from opscloud.middleware.cost_tracking import (
         ACTIVE_SESSION_THREAD_ID,
         CostTrackingMiddleware,
@@ -251,7 +259,7 @@ async def test_cost_tracking_middleware_awrap_model_call():
 
     seen_thread = None
 
-    async def dummy_handler(req):
+    async def dummy_handler(req: Any) -> Any:
         nonlocal seen_thread
         seen_thread = ACTIVE_SESSION_THREAD_ID.get()
         return "async_response"
@@ -265,6 +273,7 @@ async def test_cost_tracking_middleware_awrap_model_call():
 
 def test_cost_tracking_zero_cost_token_transfer_claim():
     """Verify that transfers with 0 cost but positive tokens are claimed."""
+    from typing import Any
     from opscloud.middleware.cost_tracking import CostTrackingMiddleware
 
     root_mw = CostTrackingMiddleware(nested=False)
@@ -275,7 +284,7 @@ def test_cost_tracking_zero_cost_token_transfer_claim():
             "tokens": 450,
         }
     }
-    state = {
+    state: Any = {
         "_session_cost_transfers": transfers,
         "_session_cost_usd": 0.0,
         "_session_total_tokens": 100,
@@ -289,7 +298,9 @@ def test_cost_tracking_zero_cost_token_transfer_claim():
     assert update is not None
     assert update.get("_session_total_tokens") == 450
     # The transfer was claimed and removed
-    remaining = update.get("_session_cost_transfers").value
+    transfer_obj = update.get("_session_cost_transfers")
+    assert transfer_obj is not None
+    remaining = transfer_obj.value
     assert "subagent:1" not in remaining
 
 

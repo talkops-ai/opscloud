@@ -12,7 +12,7 @@ from opscloud.webhooks.models import (
     WebhookEventStatus,
     WebhookSeverity,
 )
-from opscloud.webhooks.providers.base import WebhookProviderAdapter
+from opscloud.webhooks.providers.base import WebhookProviderAdapter, as_dict
 
 
 class DatadogWebhookAdapter(WebhookProviderAdapter):
@@ -141,9 +141,9 @@ class GenericWebhookAdapter(WebhookProviderAdapter):
             return self._parse_azure_monitor(data, config=config)
 
         # 2. Extract common fields from arbitrary JSON webhook payloads
-        alert_obj = data.get("alert") if isinstance(data.get("alert"), dict) else data
-        issue_obj = data.get("issue") if isinstance(data.get("issue"), dict) else {}
-        issue_fields = issue_obj.get("fields") if isinstance(issue_obj.get("fields"), dict) else {}
+        alert_obj = as_dict(data.get("alert"), fallback=data)
+        issue_obj = as_dict(data.get("issue"))
+        issue_fields = as_dict(issue_obj.get("fields"))
 
         incident_id = str(
             data.get("thread_id")
@@ -178,12 +178,11 @@ class GenericWebhookAdapter(WebhookProviderAdapter):
             or issue_fields.get("description")
             or json.dumps(data, indent=2, default=str)
         )
+        issue_priority = as_dict(issue_fields.get("priority"))
         severity_raw = (
             data.get("severity")
             or alert_obj.get("priority")
-            or (issue_fields.get("priority") or {}).get("name")
-            if isinstance(issue_fields.get("priority"), dict)
-            else data.get("severity") or alert_obj.get("priority")
+            or issue_priority.get("name")
         )
         severity = WebhookSeverity.from_raw(severity_raw)
         if severity == WebhookSeverity.UNKNOWN:
@@ -220,9 +219,9 @@ class GenericWebhookAdapter(WebhookProviderAdapter):
         *,
         config: WebhookConfig,
     ) -> NormalizedWebhookEvent:
-        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        essentials = data_obj.get("essentials") if isinstance(data_obj.get("essentials"), dict) else {}
-        context = data_obj.get("alertContext") if isinstance(data_obj.get("alertContext"), dict) else {}
+        data_obj = as_dict(payload.get("data"))
+        essentials = as_dict(data_obj.get("essentials"))
+        context = as_dict(data_obj.get("alertContext"))
 
         alert_id = str(essentials.get("alertId") or "azure-alert")
         alert_rule = str(essentials.get("alertRule") or "AzureMonitorAlert")

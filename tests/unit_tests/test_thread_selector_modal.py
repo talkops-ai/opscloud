@@ -212,3 +212,48 @@ async def test_thread_row_del_click_triggers_confirm_modal(monkeypatch: pytest.M
         assert deleted == []
 
 
+@pytest.mark.asyncio
+async def test_thread_selector_displays_title_with_fallback_and_dual_search() -> None:
+    """Verify ThreadSelectorScreen displays LLM title when present, falls back to initial_prompt, and searches both."""
+    threads = [
+        {
+            "thread_id": "thread-11112222-aaaa",
+            "message_count": 4,
+            "title": "Refining SageMaker Agent Plugin",
+            "initial_prompt": "can you help me refine the sagemaker plugin manifest",
+            "created_at": "2026-10-12T05:00:00Z",
+        },
+        {
+            "thread_id": "thread-33334444-bbbb",
+            "message_count": 1,
+            "title": None,
+            "initial_prompt": "what is yours capability ?",
+            "created_at": "2026-10-12T07:00:00Z",
+        },
+    ]
+
+    screen = ThreadSelectorScreen(threads=threads, current_thread_id="thread-11112222-aaaa")
+    app = DummyThreadApp(screen)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        opt_list = screen.query_one(CustomOptionList)
+        assert opt_list.option_count == 3
+
+        first_thread_opt = str(opt_list.get_option_at_index(1).prompt)
+        second_thread_opt = str(opt_list.get_option_at_index(2).prompt)
+        assert "Refining SageMaker Agent Plugin" in first_thread_opt
+        assert "what is yours capability ?" in second_thread_opt
+
+        search = screen.query_one(SearchInput)
+
+        # Search by LLM-generated title keyword ("Refining")
+        search.value = "Refining"
+        await pilot.pause()
+        assert opt_list.option_count == 2
+        assert opt_list.get_option_at_index(1).id == "thread-11112222-aaaa"
+
+        # Search by underlying initial_prompt keyword ("manifest") not in the title
+        search.value = "manifest"
+        await pilot.pause()
+        assert opt_list.option_count == 2
+        assert opt_list.get_option_at_index(1).id == "thread-11112222-aaaa"

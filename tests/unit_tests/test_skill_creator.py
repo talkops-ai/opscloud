@@ -18,6 +18,8 @@ from opscloud.ui.command_registry import (
 
 def _load_script_module(script_path: Path, module_name: str):
     spec = importlib.util.spec_from_file_location(module_name, script_path)
+    assert spec is not None
+    assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -198,32 +200,39 @@ async def test_skill_creator_handler_delegation():
 
 
 def test_build_skill_commands_autocomplete_entries():
-    """Verify build_skill_commands builds /skill:<name> entries and respects _STATIC_SKILL_ALIASES."""
+    """Verify build_skill_commands builds /<plugin>:<skill> and /<skill> entries and respects _STATIC_SKILL_ALIASES."""
     mock_skills = [
         {"name": "remember", "description": "Save memories", "source": "built-in"},
         {"name": "skill-creator", "description": "Create skills", "source": "built-in"},
         {"name": "aws-eks", "description": "Manage EKS", "source": "built-in"},
         {"name": "my-plugin:audit", "description": "Plugin audit", "source": "plugin"},
+        {"name": "aws-core@agent-toolkit-for-aws:signing-in-to-aws", "description": "Sign in to AWS", "source": "plugin"},
     ]
 
     entries = build_skill_commands(mock_skills)
     names = [e.name for e in entries]
 
     # remember and skill-creator should be excluded because they are in _STATIC_SKILL_ALIASES
-    assert "/skill:remember" not in names
-    assert "/skill:skill-creator" not in names
+    assert "/remember" not in names
+    assert "/skill-creator" not in names
 
-    # Other skills should be present
-    assert "/skill:aws-eks" in names
-    assert "/skill:my-plugin:audit" in names
+    # Non-plugin skills are registered as /<skill-name>, plugin skills as /<plugin>:<skill-name>
+    assert "/aws-eks" in names
+    assert "/my-plugin:audit" in names
+    assert "/aws-core:signing-in-to-aws" in names
 
-    # Plugin display name should be shortened
-    plugin_entry = next(e for e in entries if e.name == "/skill:my-plugin:audit")
-    assert plugin_entry.display_name == "/skill:audit"
-    assert "(my-plugin)" in plugin_entry.description
+    # Plugin display name is clean without @marketplace noise in description
+    plugin_entry = next(e for e in entries if e.name == "/my-plugin:audit")
+    assert plugin_entry.display_name == ""
+    assert plugin_entry.description == "Plugin audit"
+
+    aws_entry = next(e for e in entries if e.name == "/aws-core:signing-in-to-aws")
+    assert aws_entry.display_name == ""
+    assert aws_entry.description == "Sign in to AWS"
 
     all_entries = get_all_entries(entries)
     all_names = [e.name for e in all_entries]
     assert "/skill-creator" in all_names
     assert "/skill:skill-creator" in all_names
-    assert "/skill:aws-eks" in all_names
+    assert "/aws-eks" in all_names
+    assert "/my-plugin:audit" in all_names

@@ -596,7 +596,9 @@ async def test_reliable_rubric_smart_mode_tier2_1shot_diagnostic(monkeypatch):
 
     # Simulate genuine failure: criteria 1 fails with p = 0.20
     async def mock_agrade(compiled, evidence, fallback_llm_fn=None):
-        evals = [CriterionFail(name="Valid syntax", passed=False, gap="Syntax error")]
+        from typing import Any
+
+        evals: list[Any] = [CriterionFail(name="Valid syntax", passed=False, gap="Syntax error")]
         if fallback_llm_fn:
             llm_res = await fallback_llm_fn(["Valid syntax"])
             return llm_res
